@@ -1,0 +1,46 @@
+{
+  "format": "NNEditor example tracing inputs",
+  "arrays": {
+    "sensor_time_series_btf32.npy": {
+      "description": "Standardized temperature, humidity, vibration, and event channels.",
+      "dtype": "float32",
+      "layout": "batch, time, features",
+      "shape": [
+        1,
+        256,
+        4
+      ],
+      "minimum": -1.9786709547042847,
+      "maximum": 4.2952446937561035,
+      "sha256": "85287553c0c91115616bc31d74636f92257280224d4cc49058678b92faac1fa0"
+    },
+    "fox_image_nchw_f32.npy": {
+      "description": "RGB fox image scaled to the [0, 1] range.",
+      "dtype": "float32",
+      "layout": "batch, channels, height, width",
+      "shape": [
+        1,
+        3,
+        224,
+        224
+      ],
+      "minimum": 0.0,
+      "maximum": 0.9725490212440491,
+      "source_preview": "fox_image_source.png",
+      "sha256": "db182290db4e1fbac9dad6b54c2a06b4ae49235751108fcaf4bf3dd13848bb34"
+    },
+    "pixel_mask_bhw_i64.npy": {
+      "description": "All-valid pixel mask for a required int64 pixel_mask input.",
+      "dtype": "int64",
+      "layout": "batch, height, width",
+      "shape": [
+        1,
+        64,
+        64
+      ],
+      "minimum": 1,
+      "maximum": 1,
+      "sha256": "5bff883bcd2eb19b13e61e9b5b7188e97aa50f83571c2fde2edae60959e517e7"
+    }
+  }
+}

@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Internal planning and assistant state
+.claude/
+.codex/
+*.md
+!/README.md
+
+# Environments and builds
+.venv/
+.package-venv/
+build/
+dist/
+*.egg-info/
+
+# Flet
+.flet/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# NNEditor local state and model artifacts
+.nneditor/
+*.onnx
+*.onnx.data
+*.safetensors
+
+# Generated benchmark artifacts
+benchmarks/results/
+
+# Documentation generator is not part of the release source tree.
+tools/render_docs.py

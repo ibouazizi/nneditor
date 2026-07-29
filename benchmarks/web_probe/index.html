@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NNEditor hosted web renderer probe</title>
+<style>
+  body { font-family: monospace; margin: 12px; background: #fafafa; }
+  canvas { border: 1px solid #ccc; background: #fff; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="status">running…</div>
+<canvas id="surface" width="1600" height="1000"></canvas>
+<pre id="report"></pre>
+<script>
+"use strict";
+// Mirrors nneditor.rendering.synthetic: a layered DAG with one guaranteed
+// predecessor edge plus ~1.5 extra edges per node, 10% of them skips.
+// Determinism comes from a small LCG so runs are comparable across browsers.
+
+const VIEW_W = 1600, VIEW_H = 1000;
+const NODE_W = 120, NODE_H = 40, COL_GAP = 40, ROW_GAP = 60;
+const KINDS = ["#4C78A8", "#B279A2", "#72B7B2", "#F58518", "#E45756", "#9D755D", "#79706E"];
+const PAN_STEPS = 120, HIT_SAMPLES = 1000;
+
+function lcg(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+function generate(nodeCount, layerWidth, seed) {
+  const rnd = lcg(seed);
+  const nodes = [], layers = [];
+  let i = 0;
+  while (i < nodeCount) {
+    const layer = layers.length;
+    const width = Math.min(layerWidth, nodeCount - i);
+    const ids = [];
+    for (let c = 0; c < width; c++) {
+      nodes.push({
+        x: c * (NODE_W + COL_GAP), y: layer * (NODE_H + ROW_GAP),
+        w: NODE_W, h: NODE_H,
+        kind: Math.floor(rnd() * KINDS.length), label: "node_" + i,
+      });
+      ids.push(i);
+      i++;
+    }
+    layers.push(ids);
+  }
+  const edges = [];
+  for (let l = 1; l < layers.length; l++) {
+    const prev = layers[l - 1];
+    for (const t of layers[l]) {
+      const sources = new Set([prev[Math.floor(rnd() * prev.length)]]);
+      const extra = 1 + (rnd() < 0.5 ? 1 : 0);
+      for (let k = 0; k < extra; k++) {
+        let pool = prev;
+        if (rnd() < 0.1 && l > 1) pool = layers[Math.floor(rnd() * (l - 1))];
+        sources.add(pool[Math.floor(rnd() * pool.length)]);
+      }
+      for (const s of sources) edges.push([s, t]);
+    }
+  }
+  return { nodes, edges, layers };
+}
+
+// Uniform grid over nodes only, mirroring nneditor.rendering.spatial.
+function buildGrid(nodes) {
+  const cell = 4 * Math.max(NODE_W, NODE_H);
+  const cells = new Map();
+  nodes.forEach((n, id) => {
+    const c0 = Math.floor(n.x / cell), c1 = Math.floor((n.x + n.w) / cell);
+    const r0 = Math.floor(n.y / cell), r1 = Math.floor((n.y + n.h) / cell);
+    for (let c = c0; c <= c1; c++)
+      for (let r = r0; r <= r1; r++) {
+        const key = c + ":" + r;
+        if (!cells.has(key)) cells.set(key, []);
+        cells.get(key).push(id);
+      }
+  });
+  return { cell, cells };
+}
+
+function draw(ctx, graph, grid, vp) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, VIEW_W, VIEW_H);
+  ctx.setTransform(vp.scale, 0, 0, vp.scale, -vp.x * vp.scale, -vp.y * vp.scale);
+  const minX = vp.x - vp.wWorld * 0.25, maxX = vp.x + vp.wWorld * 1.25;
+  const minY = vp.y - vp.hWorld * 0.25, maxY = vp.y + vp.hWorld * 1.25;
+  let visibleEdges = 0;
+  ctx.strokeStyle = "#B5B0AC";
+  ctx.lineWidth = 1 / vp.scale;
+  ctx.beginPath();
+  for (const [s, t] of graph.edges) {
+    const a = graph.nodes[s], b = graph.nodes[t];
+    const ex0 = Math.min(a.x, b.x), ex1 = Math.max(a.x + a.w, b.x + b.w);
+    const ey0 = a.y, ey1 = b.y + b.h;
+    if (ex1 < minX || ex0 > maxX || ey1 < minY || ey0 > maxY) continue;
+    ctx.moveTo(a.x + a.w / 2, a.y + a.h);
+    ctx.lineTo(b.x + b.w / 2, b.y);
+    visibleEdges++;
+  }
+  ctx.stroke();
+  const seen = new Set();
+  const c0 = Math.floor(minX / grid.cell), c1 = Math.floor(maxX / grid.cell);
+  const r0 = Math.floor(minY / grid.cell), r1 = Math.floor(maxY / grid.cell);
+  let visibleNodes = 0;
+  const labels = vp.scale >= 0.6;
+  ctx.font = "10px sans-serif";
+  for (let c = c0; c <= c1; c++)
+    for (let r = r0; r <= r1; r++) {
+      const bucket = grid.cells.get(c + ":" + r);
+      if (!bucket) continue;
+      for (const id of bucket) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const n = graph.nodes[id];
+        if (n.x + n.w < minX || n.x > maxX || n.y + n.h < minY || n.y > maxY) continue;
+        ctx.fillStyle = KINDS[n.kind];
+        ctx.fillRect(n.x, n.y, n.w, n.h);
+        if (labels) {
+          ctx.fillStyle = "#202020";
+          ctx.fillText(n.label, n.x + 4, n.y + n.h / 2 + 3);
+        }
+        visibleNodes++;
+      }
+    }
+  return { visibleNodes, visibleEdges };
+}
+
+function percentiles(samples) {
+  const s = [...samples].sort((a, b) => a - b);
+  return {
+    p50_ms: +s[Math.floor(s.length / 2)].toFixed(3),
+    p95_ms: +s[Math.min(s.length - 1, Math.floor(s.length * 0.95))].toFixed(3),
+    max_ms: +s[s.length - 1].toFixed(3),
+  };
+}
+
+function sceneBounds(nodes) {
+  let maxX = 0, maxY = 0;
+  for (const n of nodes) { maxX = Math.max(maxX, n.x + n.w); maxY = Math.max(maxY, n.y + n.h); }
+  return { maxX, maxY };
+}
+
+async function benchScenario(ctx, nodeCount, layerWidth) {
+  const t0 = performance.now();
+  const graph = generate(nodeCount, layerWidth, 42);
+  const grid = buildGrid(graph.nodes);
+  const buildMs = performance.now() - t0;
+  const { maxX, maxY } = sceneBounds(graph.nodes);
+  const result = {
+    node_count: nodeCount, edge_count: graph.edges.length,
+    build_ms: +buildMs.toFixed(3),
+  };
+
+  // Synchronous per-frame draw cost across a diagonal pan at 1:1 zoom.
+  let samples = [], visible = 0;
+  for (let step = 0; step < PAN_STEPS; step++) {
+    const f = step / (PAN_STEPS - 1);
+    const vp = {
+      x: f * Math.max(0, maxX - VIEW_W), y: f * Math.max(0, maxY - VIEW_H),
+      scale: 1, wWorld: VIEW_W, hWorld: VIEW_H,
+    };
+    const t = performance.now();
+    visible = draw(ctx, graph, grid, vp).visibleNodes;
+    samples.push(performance.now() - t);
+    if (step % 20 === 0) await new Promise(requestAnimationFrame);
+  }
+  result.working_set = { ...percentiles(samples), visible_nodes_last: visible };
+
+  // Real animation-frame pacing for 3 seconds: measures achieved FPS with
+  // the compositor in the loop, not just script cost.
+  const deltas = [];
+  await new Promise((resolve) => {
+    let last = null, start = null;
+    function frame(ts) {
+      if (last !== null) deltas.push(ts - last);
+      last = ts;
+      if (start === null) start = ts;
+      const f = ((ts - start) % 2000) / 2000;
+      draw(ctx, graph, grid, {
+        x: f * Math.max(0, maxX - VIEW_W), y: f * Math.max(0, maxY - VIEW_H),
+        scale: 1, wWorld: VIEW_W, hWorld: VIEW_H,
+      });
+      if (ts - start < 3000) requestAnimationFrame(frame); else resolve();
+    }
+    requestAnimationFrame(frame);
+  });
+  result.animated_pan = {
+    ...percentiles(deltas),
+    achieved_fps: +(1000 / (deltas.reduce((a, b) => a + b, 0) / deltas.length)).toFixed(1),
+  };
+
+  // Everything visible at once: the zoomed-out worst case.
+  const fit = Math.min(VIEW_W / maxX, VIEW_H / maxY);
+  samples = [];
+  for (let i = 0; i < 10; i++) {
+    const t = performance.now();
+    draw(ctx, graph, grid, { x: 0, y: 0, scale: fit, wWorld: VIEW_W / fit, hWorld: VIEW_H / fit });
+    samples.push(performance.now() - t);
+  }
+  result.all_visible = percentiles(samples);
+
+  // Grid hit testing, mirroring SpatialIndex.hit.
+  const rnd = lcg(7);
+  samples = [];
+  for (let i = 0; i < HIT_SAMPLES; i++) {
+    const x = rnd() * maxX, y = rnd() * maxY;
+    const t = performance.now();
+    const bucket = grid.cells.get(Math.floor(x / grid.cell) + ":" + Math.floor(y / grid.cell)) || [];
+    for (let k = bucket.length - 1; k >= 0; k--) {
+      const n = graph.nodes[bucket[k]];
+      if (x >= n.x && x <= n.x + n.w && y >= n.y && y <= n.y + n.h) break;
+    }
+    samples.push(performance.now() - t);
+  }
+  result.hit_test = percentiles(samples);
+  return result;
+}
+
+async function main() {
+  const ctx = document.getElementById("surface").getContext("2d");
+  const report = {
+    harness: "web_probe/index.html",
+    renderer: "HTML canvas 2D, culled immediate-mode redraw per frame",
+    user_agent: navigator.userAgent,
+    device_pixel_ratio: window.devicePixelRatio,
+    memory_mb: performance.memory ? +(performance.memory.usedJSHeapSize / 1048576).toFixed(1) : null,
+    scenarios: [],
+  };
+  report.scenarios.push(await benchScenario(ctx, 1000, 25));
+  report.scenarios.push(await benchScenario(ctx, 10000, 50));
+  if (performance.memory)
+    report.memory_after_mb = +(performance.memory.usedJSHeapSize / 1048576).toFixed(1);
+  document.getElementById("report").textContent = JSON.stringify(report, null, 2);
+  document.getElementById("status").textContent = "done - submitting";
+  try {
+    await fetch("/submit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(report) });
+    document.getElementById("status").textContent = "done - submitted; you can close this tab";
+  } catch (e) {
+    document.getElementById("status").textContent = "done - could not submit (" + e + ")";
+  }
+}
+main();
+</script>
+</body>
+</html>

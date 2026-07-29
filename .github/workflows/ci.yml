@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: windows-latest
+            python-version: "3.14"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install locked dependencies
+        run: uv sync --locked --group dev --python ${{ matrix.python-version }}
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Test
+        run: uv run pytest
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Install locked dependencies
+        run: uv sync --locked --group dev --python 3.12
+
+      - name: Measure non-performance coverage
+        run: >-
+          uv run pytest -m "not performance"
+          --cov=nneditor
+          --cov-report=term-missing
+          --cov-fail-under=90
+
+  performance:
+    name: Performance budgets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Install locked dependencies
+        run: uv sync --locked --group dev --python 3.12
+
+      - name: Run accepted performance budgets without coverage
+        run: uv run pytest -m performance tests/performance
+
+  package:
+    name: Build and inspect package
+    needs: [quality, coverage, performance]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Build wheel and source distribution
+        run: uv build --clear --python 3.12
+
+      - name: Validate distribution metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Verify wheel in a clean environment
+        shell: bash
+        run: |
+          uv venv .package-venv --python 3.12
+          uv pip install --python .package-venv/bin/python --no-deps dist/*.whl
+          .package-venv/bin/python - <<'PY'
+          import importlib.metadata
+          import nneditor
+
+          distribution = importlib.metadata.distribution("nneditor")
+          entry_points = {
+              entry.name: entry.value
+              for entry in distribution.entry_points
+              if entry.group == "console_scripts"
+          }
+          assert nneditor.__version__ == distribution.version
+          assert entry_points["nneditor"] == "nneditor.ui.app:run"
+          assert distribution.locate_file("nneditor/py.typed").is_file()
+          PY

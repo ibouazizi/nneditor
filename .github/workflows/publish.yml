@@ -1,0 +1,124 @@
+name: Publish Python distribution
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify distributions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Install locked dependencies
+        run: uv sync --locked --group dev --python 3.12
+
+      - name: Run release gates
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy
+          uv run pytest -m "not performance" --cov=nneditor --cov-report=term-missing --cov-fail-under=90
+          uv run pytest -m performance tests/performance
+
+      - name: Validate tag matches package version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          package_version="$(uv run python -c 'import nneditor; print(nneditor.__version__)')"
+          test "${GITHUB_REF_NAME}" = "v${package_version}"
+
+      - name: Build wheel and source distribution
+        run: uv build --clear
+
+      - name: Validate distribution metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Verify wheel in a clean environment
+        shell: bash
+        run: |
+          uv venv .package-venv --python 3.12
+          uv pip install --python .package-venv/bin/python --no-deps dist/*.whl
+          .package-venv/bin/python - <<'PY'
+          import importlib.metadata
+          import nneditor
+
+          distribution = importlib.metadata.distribution("nneditor")
+          entry_points = {
+              entry.name: entry.value
+              for entry in distribution.entry_points
+              if entry.group == "console_scripts"
+          }
+          assert nneditor.__version__ == distribution.version
+          assert entry_points["nneditor"] == "nneditor.ui.app:run"
+          assert distribution.locate_file("nneditor/py.typed").is_file()
+          PY
+
+      - name: Store distribution artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/nneditor
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/nneditor
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

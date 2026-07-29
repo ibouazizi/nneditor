@@ -1,0 +1,112 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nneditor"
+description = "A scalable, capability-aware neural-network viewer and editor."
+dynamic = ["version"]
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.12,<3.15"
+authors = [
+    { name = "Imed Bouazizi", email = "ibouazizi@gmail.com" },
+]
+keywords = [
+    "flet",
+    "jax",
+    "machine-learning",
+    "model-editor",
+    "neural-network",
+    "onnx",
+    "pruning",
+    "pytorch",
+    "quantization",
+    "visualization",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: User Interfaces",
+    "Typing :: Typed",
+]
+dependencies = [
+    "flet[all]==0.86.4",
+    "numpy>=1.26,<3",
+    # Import remains on NNEditor's lazy wire reader.  The official bindings are
+    # used only after import for Phase 4 schema validation, checking, shape
+    # inference, and export.
+    "onnx>=1.22,<2",
+]
+
+[project.scripts]
+nneditor = "nneditor.ui.app:run"
+
+[tool.flet]
+product = "NNEditor"
+artifact = "nneditor"
+
+[tool.hatch.version]
+path = "src/nneditor/__init__.py"
+
+[dependency-groups]
+dev = [
+    "jax>=0.4.35",
+    "mypy>=1.18,<2",
+    "pytest>=8.4,<10",
+    "pytest-cov>=6,<8",
+    "ruff>=0.12,<1",
+    "safetensors>=0.4",
+    "torch>=2.6,<3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nneditor"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/README.md",
+    "/pyproject.toml",
+    "/src/nneditor",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "-m",
+    "not performance",
+]
+markers = [
+    "performance: wall-clock and scale regression tests run separately from coverage",
+]
+testpaths = ["tests"]
+
+[tool.ruff]
+extend-exclude = ["*.md"]
+line-length = 88
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "UP"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
