@@ -66,6 +66,10 @@ def test_worker_run_captures_augmented_outputs_in_bounded_files(
         encoding="utf-8",
     )
     monkeypatch.setenv("NNEDITOR_TRACE_WORKER", "1")
+    # ``run`` normally executes in a fresh subprocess. Applying its hard POSIX
+    # address-space limit to pytest itself is irreversible and can kill the
+    # coverage process after large optional runtimes have been imported.
+    monkeypatch.setattr(trace_worker, "_limit_process", lambda raw: None)
 
     trace_worker.run(request)
 

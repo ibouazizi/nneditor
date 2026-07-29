@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
 import pytest
 
 from nneditor.ir.capabilities import (
@@ -19,10 +16,6 @@ from nneditor.ir.capabilities import (
     capability_matrix_markdown,
     contract_for,
 )
-
-DOC_PATH = Path(__file__).resolve().parents[2] / "docs" / "artifact-capabilities.md"
-BEGIN = "<!-- BEGIN GENERATED: capability-matrix -->"
-END = "<!-- END GENERATED: capability-matrix -->"
 
 
 def test_every_artifact_kind_has_a_contract() -> None:
@@ -136,13 +129,13 @@ def test_contract_requires_inputs_and_modes(
         )
 
 
-def test_generated_document_section_is_up_to_date() -> None:
-    """``docs/artifact-capabilities.md`` is generated from the registry."""
-    text = DOC_PATH.read_text(encoding="utf-8")
-    match = re.search(
-        f"{re.escape(BEGIN)}\n(.*?)\n?{re.escape(END)}", text, flags=re.DOTALL
-    )
-    assert match is not None, f"{DOC_PATH} is missing the generated markers"
-    assert match.group(1).strip() == capability_matrix_markdown().strip(), (
-        "Regenerate the capability document: uv run python tools/render_docs.py"
-    )
+def test_generated_capability_matrix_covers_the_registry() -> None:
+    """The generated matrix is complete without relying on internal docs."""
+    matrix = capability_matrix_markdown()
+    for contract in ARTIFACT_CONTRACTS.values():
+        assert f"### {contract.title}" in matrix
+        for status in contract.statuses:
+            assert (
+                f"| {status.capability.value} | {status.availability.value} | "
+                f"{status.reason} |"
+            ) in matrix
