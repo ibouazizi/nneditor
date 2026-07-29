@@ -9,7 +9,7 @@ from nneditor import __main__ as package_main
 
 
 def test_version_is_exposed() -> None:
-    assert nneditor.__version__ == "1.0.0"
+    assert nneditor.__version__ == "1.0.1"
 
 
 def test_distribution_metadata_matches_package() -> None:
@@ -19,9 +19,11 @@ def test_distribution_metadata_matches_package() -> None:
         for entry in distribution.entry_points
         if entry.group == "console_scripts"
     }
+    project_urls = distribution.metadata.get_all("Project-URL") or []
 
     assert distribution.version == nneditor.__version__
     assert console_scripts["nneditor"] == "nneditor.ui.app:cli"
+    assert "Repository, https://github.com/ibouazizi/nneditor" in project_urls
 
 
 def test_package_is_marked_as_typed() -> None:

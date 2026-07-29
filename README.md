@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icons/nneditor.png" alt="NNEditor icon" width="128">
+  <img src="https://raw.githubusercontent.com/ibouazizi/nneditor/main/assets/icons/nneditor.png" alt="NNEditor icon" width="128">
 </p>
 
 <h1 align="center">NNEditor</h1>
@@ -25,15 +25,15 @@ capture bound, so NNEditor reported an honest partial result while retaining
 
 ### Navigate a model by architecture
 
-![DETR ResNet-50 architecture overview in NNEditor](assets/screenshots/architecture-overview.jpg)
+![DETR ResNet-50 architecture overview in NNEditor](https://raw.githubusercontent.com/ibouazizi/nneditor/main/assets/screenshots/architecture-overview.jpg)
 
 ### Run a bounded activation trace
 
-![Partial DETR ResNet-50 activation trace with 2,364 readable values](assets/screenshots/trace-results.jpg)
+![Partial DETR ResNet-50 activation trace with 2,364 readable values](https://raw.githubusercontent.com/ibouazizi/nneditor/main/assets/screenshots/trace-results.jpg)
 
 ### Open activation data in a large view
 
-![Large activation overlay for a traced DETR tensor](assets/screenshots/activation-overlay.jpg)
+![Large activation overlay for a traced DETR tensor](https://raw.githubusercontent.com/ibouazizi/nneditor/main/assets/screenshots/activation-overlay.jpg)
 
 ## Highlights
 
@@ -82,7 +82,7 @@ actions explain the format-specific reason directly in the interface.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.0.0
+python -m pip install nneditor==1.0.1
 ```
 
 Start the desktop application with either command:

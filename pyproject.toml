@@ -50,6 +50,9 @@ dependencies = [
 [project.scripts]
 nneditor = "nneditor.ui.app:cli"
 
+[project.urls]
+Repository = "https://github.com/ibouazizi/nneditor"
+
 [tool.flet]
 product = "NNEditor"
 artifact = "nneditor"
