@@ -18,7 +18,15 @@ MAX_TABULAR_SOURCE_BYTES: Final = 64 * 1024 * 1024
 MAX_IMAGE_EXTENT: Final = 16_384
 
 NumericArray = NDArray[np.generic]
-ImageLayout = Literal["NCHW", "NHWC", "CHW", "HWC", "NHW", "HW"]
+ImageLayout = Literal[
+    "NCHW",
+    "NHWC",
+    "CHW",
+    "HWC",
+    "NHW",
+    "HW",
+    "QWEN3VL_PATCHES",
+]
 ImageColorMode = Literal["rgb", "grayscale"]
 ImageNormalization = Literal["none", "zero-one", "minus-one-one", "imagenet"]
 MaskFill = Literal["ones", "zeros", "checkerboard", "random-binary"]
@@ -141,6 +149,17 @@ def generate_image_tensor(
         )
     if normalization == "imagenet" and color_mode != "rgb":
         raise InputGenerationError("ImageNet normalization requires an RGB image")
+    if layout == "QWEN3VL_PATCHES":
+        if color_mode != "rgb":
+            raise InputGenerationError("Qwen3-VL patch inputs require an RGB image")
+        if normalization != "minus-one-one":
+            raise InputGenerationError(
+                "Qwen3-VL patch inputs require -1 to 1 normalization"
+            )
+        if width % 32 or height % 32:
+            raise InputGenerationError(
+                "Qwen3-VL image width and height must be divisible by 32"
+            )
     channels = 3 if color_mode == "rgb" else 1
     _bounded_allocation((height, width, channels), target_dtype)
 
@@ -148,7 +167,12 @@ def generate_image_tensor(
         with Image.open(source) as opened:
             image = ImageOps.exif_transpose(opened)
             image = image.convert("RGB" if color_mode == "rgb" else "L")
-            image = image.resize((width, height), Image.Resampling.BILINEAR)
+            resampling = (
+                Image.Resampling.BICUBIC
+                if layout == "QWEN3VL_PATCHES"
+                else Image.Resampling.BILINEAR
+            )
+            image = image.resize((width, height), resampling)
             array = np.asarray(image).copy()
     except (OSError, ValueError) as error:
         raise InputGenerationError(f"could not decode image: {error}") from error
@@ -166,12 +190,53 @@ def generate_image_tensor(
             standard_deviation = np.asarray((0.229, 0.224, 0.225), dtype=target_dtype)
             array = (floating - mean) / standard_deviation
 
-    array = _apply_image_layout(array, layout, color_mode)
+    if layout == "QWEN3VL_PATCHES":
+        array = _qwen3vl_patches(array, target_dtype)
+        source_description = (
+            f"Qwen3-VL image {source.name} resized to H={height} x W={width}"
+        )
+    else:
+        array = _apply_image_layout(array, layout, color_mode)
+        source_description = f"image {source.name} resized to H={height} x W={width}"
     return _publish_array(
         array,
         destination,
-        source=f"image {source.name} resized to {width} x {height}",
+        source=source_description,
     )
+
+
+def _qwen3vl_patches(
+    array: NumericArray,
+    dtype: np.dtype[np.generic],
+) -> NumericArray:
+    """Match the official Qwen3-VL image processor's flattened patch order."""
+    patch_size = 16
+    temporal_patch_size = 2
+    merge_size = 2
+    height, width, channels = array.shape
+    grid_height = height // patch_size
+    grid_width = width // patch_size
+    output_shape = (
+        grid_height * grid_width,
+        channels * temporal_patch_size * patch_size * patch_size,
+    )
+    _bounded_allocation(output_shape, dtype)
+
+    channel_first = np.transpose(array, (2, 0, 1))[np.newaxis, ...]
+    patches = channel_first.reshape(
+        1,
+        channels,
+        grid_height // merge_size,
+        merge_size,
+        patch_size,
+        grid_width // merge_size,
+        merge_size,
+        patch_size,
+    )
+    patches = np.transpose(patches, (0, 2, 5, 3, 6, 1, 4, 7))
+    patches = np.repeat(patches[:, :, :, :, :, :, np.newaxis, :, :], 2, axis=6)
+    flattened: NumericArray = patches.reshape((1, *output_shape))[0]
+    return flattened
 
 
 def generate_mask_tensor(

@@ -91,12 +91,25 @@ class TestInputWorkspace:
             read_only=True,
             expand=True,
         )
-        self.image_width = self._field(label="Width", value="224")
-        self.image_height = self._field(label="Height", value="224")
-        self.image_layout = self._dropdown(
-            "Layout",
-            "NCHW",
-            ("NCHW", "NHWC", "CHW", "HWC", "NHW", "HW"),
+        # Tensor shapes conventionally spell the spatial dimensions H, W.
+        # Keep the form in that same order so copying a declared shape cannot
+        # silently transpose a non-square image.
+        self.image_height = self._field(label="Height (H)", value="224")
+        self.image_width = self._field(label="Width (W)", value="224")
+        self.image_layout = ft.Dropdown(
+            value="NCHW",
+            label="Layout",
+            dense=True,
+            options=[
+                *[
+                    ft.DropdownOption(key=value, text=value)
+                    for value in ("NCHW", "NHWC", "CHW", "HWC", "NHW", "HW")
+                ],
+                ft.DropdownOption(
+                    key="QWEN3VL_PATCHES",
+                    text="Qwen3-VL flattened patches",
+                ),
+            ],
         )
         self.image_color = ft.Dropdown(
             value="rgb",
@@ -121,8 +134,8 @@ class TestInputWorkspace:
         self.image_dtype = self._dtype_dropdown("float32")
         self._set_columns(
             (
-                self.image_width,
                 self.image_height,
+                self.image_width,
                 self.image_layout,
                 self.image_color,
                 self.image_normalization,
@@ -144,8 +157,8 @@ class TestInputWorkspace:
                         ]
                     ),
                     self._responsive_row(
-                        self.image_width,
                         self.image_height,
+                        self.image_width,
                         self.image_layout,
                     ),
                     self._responsive_row(
@@ -708,16 +721,68 @@ class TestInputWorkspace:
             self.mask_shape.value = shape_text
             self.tensor_shape.value = shape_text
             if len(shape) == 4 and shape[1] in {1, 3}:
+                self.kind.value = "image"
                 self.image_layout.value = "NCHW"
+                self.image_color.value = "rgb" if shape[1] == 3 else "grayscale"
                 self.image_height.value = str(shape[2])
                 self.image_width.value = str(shape[3])
             elif len(shape) == 4 and shape[3] in {1, 3}:
+                self.kind.value = "image"
                 self.image_layout.value = "NHWC"
+                self.image_color.value = "rgb" if shape[3] == 3 else "grayscale"
                 self.image_height.value = str(shape[1])
                 self.image_width.value = str(shape[2])
+            elif len(shape) == 3 and shape[0] in {1, 3}:
+                self.kind.value = "image"
+                self.image_layout.value = "CHW"
+                self.image_color.value = "rgb" if shape[0] == 3 else "grayscale"
+                self.image_height.value = str(shape[1])
+                self.image_width.value = str(shape[2])
+            elif len(shape) == 3 and shape[2] in {1, 3}:
+                self.kind.value = "image"
+                self.image_layout.value = "HWC"
+                self.image_color.value = "rgb" if shape[2] == 3 else "grayscale"
+                self.image_height.value = str(shape[0])
+                self.image_width.value = str(shape[1])
+            elif (
+                len(shape) == 2
+                and shape[1] == 1536
+                and shape[0] % 4 == 0
+                and "pixel" in target.name.lower()
+            ):
+                grid_height, grid_width = self._closest_landscape_patch_grid(shape[0])
+                self.kind.value = "image"
+                self.image_layout.value = "QWEN3VL_PATCHES"
+                self.image_color.value = "rgb"
+                self.image_normalization.value = "minus-one-one"
+                self.image_height.value = str(grid_height * 16)
+                self.image_width.value = str(grid_width * 16)
+                self._on_kind_changed(None)
+            elif len(shape) == 2:
+                self.kind.value = "image"
+                self.image_layout.value = "HW"
+                self.image_color.value = "grayscale"
+                self.image_height.value = str(shape[0])
+                self.image_width.value = str(shape[1])
+            if self.kind.value == "image":
+                self._on_kind_changed(None)
         if target.is_mask:
             self.kind.value = "mask"
             self._on_kind_changed(None)
+
+    @staticmethod
+    def _closest_landscape_patch_grid(patch_count: int) -> tuple[int, int]:
+        """Choose the least-distorted even grid for a fixed Qwen patch count."""
+        candidates = [
+            (height, patch_count // height)
+            for height in range(2, int(patch_count**0.5) + 1, 2)
+            if patch_count % height == 0 and (patch_count // height) % 2 == 0
+        ]
+        if not candidates:
+            raise InputGenerationError(
+                "Qwen3-VL patch count needs an even height and width"
+            )
+        return min(candidates, key=lambda item: item[1] / item[0])
 
     def _refresh_assign_button(self) -> None:
         self.generate_and_assign_button.disabled = (

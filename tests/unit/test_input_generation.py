@@ -124,6 +124,35 @@ def test_image_float_normalization_modes(
     assert np.all(np.isfinite(np.load(generated.path, allow_pickle=False)))
 
 
+def test_qwen3vl_image_generation_flattens_official_patch_order(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "qwen.png"
+    pixels = np.arange(32 * 64 * 3, dtype=np.uint8).reshape(32, 64, 3)
+    Image.fromarray(pixels, mode="RGB").save(source)
+
+    generated = generate_image_tensor(
+        source,
+        tmp_path / "qwen.npy",
+        width=64,
+        height=32,
+        layout="QWEN3VL_PATCHES",
+        normalization="minus-one-one",
+        dtype="float32",
+    )
+
+    array = np.load(generated.path, allow_pickle=False)
+    assert array.shape == (8, 1536)
+    assert array.dtype == np.dtype("float32")
+    first_patch = array[0].reshape(3, 2, 16, 16)
+    np.testing.assert_array_equal(first_patch[:, 0], first_patch[:, 1])
+    expected_first_patch = (
+        pixels[:16, :16].astype(np.float32).transpose(2, 0, 1) / 127.5 - 1.0
+    )
+    np.testing.assert_allclose(first_patch[:, 0], expected_first_patch)
+    assert generated.source.startswith("Qwen3-VL image")
+
+
 def test_image_generation_rejects_invalid_sources_and_configurations(
     tmp_path: Path,
 ) -> None:
@@ -166,6 +195,14 @@ def test_image_generation_rejects_invalid_sources_and_configurations(
             width=2,
             height=2,
             layout=cast(Any, "HW"),
+        ),
+        lambda: generate_image_tensor(
+            source,
+            tmp_path / "out.npy",
+            width=32,
+            height=32,
+            layout="QWEN3VL_PATCHES",
+            normalization="zero-one",
         ),
     ]
     for call in calls:

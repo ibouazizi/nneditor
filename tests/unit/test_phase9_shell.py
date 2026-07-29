@@ -24,6 +24,7 @@ from nneditor.tracing import (
     build_activation_visualizations,
 )
 from nneditor.ui.app import Shell
+from nneditor.ui.input_workspace import InputTarget
 from tests.fixtures.onnx_models import build_embedded_model, build_masked_image_model
 from tests.unit.test_shell import make_shell
 
@@ -372,6 +373,70 @@ def test_generator_target_switches_mask_inputs_to_all_valid_mask(
         assert generator.mask_dtype.value == "int64"
         assert generator.mask_section.visible
         assert not generator.image_section.visible
+
+
+def test_generator_target_switches_qwen3vl_pixels_to_patch_profile() -> None:
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        generator = shell.input_generator
+        generator.refresh_targets(
+            [
+                InputTarget(
+                    name="pixel_values",
+                    element_type="float32",
+                    shape=(880, 1536),
+                )
+            ],
+            can_assign=True,
+        )
+
+        assert generator.kind.value == "image"
+        assert generator.image_layout.value == "QWEN3VL_PATCHES"
+        assert generator.image_width.value == "640"
+        assert generator.image_height.value == "352"
+        assert generator.image_normalization.value == "minus-one-one"
+        assert generator.image_section.visible
+
+
+@pytest.mark.parametrize(
+    ("shape", "layout", "height", "width", "color"),
+    [
+        ((1, 3, 320, 640), "NCHW", "320", "640", "rgb"),
+        ((1, 320, 640, 3), "NHWC", "320", "640", "rgb"),
+        ((3, 320, 640), "CHW", "320", "640", "rgb"),
+        ((1, 320, 640), "CHW", "320", "640", "grayscale"),
+        ((320, 640, 3), "HWC", "320", "640", "rgb"),
+        ((320, 640), "HW", "320", "640", "grayscale"),
+    ],
+)
+def test_generator_maps_tensor_height_and_width_without_transposing(
+    shape: tuple[int, ...],
+    layout: str,
+    height: str,
+    width: str,
+    color: str,
+) -> None:
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        generator = shell.input_generator
+        generator.refresh_targets(
+            [
+                InputTarget(
+                    name="image",
+                    element_type="float32",
+                    shape=shape,
+                )
+            ],
+            can_assign=True,
+        )
+
+        assert generator.kind.value == "image"
+        assert generator.image_layout.value == layout
+        assert generator.image_height.value == height
+        assert generator.image_width.value == width
+        assert generator.image_color.value == color
+        assert generator.image_height.label == "Height (H)"
+        assert generator.image_width.label == "Width (W)"
 
 
 def test_generator_form_builds_image_mask_csv_and_time_series(

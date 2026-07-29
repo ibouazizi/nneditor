@@ -68,7 +68,7 @@ jobs:
               if entry.group == "console_scripts"
           }
           assert nneditor.__version__ == distribution.version
-          assert entry_points["nneditor"] == "nneditor.ui.app:run"
+          assert entry_points["nneditor"] == "nneditor.ui.app:cli"
           assert distribution.locate_file("nneditor/py.typed").is_file()
           PY
 

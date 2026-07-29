@@ -82,7 +82,7 @@ actions explain the format-specific reason directly in the interface.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.0.1
+python -m pip install nneditor==1.0.2
 ```
 
 Start the desktop application with either command:
@@ -141,6 +141,9 @@ Desktop tracing is available for ONNX models:
    tensor. Select a model input and use **Generate, save & assign** to return
    directly to that input node. You can also click the tensor-picker button
    inside an input node and choose an existing safe NumPy `.npy` tensor.
+   Image dimensions are shown and applied as height then width, matching tensor
+   shape conventions. Fixed Qwen3-VL `pixel_values` inputs automatically use
+   the model-compatible flattened-patch profile.
    Required `*_mask` inputs left unchanged use an automatically generated
    all-valid mask; other inputs use deterministic random data.
 2. Open **Trace activations**, review the input specification and the
