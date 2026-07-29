@@ -1,12 +1,39 @@
-# NNEditor
+<p align="center">
+  <img src="assets/icons/nneditor.png" alt="NNEditor icon" width="128">
+</p>
 
-Inspect, understand, edit, optimize, and trace neural-network artifacts without
-loading an entire model into memory or executing artifact-provided code.
+<h1 align="center">NNEditor</h1>
+
+<p align="center">
+  Inspect, understand, edit, optimize, and trace neural-network artifacts
+  without loading an entire model into memory or executing artifact-provided
+  code.
+</p>
 
 NNEditor 1.0 is a capability-aware neural-network workspace for ONNX, PyTorch,
 safetensors, and textual StableHLO artifacts. It combines semantic graph
 navigation, lazy tensor access, reversible editing, validated export, and
 desktop activation tracing in one application.
+
+## NNEditor in action
+
+These screenshots come from a real desktop session with the 2,364-operator
+`detr-resnet-50.onnx` model. The trace used the included fox image tensor and an
+automatically generated all-valid pixel mask. It reached the approved 256 MiB
+capture bound, so NNEditor reported an honest partial result while retaining
+2,364 readable activations.
+
+### Navigate a model by architecture
+
+![DETR ResNet-50 architecture overview in NNEditor](assets/screenshots/architecture-overview.jpg)
+
+### Run a bounded activation trace
+
+![Partial DETR ResNet-50 activation trace with 2,364 readable values](assets/screenshots/trace-results.jpg)
+
+### Open activation data in a large view
+
+![Large activation overlay for a traced DETR tensor](assets/screenshots/activation-overlay.jpg)
 
 ## Highlights
 
