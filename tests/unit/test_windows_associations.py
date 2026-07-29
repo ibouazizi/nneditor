@@ -147,6 +147,10 @@ def test_register_and_unregister_use_only_owned_per_user_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "nneditor.desktop.windows_associations.sys.platform",
+        "win32",
+    )
     written: list[tuple[str | None, str]] = []
     deleted: list[str] = []
     fake_winreg = _fake_winreg(written=written, deleted=deleted)
@@ -185,6 +189,10 @@ def test_registration_wraps_registry_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "nneditor.desktop.windows_associations.sys.platform",
+        "win32",
+    )
     fake_winreg = _fake_winreg()
     cast(Any, fake_winreg).CreateKeyEx = lambda *args: (_ for _ in ()).throw(
         OSError("denied")
@@ -201,10 +209,15 @@ def test_registration_wraps_registry_errors(
 def test_default_apps_settings_uri_and_error_translation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "nneditor.desktop.windows_associations.sys.platform",
+        "win32",
+    )
     opened: list[str] = []
     monkeypatch.setattr(
         "nneditor.desktop.windows_associations.os.startfile",
         opened.append,
+        raising=False,
     )
     open_default_apps_settings()
     assert opened == ["ms-settings:defaultapps?registeredAppUser=NNEditor"]
@@ -215,6 +228,7 @@ def test_default_apps_settings_uri_and_error_translation(
     monkeypatch.setattr(
         "nneditor.desktop.windows_associations.os.startfile",
         fail,
+        raising=False,
     )
     with pytest.raises(FileAssociationError, match="unavailable"):
         open_default_apps_settings()
