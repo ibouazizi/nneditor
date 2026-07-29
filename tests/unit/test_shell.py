@@ -20,12 +20,13 @@ import pytest
 
 from nneditor.analysis.lod import DetailLevel
 from nneditor.application.session import ApplicationService
+from nneditor.artifact_formats import MODEL_FILE_EXTENSIONS
 from nneditor.rendering import (
     InteractiveGraphRenderer,
     SelectionCallback,
     create_flet_renderer,
 )
-from nneditor.ui.app import MODEL_FILE_EXTENSIONS, Shell
+from nneditor.ui.app import Shell
 from tests.fixtures.onnx_models import build_control_flow_model, build_embedded_model
 
 
@@ -125,6 +126,21 @@ def test_show_session_populates_all_panels(
     assert not shell.empty_state.visible
     assert not shell.loading_overlay.visible
     assert not shell.error_banner.visible
+
+
+def test_command_line_path_opens_through_the_normal_background_job(
+    tmp_path: Path,
+    service: ApplicationService,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=4)
+    shell, _page = make_shell(service)
+
+    shell.open_path(path)
+
+    assert shell.session is not None
+    assert Path(shell.session.document.source.path).resolve() == path.resolve()
+    assert "Opened" in str(shell.status_text.value)
 
 
 def test_save_action_tracks_unsaved_revisions(

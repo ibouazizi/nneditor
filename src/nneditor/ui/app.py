@@ -13,11 +13,14 @@ events in, service calls out, controls updated.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import functools
 import math
+import sys
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
@@ -34,6 +37,13 @@ from nneditor.application.navigation import Direction, MiniMap
 from nneditor.application.persistence import SessionStateStore, ViewState
 from nneditor.application.session import ApplicationService, ExportOutcome, ModelSession
 from nneditor.application.slices import GraphSlice
+from nneditor.artifact_formats import MODEL_FILE_EXTENSIONS
+from nneditor.desktop import (
+    FileAssociationError,
+    open_default_apps_settings,
+    register_file_associations,
+    unregister_file_associations,
+)
 from nneditor.editing.validation import (
     EditRequest,
     EditTransaction,
@@ -45,6 +55,7 @@ from nneditor.editing.validation import (
     SetAttributeRequest,
     parse_attribute_value,
 )
+from nneditor.input_generation import GeneratedTensor
 from nneditor.ir.capabilities import ArtifactKind, Availability, Capability
 from nneditor.ir.core import AttrKind, Storage
 from nneditor.rendering import create_flet_renderer
@@ -65,7 +76,7 @@ from nneditor.transformations.engine import (
     TransformationRequest,
 )
 from nneditor.transformations.schema import Granularity
-from nneditor.ui import overview, shell_layout, tensor_tools, viewmodel
+from nneditor.ui import input_workspace, overview, shell_layout, tensor_tools, viewmodel
 from nneditor.ui.trace_graph import TraceGraphPresentation, build_trace_graph
 
 APP_TITLE = "NNEditor"
@@ -74,20 +85,6 @@ APP_ICON_PATH = APP_ASSETS_DIRECTORY / "nneditor.png"
 APP_WINDOW_ICON_PATH = APP_ASSETS_DIRECTORY / "nneditor.ico"
 _WEB_UPLOAD_TEMP = tempfile.TemporaryDirectory(prefix="nneditor-web-upload-")
 _WEB_UPLOAD_DIRECTORY = Path(_WEB_UPLOAD_TEMP.name)
-
-MODEL_FILE_EXTENSION_GROUPS: dict[str, tuple[str, ...]] = {
-    "ONNX": ("onnx", "pb"),
-    "PyTorch": ("pt2", "pt", "pth", "ckpt", "bin"),
-    "Safetensors": ("safetensors",),
-    "StableHLO": ("mlir", "stablehlo"),
-}
-"""Extension hints for the native picker; content detection remains authoritative."""
-
-MODEL_FILE_EXTENSIONS: tuple[str, ...] = tuple(
-    extension
-    for extensions in MODEL_FILE_EXTENSION_GROUPS.values()
-    for extension in extensions
-)
 
 
 def _uses_automatic_mask(input_name: str) -> bool:
@@ -587,6 +584,24 @@ class Shell:
             size=10,
             color=_MUTED,
         )
+        self.file_types_button = ft.TextButton(
+            content="File types",
+            icon=ft.Icons.SETTINGS_APPLICATIONS_ROUNDED,
+            tooltip="Register NNEditor in Windows Open with and Default apps",
+            on_click=self._on_register_file_types,
+            visible=sys.platform == "win32",
+        )
+
+        self.input_generator = input_workspace.TestInputWorkspace(
+            page=page,
+            picker=self.picker,
+            palette=_SHELL_PALETTE,
+            assign=self._assign_generated_input,
+            on_error=self._show_error,
+            on_status=self._set_status,
+            clear_error=self._clear_error,
+            watch_text_focus=self._watch_text_focus,
+        )
 
         trace_controls = ft.Column(
             controls=[
@@ -784,6 +799,7 @@ class Shell:
                 self.close_model_button,
                 ft.Container(expand=True),
                 self.job_text,
+                self.file_types_button,
                 self.left_toggle,
                 self.right_toggle,
             ],
@@ -817,11 +833,43 @@ class Shell:
             expand=True,
             spacing=0,
         )
-        body = ft.Row(
+        model_workspace = ft.Row(
             controls=[self.left_panel, graph_workspace, self.right_panel],
             expand=True,
             spacing=0,
             vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
+        generator_workspace = self.input_generator.control
+        self.workspace_tabs = ft.Tabs(
+            content=ft.Column(
+                controls=[
+                    ft.TabBar(
+                        tabs=[
+                            ft.Tab(
+                                label="Model graph",
+                                icon=ft.Icons.ACCOUNT_TREE_ROUNDED,
+                            ),
+                            ft.Tab(
+                                label="Generate test input",
+                                icon=ft.Icons.SCIENCE_ROUNDED,
+                            ),
+                        ],
+                        scrollable=False,
+                        indicator_color=_ACCENT,
+                        label_color=_ACCENT,
+                        unselected_label_color=_MUTED,
+                    ),
+                    ft.TabBarView(
+                        controls=[model_workspace, generator_workspace],
+                        expand=True,
+                    ),
+                ],
+                expand=True,
+                spacing=0,
+            ),
+            length=2,
+            selected_index=0,
+            expand=True,
         )
         return ft.Column(
             controls=[
@@ -832,7 +880,7 @@ class Shell:
                     border=ft.Border.only(bottom=ft.BorderSide(1, _BORDER)),
                 ),
                 self.error_banner,
-                body,
+                self.workspace_tabs,
                 ft.Container(
                     content=ft.Row(
                         controls=[
@@ -889,6 +937,79 @@ class Shell:
         self._refresh_panel_toggles()
         self.page.update()
 
+    def _on_register_file_types(
+        self,
+        event: ft.Event[ft.TextButton],
+    ) -> None:
+        try:
+            registration = register_file_associations(icon_path=APP_WINDOW_ICON_PATH)
+            open_default_apps_settings()
+        except (FileAssociationError, OSError, ValueError) as error:
+            self._show_error(f"Could not register NNEditor file types: {error}")
+        else:
+            self.error_banner.visible = False
+            self._set_status(
+                f"Registered {len(registration.extensions)} model file types; "
+                "choose NNEditor in Windows Default apps."
+            )
+        self.page.update()
+
+    def _assign_generated_input(
+        self,
+        input_name: str,
+        generated: GeneratedTensor,
+    ) -> None:
+        if self.session is None:
+            raise ValueError("the model was closed before assignment")
+        binding = self.session.trace_tensor_input(input_name, generated.path)
+        self._trace_input_bindings[input_name] = binding
+        self._refresh_graph_trace_actions()
+        self._refresh_trace_actions()
+        graph = self.session.document.main_graph
+        value_id = next(
+            value_id
+            for value_id in graph.inputs
+            if value_id not in graph.initializers
+            and (graph.value(value_id).name or value_id) == input_name
+        )
+        if self.current_graph != self.session.document.entry_graph:
+            self._show_graph(self.session.document.entry_graph)
+        presentation = self._trace_graph_presentation
+        glyph_id = (
+            presentation.input_glyphs.get(value_id)
+            if presentation is not None
+            else None
+        )
+        if glyph_id is not None:
+            self.workspace_tabs.selected_index = 0
+            selected = frozenset({glyph_id})
+            self.renderer.set_selection(selected)
+            self._on_selected(selected)
+        else:
+            self._refresh_inspector(self._inspected_ids)
+
+    def _refresh_generator_targets(self) -> None:
+        session = self.session
+        if session is None:
+            self.input_generator.refresh_targets((), can_assign=False)
+            return
+        graph = session.document.main_graph
+        targets = tuple(
+            input_workspace.InputTarget(
+                name=value.name or value.id,
+                element_type=value.element_type,
+                shape=value.shape,
+                is_mask=_uses_automatic_mask(value.name or value.id),
+            )
+            for value_id in graph.inputs
+            if value_id not in graph.initializers
+            for value in (graph.value(value_id),)
+        )
+        self.input_generator.refresh_targets(
+            targets,
+            can_assign=not bool(getattr(self.page, "web", False)),
+        )
+
     # -- event handlers ----------------------------------------------------
 
     async def _on_open_clicked(self, event: ft.Event[ft.Button]) -> None:
@@ -934,6 +1055,14 @@ class Shell:
         display_name = Path(selected).name
         job = self.service.open_model_async(selected)
         self._begin_open_job(job, display_name)
+
+    def open_path(self, path: Path | str) -> None:
+        """Open a path supplied by the command line or desktop shell."""
+        if self.open_job is not None and not self.open_job.state.is_terminal:
+            raise RuntimeError("another model is already opening")
+        selected = Path(path).expanduser().resolve()
+        job = self.service.open_model_async(selected)
+        self._begin_open_job(job, selected.name)
 
     def _begin_open_job(self, job: Job[ModelSession], display_name: str) -> None:
         self.open_job = job
@@ -1069,6 +1198,7 @@ class Shell:
         self._show_committed_diff()
         self._refresh_trace_actions()
         self._refresh_edit_actions()
+        self._refresh_generator_targets()
         self._set_status(f"Closed {title}")
         self.page.update()
 
@@ -1629,6 +1759,7 @@ class Shell:
         self._refresh_inspector(frozenset())
         self._show_committed_diff()
         self._refresh_trace_actions()
+        self._refresh_generator_targets()
 
     def _refresh_graph_list(self) -> None:
         assert self.session is not None
@@ -4741,6 +4872,9 @@ class Shell:
     def _set_status(self, text: str) -> None:
         self.status_text.value = text
 
+    def _clear_error(self) -> None:
+        self.error_banner.visible = False
+
     def _show_error(self, text: str) -> None:
         banner = self.error_banner.content
         assert isinstance(banner, ft.Text)
@@ -4749,7 +4883,7 @@ class Shell:
         self._set_status("Error")
 
 
-def main(page: ft.Page) -> None:
+def main(page: ft.Page, *, launch_path: Path | None = None) -> None:
     """Flet entry point."""
     page.title = APP_TITLE
     page.window.icon = str(APP_WINDOW_ICON_PATH)
@@ -4778,13 +4912,71 @@ def main(page: ft.Page) -> None:
     page.add(shell.build())
     if page.width:
         shell.apply_layout_for_width(float(page.width))
+    if launch_path is not None:
+        shell.open_path(launch_path)
     page.update()
 
 
-def run() -> None:
+def run(launch_path: Path | None = None) -> None:
     """Launch NNEditor using Flet's current runtime."""
+    target = (
+        functools.partial(main, launch_path=launch_path)
+        if launch_path is not None
+        else main
+    )
     ft.run(
-        main,
+        target,
         assets_dir=str(APP_ASSETS_DIRECTORY),
         upload_dir=str(_WEB_UPLOAD_DIRECTORY),
     )
+
+
+def cli(argv: Sequence[str] | None = None) -> None:
+    """Parse desktop launch and file-association commands."""
+    parser = argparse.ArgumentParser(
+        prog="nneditor",
+        description="Open and inspect neural-network model artifacts.",
+    )
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument(
+        "--register-file-types",
+        action="store_true",
+        help="register NNEditor in Windows Open with and Default apps",
+    )
+    actions.add_argument(
+        "--unregister-file-types",
+        action="store_true",
+        help="remove NNEditor's per-user Windows file-type registration",
+    )
+    actions.add_argument(
+        "--choose-default-app",
+        action="store_true",
+        help="open Windows Settings so the user can choose NNEditor as a default",
+    )
+    parser.add_argument(
+        "model",
+        nargs="?",
+        type=Path,
+        help="model artifact to open (.onnx, .pt, .pth, .bin, and others)",
+    )
+    arguments = parser.parse_args(argv)
+    try:
+        if arguments.register_file_types:
+            registration = register_file_associations(
+                icon_path=APP_WINDOW_ICON_PATH,
+            )
+            print(
+                f"Registered NNEditor for {len(registration.extensions)} "
+                "model file types."
+            )
+            return
+        if arguments.unregister_file_types:
+            unregister_file_associations()
+            print("Removed NNEditor's per-user file-type registration.")
+            return
+        if arguments.choose_default_app:
+            open_default_apps_settings()
+            return
+    except FileAssociationError as error:
+        parser.error(str(error))
+    run(arguments.model)

@@ -11,8 +11,10 @@ import flet as ft
 import flet.canvas as cv
 import numpy as np
 import pytest
+from PIL import Image
 
 from nneditor.application.session import ApplicationService
+from nneditor.desktop.windows_associations import FileAssociationError
 from nneditor.tracing import (
     ActivationRecord,
     CaptureState,
@@ -299,6 +301,221 @@ def test_required_mask_is_automatic_after_selecting_an_image(tmp_path: Path) -> 
         assert not shell.error_banner.visible
         callbacks.pop()()
         assert shell.active_trace_id is not None
+
+
+def test_generator_tab_saves_and_assigns_to_selected_graph_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "model.onnx"
+    destination = tmp_path / "generated.npy"
+    build_embedded_model(model, elements=8)
+
+    async def save_file(
+        picker: ft.FilePicker,
+        **kwargs: object,
+    ) -> str:
+        assert kwargs["allowed_extensions"] == ["npy"]
+        return str(destination)
+
+    monkeypatch.setattr(ft.FilePicker, "save_file", save_file)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        session = service.open_model(model)
+        shell.show_session(session)
+        generator = shell.input_generator
+
+        assert shell.workspace_tabs.length == 2
+        assert generator.target_input.value == "input"
+        assert not generator.generate_and_assign_button.disabled
+        shell.workspace_tabs.selected_index = 1
+        generator.kind.value = "tensor"
+        generator._on_kind_changed(None)
+        generator.tensor_shape.value = "8"
+        generator.tensor_distribution.value = "ramp"
+        generator.tensor_dtype.value = "float32"
+
+        asyncio.run(generator._on_generate_and_assign(cast(Any, SimpleNamespace())))
+
+        assert destination.is_file()
+        np.testing.assert_array_equal(
+            np.load(destination, allow_pickle=False),
+            np.arange(8, dtype=np.float32),
+        )
+        binding = shell._trace_input_bindings["input"]
+        assert binding.tensor_file == str(destination.resolve())
+        assert shell.workspace_tabs.selected_index == 0
+        presentation = shell._trace_graph_presentation
+        assert presentation is not None
+        input_id = session.document.main_graph.inputs[0]
+        assert shell.renderer.selection == frozenset(
+            {presentation.input_glyphs[input_id]}
+        )
+        assert "Saved and assigned" in str(generator.status.value)
+
+
+def test_generator_target_switches_mask_inputs_to_all_valid_mask(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "masked-image.onnx"
+    build_masked_image_model(model)
+
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        shell.show_session(service.open_model(model))
+        generator = shell.input_generator
+        generator.target_input.value = "pixel_mask"
+        generator._on_target_changed(None)
+
+        assert generator.kind.value == "mask"
+        assert generator.mask_fill.value == "ones"
+        assert generator.mask_dtype.value == "int64"
+        assert generator.mask_section.visible
+        assert not generator.image_section.visible
+
+
+def test_generator_form_builds_image_mask_csv_and_time_series(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "image.png"
+    Image.fromarray(np.full((4, 6, 3), 127, dtype=np.uint8), mode="RGB").save(image)
+    csv = tmp_path / "series.csv"
+    csv.write_text("1,2\n3,4\n", encoding="utf-8")
+
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        generator = shell.input_generator
+        event = cast(Any, SimpleNamespace())
+
+        generator.kind.value = "image"
+        generator.image_path.value = str(image)
+        generator.image_width.value = "3"
+        generator.image_height.value = "2"
+        generated = generator.generate_current_input(tmp_path / "image.npy")
+        assert generated.shape == (1, 3, 2, 3)
+
+        generator.kind.value = "mask"
+        generator._on_kind_changed(event)
+        generator.mask_shape.value = "1,2,3"
+        generated = generator.generate_current_input(tmp_path / "mask.npy")
+        assert generated.shape == (1, 2, 3)
+        assert page.updates
+
+        generator.kind.value = "csv"
+        generator._on_kind_changed(None)
+        generator.csv_path.value = str(csv)
+        generator.csv_columns.value = "1"
+        generator.csv_add_batch.value = True
+        generated = generator.generate_current_input(tmp_path / "csv.npy")
+        assert generated.shape == (1, 2, 1)
+
+        generator.kind.value = "time-series"
+        generator._on_kind_changed(None)
+        generator.series_samples.value = "8"
+        generator.series_channels.value = "2"
+        generated = generator.generate_current_input(tmp_path / "series.npy")
+        assert generated.shape == (1, 8, 2)
+
+
+def test_generator_source_pickers_update_the_form(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = tmp_path / "image.png"
+    csv = tmp_path / "series.csv"
+    responses = [
+        [SimpleNamespace(path=str(image), name=image.name)],
+        [SimpleNamespace(path=str(csv), name=csv.name)],
+    ]
+
+    async def pick_files(
+        picker: ft.FilePicker,
+        **kwargs: object,
+    ) -> list[SimpleNamespace]:
+        assert kwargs["allow_multiple"] is False
+        return responses.pop(0)
+
+    monkeypatch.setattr(ft.FilePicker, "pick_files", pick_files)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        generator = shell.input_generator
+        event = cast(Any, SimpleNamespace())
+        asyncio.run(generator._on_choose_image(event))
+        asyncio.run(generator._on_choose_csv(event))
+
+        assert generator.image_path.value == str(image)
+        assert generator.csv_path.value == str(csv)
+        assert generator.status.value == f"Selected {csv.name}"
+
+
+def test_generator_reports_validation_and_assignment_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "model.onnx"
+    destination = tmp_path / "wrong.npy"
+    build_embedded_model(model, elements=4)
+
+    async def save_file(
+        picker: ft.FilePicker,
+        **kwargs: object,
+    ) -> str:
+        return str(destination)
+
+    monkeypatch.setattr(ft.FilePicker, "save_file", save_file)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        generator = shell.input_generator
+        asyncio.run(generator.generate(assign=True))
+        banner = cast(ft.Text, shell.error_banner.content)
+        assert "Open a model" in str(banner.value)
+
+        shell.show_session(service.open_model(model))
+        generator.kind.value = "tensor"
+        generator.tensor_shape.value = "4"
+        generator.tensor_dtype.value = "int64"
+        asyncio.run(generator.generate(assign=True))
+
+        assert destination.is_file()
+        assert "could not assign" in str(banner.value)
+        assert "assignment failed" in str(generator.status.value)
+
+        generator.tensor_shape.value = "not-a-shape"
+        asyncio.run(generator.generate(assign=False))
+        assert "Could not generate" in str(banner.value)
+
+
+def test_file_type_button_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        settings = 0
+
+        def open_settings() -> None:
+            nonlocal settings
+            settings += 1
+
+        monkeypatch.setattr(
+            "nneditor.ui.app.register_file_associations",
+            lambda **kwargs: SimpleNamespace(extensions=(".onnx", ".pt")),
+        )
+        monkeypatch.setattr(
+            "nneditor.ui.app.open_default_apps_settings",
+            open_settings,
+        )
+        shell._on_register_file_types(cast(Any, SimpleNamespace()))
+
+        assert settings == 1
+        assert "Registered 2" in str(shell.status_text.value)
+
+        def fail(**kwargs: object) -> None:
+            raise FileAssociationError("denied")
+
+        monkeypatch.setattr("nneditor.ui.app.register_file_associations", fail)
+        shell._on_register_file_types(cast(Any, SimpleNamespace()))
+        banner = cast(ft.Text, shell.error_banner.content)
+        assert "denied" in str(banner.value)
 
 
 def test_trace_shell_invalid_limits_and_web_unavailable(tmp_path: Path) -> None:

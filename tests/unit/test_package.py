@@ -21,7 +21,7 @@ def test_distribution_metadata_matches_package() -> None:
     }
 
     assert distribution.version == nneditor.__version__
-    assert console_scripts["nneditor"] == "nneditor.ui.app:run"
+    assert console_scripts["nneditor"] == "nneditor.ui.app:cli"
 
 
 def test_package_is_marked_as_typed() -> None:
@@ -31,11 +31,11 @@ def test_package_is_marked_as_typed() -> None:
 def test_module_entry_point_delegates_to_app(monkeypatch: MonkeyPatch) -> None:
     calls = 0
 
-    def fake_run() -> None:
+    def fake_cli() -> None:
         nonlocal calls
         calls += 1
 
-    monkeypatch.setattr(package_main, "run", fake_run)
+    monkeypatch.setattr(package_main, "cli", fake_cli)
 
     package_main.main()
 

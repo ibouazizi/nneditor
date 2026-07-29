@@ -47,6 +47,8 @@ capture bound, so NNEditor reported an honest partial result while retaining
   artifact.
 - Save only when needed through a dirty-aware top-bar action, or close the
   current model without quitting the application.
+- Generate safe `.npy` test inputs from images, masks, CSV data, synthetic
+  time series, or generic tensor patterns, then assign them to model inputs.
 - Preview quantization and pruning before committing them.
 - Export validated ONNX revisions or clearly labelled weights-only artifacts.
 - Trace ONNX activations in an isolated desktop worker and inspect values by
@@ -93,6 +95,18 @@ nneditor
 python -m nneditor
 ```
 
+Open a model directly from the command line:
+
+```bash
+nneditor path/to/model.onnx
+```
+
+On Windows, select **File types** in the top bar to register NNEditor for
+`.onnx`, `.pb`, `.pt2`, `.pt`, `.pth`, `.ckpt`, `.bin`, `.safetensors`,
+`.mlir`, and `.stablehlo` files. NNEditor then opens Windows Default apps,
+where you choose which extensions should launch it. Registration is per-user
+and never replaces a protected Windows default without that explicit choice.
+
 ## First run
 
 1. Select **Open model** and choose a supported artifact. NNEditor detects its
@@ -122,10 +136,13 @@ it as complete.
 
 Desktop tracing is available for ONNX models:
 
-1. Click the tensor-picker button inside a model input node and choose a safe
-   NumPy `.npy` tensor. Required `*_mask` inputs left unchanged use an
-   automatically generated all-valid mask; other inputs use deterministic
-   random data.
+1. Open **Generate test input** to resize an image, create a mask, convert
+   numeric CSV/time-series data, synthesize a signal, or create a generic
+   tensor. Select a model input and use **Generate, save & assign** to return
+   directly to that input node. You can also click the tensor-picker button
+   inside an input node and choose an existing safe NumPy `.npy` tensor.
+   Required `*_mask` inputs left unchanged use an automatically generated
+   all-valid mask; other inputs use deterministic random data.
 2. Open **Trace activations**, review the input specification and the
    wall-clock, memory, capture, and chunk limits.
 3. Select **Approve & run trace**. This click creates an approval bound to the

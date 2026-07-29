@@ -40,6 +40,7 @@ classifiers = [
 dependencies = [
     "flet[all]==0.86.4",
     "numpy>=1.26,<3",
+    "pillow>=10,<13",
     # Import remains on NNEditor's lazy wire reader.  The official bindings are
     # used only after import for Phase 4 schema validation, checking, shape
     # inference, and export.
@@ -47,7 +48,7 @@ dependencies = [
 ]
 
 [project.scripts]
-nneditor = "nneditor.ui.app:run"
+nneditor = "nneditor.ui.app:cli"
 
 [tool.flet]
 product = "NNEditor"
