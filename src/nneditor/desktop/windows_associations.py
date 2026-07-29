@@ -7,7 +7,6 @@ application and never overwrites the protected ``UserChoice`` default.
 
 from __future__ import annotations
 
-import ctypes
 import os
 import shutil
 import subprocess
@@ -213,6 +212,10 @@ def open_default_apps_settings() -> None:
 
 
 def _delete_tree(root: int, path: str) -> None:
+    if sys.platform != "win32":
+        raise FileAssociationError(
+            "file-association registration is available only on Windows"
+        )
     import winreg
 
     try:
@@ -238,6 +241,12 @@ def _delete_tree(root: int, path: str) -> None:
 
 
 def _notify_shell() -> None:
+    if sys.platform != "win32":
+        raise FileAssociationError(
+            "file-association registration is available only on Windows"
+        )
+    import ctypes
+
     # SHCNE_ASSOCCHANGED / SHCNF_IDLIST: invalidate Explorer's association
     # cache after the complete registration is in place.
     ctypes.windll.shell32.SHChangeNotify(0x08000000, 0x0000, None, None)

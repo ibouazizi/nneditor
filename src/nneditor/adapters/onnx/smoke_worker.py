@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import onnx
@@ -24,14 +24,15 @@ def _limit_process() -> None:
     try:
         import resource
 
-        resource.setrlimit(resource.RLIMIT_CPU, (30, 30))  # type: ignore[attr-defined]
+        resource_api = cast(Any, resource)
+        resource_api.setrlimit(resource_api.RLIMIT_CPU, (30, 30))
         memory = 2 * 1024 * 1024 * 1024
-        resource.setrlimit(  # type: ignore[attr-defined]
-            resource.RLIMIT_AS,  # type: ignore[attr-defined]
+        resource_api.setrlimit(
+            resource_api.RLIMIT_AS,
             (memory, memory),
         )
-        resource.setrlimit(  # type: ignore[attr-defined]
-            resource.RLIMIT_NOFILE,  # type: ignore[attr-defined]
+        resource_api.setrlimit(
+            resource_api.RLIMIT_NOFILE,
             (64, 64),
         )
     except (ImportError, OSError, ValueError):

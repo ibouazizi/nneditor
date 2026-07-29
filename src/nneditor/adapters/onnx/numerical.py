@@ -66,7 +66,7 @@ def _create_job_object(memory_limit: int = _WORKER_MEMORY_LIMIT) -> int | None:
     job dies when the last handle closes. Returns ``None`` off Windows or when
     the API refuses.
     """
-    if os.name != "nt":
+    if sys.platform != "win32":
         return None
     import ctypes
     from ctypes import wintypes
@@ -143,7 +143,7 @@ def _create_job_object(memory_limit: int = _WORKER_MEMORY_LIMIT) -> int | None:
 
 def _assign_process_to_job(job: int, process_handle: int) -> bool:
     """Attach one process to the job; ``False`` means the cap is not applied."""
-    if os.name != "nt":
+    if sys.platform != "win32":
         return False
     import ctypes
     from ctypes import wintypes
@@ -156,7 +156,7 @@ def _assign_process_to_job(job: int, process_handle: int) -> bool:
 
 def _close_job_object(job: int | None) -> None:
     """Close the job handle, which kills any process still inside it."""
-    if job is None or os.name != "nt":
+    if job is None or sys.platform != "win32":
         return
     import ctypes
     from ctypes import wintypes
@@ -178,7 +178,7 @@ def _cap_worker_process(
     failure degrades to an uncapped worker rather than refusing the
     comparison.
     """
-    if os.name != "nt":
+    if sys.platform != "win32":
         return None
     job = _create_job_object(memory_limit)
     if job is None:
