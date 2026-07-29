@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from nneditor.analysis.lod import DetailLevel
 from nneditor.application.session import ApplicationService
 from nneditor.application.slices import GraphSlice
+from nneditor.input_generation import generate_image_tensor
 from nneditor.rendering.scene import NodeGlyph, Scene
 from nneditor.storage.store import TensorUnavailableError
 from nneditor.tracing import (
@@ -373,23 +376,24 @@ def test_narrowed_rerun_preserves_other_values_under_the_value_key(
     assert store.open(second.id).read("b") == np.float32(2.0).tobytes()
 
 
-def test_visualization_builders_are_deterministic_and_disclose_choices() -> None:
+def test_visualization_builders_preserve_exact_matrix_shape() -> None:
     matrix = np.arange(36, dtype=np.float32).reshape(6, 6)
     record = _record("matrix", matrix.tobytes(), shape=matrix.shape)
-    first = build_activation_visualizations(record, matrix.tobytes(), max_map_extent=3)
-    second = build_activation_visualizations(record, matrix.tobytes(), max_map_extent=3)
+    first = build_activation_visualizations(record, matrix.tobytes())
+    second = build_activation_visualizations(record, matrix.tobytes())
     assert first == second
     assert {view.kind for view in first} == {
         PlotKind.HISTOGRAM,
         PlotKind.HEATMAP,
+        PlotKind.TENSOR_LAYER_STACK,
     }
     heatmap = next(view for view in first if view.kind is PlotKind.HEATMAP)
-    assert heatmap.shape == (3, 3)
-    assert "evenly-spaced" in heatmap.downsampling
+    assert heatmap.shape == (6, 6)
+    assert "exact 6x6" in heatmap.downsampling
     assert heatmap.colormap.startswith("viridis")
     assert "min-max" in heatmap.normalization
-    assert heatmap.colors[0] == "#440154"
-    assert heatmap.colors[-1] == "#FDE725"
+    assert heatmap.raster_size == (6, 6)
+    assert heatmap.raster_png.startswith(b"\x89PNG")
 
 
 def test_feature_and_attention_view_selection() -> None:
@@ -401,6 +405,101 @@ def test_feature_and_attention_view_selection() -> None:
     )
     assert PlotKind.FEATURE_MAP_GRID in {view.kind for view in regular}
     assert PlotKind.ATTENTION_MAP in {view.kind for view in attention}
+    feature = next(view for view in regular if view.kind is PlotKind.FEATURE_MAP_GRID)
+    assert feature.shape == (3, 4, 4)
+    assert feature.raster_png.startswith(b"\x89PNG")
+    assert "exact 4x4" in feature.downsampling
+
+
+def test_feature_maps_preserve_non_square_spatial_dimensions() -> None:
+    tensor = np.arange(2 * 18 * 47, dtype=np.float32).reshape(1, 2, 18, 47)
+    record = _record("feature", tensor.tobytes(), shape=tensor.shape)
+
+    feature = next(
+        view
+        for view in build_activation_visualizations(record, tensor.tobytes())
+        if view.kind is PlotKind.FEATURE_MAP_GRID
+    )
+
+    assert feature.shape == (2, 18, 47)
+    assert feature.raster_size == (95, 18)
+    assert "exact 18x47" in feature.downsampling
+
+
+def test_qwen_pixel_patches_reconstruct_exact_rgb_image_and_channel_planes(
+    tmp_path: Path,
+) -> None:
+    pixels = np.arange(32 * 64 * 3, dtype=np.uint8).reshape(32, 64, 3)
+    source = tmp_path / "source.png"
+    Image.fromarray(pixels).save(source)
+    generated = generate_image_tensor(
+        source,
+        tmp_path / "qwen.npy",
+        width=64,
+        height=32,
+        layout="QWEN3VL_PATCHES",
+        normalization="minus-one-one",
+        dtype="float32",
+    )
+    patches = np.load(generated.path, allow_pickle=False)
+    record = _record("pixel_values", patches.tobytes(), shape=patches.shape)
+
+    views = build_activation_visualizations(record, patches.tobytes())
+    image = next(view for view in views if view.kind is PlotKind.RGB_IMAGE)
+    channels = next(view for view in views if view.kind is PlotKind.IMAGE_CHANNEL_STACK)
+    reconstructed = np.asarray(Image.open(BytesIO(image.raster_png)).convert("RGB"))
+
+    assert image.shape == (32, 64, 3)
+    assert image.raster_size == (64, 32)
+    np.testing.assert_array_equal(reconstructed, pixels)
+    assert channels.shape == (3, 32, 64)
+    assert channels.layer_shape == (32, 64)
+    assert len(channels.layer_pngs) == 3
+    assert channels.layer_labels[0].startswith("Red")
+    assert "three planes offset for depth" in channels.downsampling
+
+
+def test_ordinary_rgb_tensor_gets_image_and_layered_channel_views() -> None:
+    tensor = np.arange(3 * 18 * 47, dtype=np.float32).reshape(1, 3, 18, 47)
+    record = _record("pixel_values", tensor.tobytes(), shape=tensor.shape)
+
+    views = build_activation_visualizations(record, tensor.tobytes())
+
+    assert next(view for view in views if view.kind is PlotKind.RGB_IMAGE).shape == (
+        18,
+        47,
+        3,
+    )
+    assert next(
+        view for view in views if view.kind is PlotKind.IMAGE_CHANNEL_STACK
+    ).shape == (3, 18, 47)
+
+
+@pytest.mark.parametrize(
+    ("shape", "layer_count", "last_label"),
+    [
+        ((5, 7), 1, "[:, :]"),
+        ((3, 5, 7), 3, "[2, :, :]"),
+        ((2, 3, 5, 7), 6, "[1, 2, :, :]"),
+    ],
+)
+def test_tensor_layer_stack_maps_leading_axes_to_exact_2d_layers(
+    shape: tuple[int, ...],
+    layer_count: int,
+    last_label: str,
+) -> None:
+    tensor = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    record = _record("activation", tensor.tobytes(), shape=tensor.shape)
+
+    views = build_activation_visualizations(record, tensor.tobytes())
+    stack = next(view for view in views if view.kind is PlotKind.TENSOR_LAYER_STACK)
+
+    assert views[0] is stack
+    assert stack.shape == shape
+    assert stack.layer_shape == shape[-2:]
+    assert len(stack.layer_pngs) == layer_count
+    assert stack.layer_labels[-1] == last_label
+    assert stack.layer_indices == tuple(range(layer_count))
 
 
 def test_comparison_metrics_and_scene_overlays(tmp_path: Path) -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import os
@@ -12,7 +11,6 @@ from typing import Any, cast
 
 import numpy as np
 import onnx
-from onnx import TensorProto, helper
 from onnx.reference import ReferenceEvaluator
 
 
@@ -48,27 +46,30 @@ def _limit_process(raw: dict[str, object]) -> None:
         ) from error
 
 
-def _value_info(model: onnx.ModelProto, name: str) -> onnx.ValueInfoProto:
-    for value in (*model.graph.input, *model.graph.output, *model.graph.value_info):
-        if value.name == name:
-            return cast(onnx.ValueInfoProto, copy.deepcopy(value))
-    return helper.make_tensor_value_info(name, TensorProto.UNDEFINED, None)
-
-
-def _model_for_outputs(
+def _evaluate_prefix(
     model: onnx.ModelProto,
-    names: list[str],
+    feeds: dict[str, np.ndarray[Any, Any]],
+    name: str,
     *,
-    producer_limit: int | None = None,
-) -> onnx.ModelProto:
-    candidate = copy.deepcopy(model)
-    if producer_limit is not None:
-        nodes = list(candidate.graph.node[: producer_limit + 1])
-        del candidate.graph.node[:]
-        candidate.graph.node.extend(nodes)
-    del candidate.graph.output[:]
-    candidate.graph.output.extend(_value_info(candidate, name) for name in names)
-    return candidate
+    producer_limit: int,
+) -> np.ndarray[Any, Any]:
+    """Evaluate one value without copying the model's weights.
+
+    The fallback removes only nodes after the requested value while the
+    evaluator is built and run. Protobuf repeated fields keep the detached
+    node messages alive, so they can be restored without duplicating the
+    model's potentially multi-gigabyte initializer payload.
+    """
+    trailing_nodes = list(model.graph.node[producer_limit + 1 :])
+    del model.graph.node[producer_limit + 1 :]
+    try:
+        values = cast(
+            list[np.ndarray[Any, Any]],
+            ReferenceEvaluator(model).run([name], feeds),
+        )
+        return np.asarray(values[0])
+    finally:
+        model.graph.node.extend(trailing_nodes)
 
 
 def _evaluate(
@@ -90,9 +91,15 @@ def _evaluate(
         return captures, diagnostics
     names = [str(target["value_name"]) for target in runtime_targets]
     try:
-        values = ReferenceEvaluator(_model_for_outputs(model, names)).run(None, feeds)
+        values = ReferenceEvaluator(model).run(names, feeds)
         for target, value in zip(runtime_targets, values, strict=True):
             captures[str(target["value_id"])] = np.asarray(value)
+        return captures, diagnostics
+    except MemoryError as error:
+        diagnostics.append(
+            "full trace exhausted the approved memory limit during evaluation: "
+            f"{error}; increase the Memory limit and approve the trace again"
+        )
         return captures, diagnostics
     except Exception as error:
         diagnostics.append(
@@ -113,13 +120,12 @@ def _evaluate(
             diagnostics.append(f"value {name!r} has no executable producer")
             continue
         try:
-            values = cast(
-                list[np.ndarray[Any, Any]],
-                ReferenceEvaluator(
-                    _model_for_outputs(model, [name], producer_limit=producer)
-                ).run(None, feeds),
+            captures[str(target["value_id"])] = _evaluate_prefix(
+                model,
+                feeds,
+                name,
+                producer_limit=producer,
             )
-            captures[str(target["value_id"])] = np.asarray(values[0])
         except Exception as error:
             diagnostics.append(
                 f"value {name!r} was not captured: {type(error).__name__}: {error}"
@@ -223,33 +229,56 @@ def run(request_path: Path) -> None:
     _limit_process(raw)
     with np.load(str(raw["inputs"]), allow_pickle=False) as archive:
         feeds = {name: np.asarray(archive[name]) for name in archive.files}
-    model = onnx.load_model(str(raw["model"]), load_external_data=True)
+    try:
+        model = onnx.load_model(str(raw["model"]), load_external_data=True)
+    except MemoryError as error:
+        model_mib = Path(str(raw["model"])).stat().st_size / (1024 * 1024)
+        limit_mib = int(raw["memory_bytes"]) / (1024 * 1024)
+        raise RuntimeError(
+            f"the {model_mib:,.0f} MiB ONNX model could not be loaded within "
+            f"the approved {limit_mib:,.0f} MiB trace memory limit; increase "
+            "the Memory limit and approve the trace again"
+        ) from error
     targets = [dict(item) for item in raw["targets"] if isinstance(item, dict)]
     captures, diagnostics = _evaluate(model, feeds, targets)
     output = Path(str(raw["output"]))
     remaining = int(raw["capture_bytes"])
     chunk_bytes = int(raw["chunk_bytes"])
-    records: list[dict[str, object]] = []
-    for target in targets:
-        value_id = str(target["value_id"])
-        capture = captures.get(value_id)
-        failure = next(
-            (
-                diagnostic
-                for diagnostic in diagnostics
-                if repr(str(target["value_name"])) in diagnostic
-            ),
-            None,
-        )
-        record, remaining = _write_capture(
-            output,
-            target,
-            capture,
-            remaining=remaining,
-            chunk_bytes=chunk_bytes,
-            reason=failure,
-        )
-        records.append(record)
+    records_by_index: dict[int, dict[str, object]] = {}
+    prioritized = [
+        index
+        for index, target in enumerate(targets)
+        if target["role"] == "graph-input" or bool(target.get("graph_output"))
+    ]
+    ordinary = [index for index in range(len(targets)) if index not in prioritized]
+    for phase in (prioritized, ordinary):
+        for offset, index in enumerate(phase):
+            target = targets[index]
+            value_id = str(target["value_id"])
+            capture = captures.get(value_id)
+            failure = next(
+                (
+                    diagnostic
+                    for diagnostic in diagnostics
+                    if repr(str(target["value_name"])) in diagnostic
+                ),
+                None,
+            )
+            # Reserve an equal share for each remaining value in this phase.
+            # Small tensors return their unused share to the pool, while large
+            # tensors keep a useful prefix rather than starving later nodes.
+            budget = remaining // (len(phase) - offset)
+            record, unused_budget = _write_capture(
+                output,
+                target,
+                capture,
+                remaining=budget,
+                chunk_bytes=chunk_bytes,
+                reason=failure,
+            )
+            remaining -= budget - unused_budget
+            records_by_index[index] = record
+    records = [records_by_index[index] for index in range(len(targets))]
     response = {
         "runtime": f"onnx.reference {onnx.__version__}",
         "records": records,

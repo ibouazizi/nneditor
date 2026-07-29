@@ -12,7 +12,7 @@ import pytest
 from nneditor.application.session import ApplicationService, ModelSession
 from nneditor.cancellation import OperationCancelled
 from nneditor.tracing import TraceApproval, TraceLimits, TraceRequest
-from nneditor.tracing.runner import TraceError
+from nneditor.tracing.runner import TraceError, recommended_trace_limits
 from tests.fixtures.onnx_models import (
     build_custom_domain_model,
     build_embedded_model,
@@ -198,6 +198,41 @@ def test_inputs_cannot_exceed_approved_worker_memory(tmp_path: Path) -> None:
         with pytest.raises(TraceError, match="inputs require"):
             session.trace_async(request).result(timeout=10)
         assert session.traces() == ()
+
+
+def test_model_load_memory_is_rejected_before_worker_launch(tmp_path: Path) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=4)
+    with ApplicationService() as service:
+        session = service.open_model(path)
+        specification = session.default_trace_inputs()
+        limits = TraceLimits(
+            wall_seconds=10,
+            memory_bytes=128 * 1024 * 1024,
+            capture_bytes=1024,
+            chunk_bytes=64,
+        )
+        request = TraceRequest(
+            specification,
+            limits,
+            TraceApproval.approve(
+                session.title,
+                session.document.source.content_hash,
+                specification,
+                limits,
+            ),
+        )
+
+        with pytest.raises(TraceError, match="before evaluation"):
+            session.trace_async(request).result(timeout=10)
+        assert session.traces() == ()
+
+
+def test_large_inline_onnx_model_gets_practical_trace_defaults() -> None:
+    limits = recommended_trace_limits(1_326_283_019)
+
+    assert limits.memory_bytes == 16384 * 1024 * 1024
+    assert limits.wall_seconds == 300
 
 
 def test_cancellation_discards_worker_staging(tmp_path: Path) -> None:

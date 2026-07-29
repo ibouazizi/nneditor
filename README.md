@@ -82,7 +82,7 @@ actions explain the format-specific reason directly in the interface.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.0.2
+python -m pip install nneditor==1.1.0
 ```
 
 Start the desktop application with either command:

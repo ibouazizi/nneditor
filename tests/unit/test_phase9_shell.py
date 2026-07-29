@@ -50,12 +50,17 @@ def test_trace_shell_empty_consent_loading_and_activation_states(
         callbacks: list[Any] = []
         page.run_thread = cast(Any, callbacks.append)
         shell._on_run_trace(event)
-        assert "Loading trace" in str(shell.trace_status.value)
+        assert "Preparing approved trace" in str(shell.trace_status.value)
+        assert shell.trace_progress.visible
+        assert shell.run_trace_button.disabled
         assert not shell.error_banner.visible
         assert callbacks
-        callbacks.pop()()
+        callbacks.pop(0)()
+        assert callbacks
+        callbacks.pop(0)()
         assert shell.active_trace_id is not None
         assert "Complete trace" in str(shell.trace_status.value)
+        assert not shell.trace_progress.visible
 
         node_id = session.document.main_graph.nodes[0].id
         shell.current_detail = shell.current_detail.OPERATOR
@@ -75,6 +80,29 @@ def test_trace_shell_empty_consent_loading_and_activation_states(
         )
 
 
+def test_open_model_applies_model_aware_trace_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    suggested = TraceLimits(
+        wall_seconds=300,
+        memory_bytes=16384 * 1024 * 1024,
+    )
+    monkeypatch.setattr(
+        "nneditor.ui.app.recommended_trace_limits",
+        lambda _model_bytes: suggested,
+    )
+
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        shell.show_session(service.open_model(path))
+
+        assert shell.trace_wall_seconds.value == "300"
+        assert shell.trace_memory_mib.value == "16384"
+
+
 def test_selecting_traced_node_builds_views_and_opens_large_overlay(
     tmp_path: Path,
 ) -> None:
@@ -89,6 +117,7 @@ def test_selecting_traced_node_builds_views_and_opens_large_overlay(
 
         event = cast(ft.Event[ft.Button], cast(Any, SimpleNamespace()))
         shell._on_run_trace(event)
+        callbacks.pop(0)()
         callbacks.pop(0)()
         assert shell.active_trace_id is not None
 
@@ -217,7 +246,8 @@ def test_graph_first_tensor_picker_and_click_to_inspect_every_value(
         callbacks: list[Any] = []
         cast(Any, page).run_thread = callbacks.append
         shell._on_run_trace(cast(ft.Event[ft.Button], event))
-        callbacks.pop()()
+        callbacks.pop(0)()
+        callbacks.pop(0)()
         assert shell.active_trace_id is not None
         captured = session.activations(shell.active_trace_id).read(input_id)
         np.testing.assert_array_equal(
@@ -300,7 +330,8 @@ def test_required_mask_is_automatic_after_selecting_an_image(tmp_path: Path) -> 
         shell._on_run_trace(cast(Any, SimpleNamespace()))
         assert callbacks
         assert not shell.error_banner.visible
-        callbacks.pop()()
+        callbacks.pop(0)()
+        callbacks.pop(0)()
         assert shell.active_trace_id is not None
 
 
@@ -595,6 +626,8 @@ def test_trace_shell_invalid_limits_and_web_unavailable(tmp_path: Path) -> None:
         assert "configuration is invalid" in str(
             cast(ft.Text, shell.error_banner.content).value
         )
+        assert not shell.trace_progress.visible
+        assert not shell.run_trace_button.disabled
 
         page.web = True  # type: ignore[attr-defined]
         shell._refresh_trace_actions()
@@ -676,16 +709,95 @@ def test_activation_plot_adapter_consumes_headless_view_models() -> None:
         "activation-plot:heatmap",
         "activation-plot:histogram",
         "activation-plot:line",
+        "activation-plot:tensor-layer-stack",
     }
+    heatmap_control = next(
+        control for control in controls if control.data == "activation-plot:heatmap"
+    )
+    assert isinstance(heatmap_control.content, ft.Image)
     assert all(
         isinstance(control.content, cv.Canvas) and control.content.shapes
         for control in controls
+        if control.data in {"activation-plot:histogram", "activation-plot:line"}
     )
     heatmap = next(view for view in views if view.kind.value == "heatmap")
     large_heatmap = cast(
         ft.Container,
         Shell._activation_plot_control(heatmap, width=780, height=420),
     )
-    large_canvas = cast(cv.Canvas, large_heatmap.content)
-    assert large_canvas.width == 420
-    assert large_canvas.height == 420
+    large_image = cast(ft.Image, large_heatmap.content)
+    assert large_image.width == 420
+    assert large_image.height == 420
+
+
+def test_feature_plot_uses_exact_resolution_raster() -> None:
+    tensor = np.arange(2 * 18 * 47, dtype=np.float32).reshape(1, 2, 18, 47)
+    record = ActivationRecord(
+        "feature",
+        "feature",
+        "node",
+        "node-output",
+        "float32",
+        "float32",
+        tensor.shape,
+        CaptureState.COMPLETE,
+        tensor.nbytes,
+        tensor.nbytes,
+        "captures/feature.bin",
+    )
+    feature = next(
+        view
+        for view in build_activation_visualizations(record, tensor.tobytes())
+        if view.kind.value == "feature-map-grid"
+    )
+
+    control = cast(
+        ft.Container,
+        Shell._activation_plot_control(feature, width=780, height=420),
+    )
+
+    assert isinstance(control.content, ft.Image)
+    assert control.content.src == feature.raster_png
+    assert feature.shape[-2:] == (18, 47)
+    assert control.width == pytest.approx(780)
+    assert control.height == pytest.approx(780 * 18 / 95)
+
+
+def test_tensor_layer_viewer_rotates_and_brings_selected_plane_forward() -> None:
+    tensor = np.arange(3 * 18 * 47, dtype=np.float32).reshape(3, 18, 47)
+    record = ActivationRecord(
+        "layers",
+        "layers",
+        "node",
+        "node-output",
+        "float32",
+        "float32",
+        tensor.shape,
+        CaptureState.COMPLETE,
+        tensor.nbytes,
+        tensor.nbytes,
+        "captures/layers.bin",
+    )
+    stack = next(
+        view
+        for view in build_activation_visualizations(record, tensor.tobytes())
+        if view.kind.value == "tensor-layer-stack"
+    )
+    control = cast(
+        ft.Container,
+        Shell._activation_plot_control(stack, width=780, height=420),
+    )
+    controller = cast(Any, control).activation_layer_viewer
+    initial_yaw = controller.yaw
+    initial_pitch = controller.pitch
+
+    controller.rotate(12, -8)
+    controller.select(1)
+
+    assert controller.yaw != initial_yaw
+    assert controller.pitch != initial_pitch
+    assert controller.selected == 1
+    assert controller.scene.controls[-1] is controller.planes[1]
+    assert controller.planes[1].opacity == 1.0
+    assert controller.planes[0].opacity < 1.0
+    assert "source 1" in str(controller.selection_text.value)

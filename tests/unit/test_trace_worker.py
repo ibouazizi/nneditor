@@ -22,12 +22,14 @@ def _target(
     value_name: str,
     *,
     node_id: str | None = "node",
+    graph_output: bool = False,
 ) -> dict[str, object]:
     return {
         "value_id": value_id,
         "value_name": value_name,
         "node_id": node_id,
         "role": "node-output" if node_id else "graph-input",
+        "graph_output": graph_output,
         "element_type": "float32",
         "shape": [4],
     }
@@ -84,6 +86,51 @@ def test_worker_run_captures_augmented_outputs_in_bounded_files(
         (output / record["file_name"]).stat().st_size == record["stored_byte_length"]
         for record in payload["records"]
     )
+
+
+def test_worker_prioritizes_boundaries_and_shares_remaining_capture_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.onnx"
+    build_embedded_model(model_path, elements=4)
+    inputs = tmp_path / "inputs.npz"
+    np.savez(inputs, input=np.arange(4, dtype=np.float32))
+    output = tmp_path / "output"
+    output.mkdir()
+    response = tmp_path / "response.json"
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "model": str(model_path),
+                "inputs": str(inputs),
+                "output": str(output),
+                "response": str(response),
+                "targets": [
+                    _target("input-id", "input", node_id=None),
+                    _target("scaled-id", "scaled"),
+                    _target("output-id", "output", graph_output=True),
+                ],
+                "wall_seconds": 10,
+                "memory_bytes": 1024 * 1024 * 1024,
+                "capture_bytes": 40,
+                "chunk_bytes": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NNEDITOR_TRACE_WORKER", "1")
+    monkeypatch.setattr(trace_worker, "_limit_process", lambda raw: None)
+
+    trace_worker.run(request)
+
+    records = json.loads(response.read_text(encoding="utf-8"))["records"]
+    by_name = {record["value_name"]: record for record in records}
+    assert by_name["input"]["state"] == "complete"
+    assert by_name["output"]["state"] == "complete"
+    assert by_name["scaled"]["state"] == "truncated"
+    assert by_name["scaled"]["stored_byte_length"] == 8
 
 
 def test_worker_capture_states_are_explicit(tmp_path: Path) -> None:
@@ -144,6 +191,96 @@ def test_worker_unsupported_operator_returns_inputs_and_diagnostics(
     assert "output-id" not in captures
     assert diagnostics
     assert "degraded" in diagnostics[0]
+
+
+def test_worker_prefix_fallback_restores_model_without_copying_weights() -> None:
+    input_info = onnx.helper.make_tensor_value_info(
+        "input", onnx.TensorProto.FLOAT, [4]
+    )
+    output_info = onnx.helper.make_tensor_value_info(
+        "output", onnx.TensorProto.FLOAT, [4]
+    )
+    scale = onnx.helper.make_tensor(
+        "scale",
+        onnx.TensorProto.FLOAT,
+        [1],
+        [2.0],
+    )
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Mul", ["input", "scale"], ["scaled"]),
+                onnx.helper.make_node(
+                    "Unsupported",
+                    ["scaled"],
+                    ["output"],
+                    domain="nneditor.test",
+                ),
+            ],
+            "prefix-fallback",
+            [input_info],
+            [output_info],
+            [scale],
+        ),
+        opset_imports=[
+            onnx.helper.make_operatorsetid("", 18),
+            onnx.helper.make_operatorsetid("nneditor.test", 1),
+        ],
+    )
+    before = model.SerializeToString()
+
+    captures, diagnostics = trace_worker._evaluate(
+        model,
+        {"input": np.arange(4, dtype=np.float32)},
+        [
+            _target("scaled-id", "scaled"),
+            _target("output-id", "output"),
+        ],
+    )
+
+    assert np.array_equal(
+        captures["scaled-id"],
+        np.arange(4, dtype=np.float32) * 2,
+    )
+    assert "output-id" not in captures
+    assert diagnostics
+    assert model.SerializeToString() == before
+
+
+def test_worker_memory_exhaustion_does_not_retry_every_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.onnx"
+    build_embedded_model(model_path, elements=4)
+    model = onnx.load_model(model_path)
+    calls = 0
+
+    class ExhaustedEvaluator:
+        def __init__(self, _model: onnx.ModelProto) -> None:
+            nonlocal calls
+            calls += 1
+
+        def run(
+            self,
+            _names: object,
+            _feeds: object,
+        ) -> list[object]:
+            raise MemoryError("allocation failed")
+
+    monkeypatch.setattr(trace_worker, "ReferenceEvaluator", ExhaustedEvaluator)
+    captures, diagnostics = trace_worker._evaluate(
+        model,
+        {"input": np.arange(4, dtype=np.float32)},
+        [
+            _target("scaled-id", "scaled"),
+            _target("output-id", "output"),
+        ],
+    )
+
+    assert captures == {}
+    assert calls == 1
+    assert "increase the Memory limit" in diagnostics[0]
 
 
 def test_worker_rejects_bad_requests_and_direct_launch(

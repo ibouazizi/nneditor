@@ -70,6 +70,7 @@ from nneditor.tracing.contracts import (
     TraceRequest,
     TraceResult,
 )
+from nneditor.tracing.runner import recommended_trace_limits
 from nneditor.tracing.visualization import ActivationVisualization
 from nneditor.transformations.engine import (
     TransformationProposal,
@@ -77,6 +78,7 @@ from nneditor.transformations.engine import (
 )
 from nneditor.transformations.schema import Granularity
 from nneditor.ui import input_workspace, overview, shell_layout, tensor_tools, viewmodel
+from nneditor.ui.activation_layers import build_activation_layer_viewer
 from nneditor.ui.trace_graph import TraceGraphPresentation, build_trace_graph
 
 APP_TITLE = "NNEditor"
@@ -165,6 +167,7 @@ class Shell:
         self.open_job: Job[ModelSession] | None = None
         self.export_job: Job[ExportOutcome] | None = None
         self.trace_job: Job[TraceResult] | None = None
+        self._trace_preparing = False
         # The revision represented by the last successful export in this
         # shell. None is the immutable source artifact; recovered sidecar
         # revisions therefore reopen as unsaved and offer an explicit save.
@@ -583,6 +586,13 @@ class Shell:
             "Open an artifact to see tracing availability.",
             size=10,
             color=_MUTED,
+            expand=True,
+        )
+        self.trace_progress = ft.ProgressRing(
+            width=18,
+            height=18,
+            stroke_width=2,
+            visible=False,
         )
         self.file_types_button = ft.TextButton(
             content="File types",
@@ -605,7 +615,11 @@ class Shell:
 
         trace_controls = ft.Column(
             controls=[
-                self.trace_status,
+                ft.Row(
+                    controls=[self.trace_progress, self.trace_status],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
                 self.trace_seed,
                 self.trace_shapes,
                 ft.Row(
@@ -1148,6 +1162,7 @@ class Shell:
         if self.export_job is not None and not self.export_job.state.is_terminal:
             self.export_job.cancel()
         self.trace_job = None
+        self._trace_preparing = False
         self.export_job = None
         self.service.close_session(session.id)
         self.session = None
@@ -1703,6 +1718,7 @@ class Shell:
         if self.export_job is not None and not self.export_job.state.is_terminal:
             self.export_job.cancel()
         self.trace_job = None
+        self._trace_preparing = False
         self.export_job = None
         if previous is not None and previous is not session and not previous.closed:
             # A reopen must release the outgoing document, its caches, and
@@ -1710,6 +1726,11 @@ class Shell:
             # session takes over; otherwise every reopen leaks all three.
             self.service.close_session(previous.id)
         self.session = session
+        suggested_limits = recommended_trace_limits(session.document.source.byte_size)
+        self.trace_wall_seconds.value = f"{suggested_limits.wall_seconds:g}"
+        self.trace_memory_mib.value = str(
+            suggested_limits.memory_bytes // (1024 * 1024)
+        )
         self._saved_revision_id = None
         self._typed_preview_consent.clear()
         self._hex_offsets.clear()
@@ -2477,6 +2498,7 @@ class Shell:
     def _refresh_trace_actions(self) -> None:
         session = self.session
         running = self.trace_job is not None and not self.trace_job.state.is_terminal
+        busy = self._trace_preparing or running
         web = bool(getattr(self.page, "web", False))
         available = False
         reason = "Open an artifact to see tracing availability."
@@ -2497,7 +2519,8 @@ class Shell:
                 "Review the selected inputs and limits. The run button approves "
                 "exactly one isolated trace."
             )
-        self.run_trace_button.disabled = not available or running
+        self.trace_progress.visible = busy
+        self.run_trace_button.disabled = not available or busy
         self.cancel_trace_button.disabled = not running
         active_result = (
             session.trace(self.active_trace_id)
@@ -2553,13 +2576,16 @@ class Shell:
             self.trace_compare_with.value = (
                 alternatives[-1].id if alternatives else None
             )
-        self.trace_compare_with.disabled = not alternatives or running
+        self.trace_compare_with.disabled = not alternatives or busy
         self.compare_trace_button.disabled = (
-            self.active_trace_id is None or not alternatives or running
+            self.active_trace_id is None or not alternatives or busy
         )
 
     def _on_run_trace(self, event: ft.Event[ft.Button]) -> None:
-        if self.session is None:
+        session = self.session
+        if session is None or self._trace_preparing:
+            return
+        if self.trace_job is not None and not self.trace_job.state.is_terminal:
             return
         if getattr(self.page, "web", False):
             self._show_error(
@@ -2568,49 +2594,69 @@ class Shell:
             )
             self.page.update()
             return
-        try:
-            seed = int(self.trace_seed.value or "")
-            shapes = viewmodel.parse_shape_overrides(self.trace_shapes.value or "")
-            specification = self.session.default_trace_inputs(
-                seed=seed,
-                shapes=shapes,
-                bindings=self._trace_input_bindings,
-            )
-            limits = TraceLimits(
-                wall_seconds=float(self.trace_wall_seconds.value or ""),
-                memory_bytes=int(self.trace_memory_mib.value or "") * 1024 * 1024,
-                capture_bytes=int(self.trace_capture_mib.value or "") * 1024 * 1024,
-                chunk_bytes=int(self.trace_chunk_kib.value or "") * 1024,
-            )
-            approval = TraceApproval.approve(
-                self.session.title,
-                self.session.document.source.content_hash,
-                specification,
-                limits,
-            )
-            # The graph-first workflow promises that any later node or
-            # connection click is inspectable, so the default UI run captures
-            # every graph input and operator output. Narrowed reruns remain
-            # available through the application API.
-            request = TraceRequest(specification, limits, approval)
-            job = self.session.trace_async(request)
-        except (TypeError, ValueError) as error:
-            self._show_error(f"Trace configuration is invalid: {error}")
-            self.page.update()
-            return
+        seed_text = self.trace_seed.value or ""
+        shapes_text = self.trace_shapes.value or ""
+        wall_text = self.trace_wall_seconds.value or ""
+        memory_text = self.trace_memory_mib.value or ""
+        capture_text = self.trace_capture_mib.value or ""
+        chunk_text = self.trace_chunk_kib.value or ""
+        bindings = dict(self._trace_input_bindings)
+        self._trace_preparing = True
         self.error_banner.visible = False
-        self.trace_job = job
         self.active_trace_comparison = None
         self._refresh_trace_actions()
-        self.trace_status.value = (
-            f"Loading trace for {self.session.title} • inputs "
-            f"{specification.hash[:19]} • {limits.wall_seconds:g}s / "
-            f"{limits.memory_bytes // (1024 * 1024)} MiB / "
-            f"{limits.capture_bytes // (1024 * 1024)} MiB capture"
-        )
-        self._set_status("Running approved inference trace in an isolated worker…")
+        self.trace_status.value = f"Preparing approved trace for {session.title}…"
+        self._set_status("Preparing inputs and isolated trace worker…")
         self.page.update()
-        self._watch_trace(job)
+
+        def prepare() -> None:
+            try:
+                seed = int(seed_text)
+                shapes = viewmodel.parse_shape_overrides(shapes_text)
+                specification = session.default_trace_inputs(
+                    seed=seed,
+                    shapes=shapes,
+                    bindings=bindings,
+                )
+                limits = TraceLimits(
+                    wall_seconds=float(wall_text),
+                    memory_bytes=int(memory_text) * 1024 * 1024,
+                    capture_bytes=int(capture_text) * 1024 * 1024,
+                    chunk_bytes=int(chunk_text) * 1024,
+                )
+                approval = TraceApproval.approve(
+                    session.title,
+                    session.document.source.content_hash,
+                    specification,
+                    limits,
+                )
+                request = TraceRequest(specification, limits, approval)
+                job = session.trace_async(request)
+            except (OSError, TypeError, ValueError) as error:
+                if self.session is session:
+                    self._trace_preparing = False
+                    self._refresh_trace_actions()
+                    self._show_error(f"Trace configuration is invalid: {error}")
+                    self.page.update()
+                return
+            if self.session is not session:
+                if not job.state.is_terminal:
+                    job.cancel()
+                return
+            self._trace_preparing = False
+            self.trace_job = job
+            self._refresh_trace_actions()
+            self.trace_status.value = (
+                f"Loading trace for {session.title} • inputs "
+                f"{specification.hash[:19]} • {limits.wall_seconds:g}s / "
+                f"{limits.memory_bytes // (1024 * 1024)} MiB / "
+                f"{limits.capture_bytes // (1024 * 1024)} MiB capture"
+            )
+            self._set_status("Running approved inference trace in an isolated worker…")
+            self.page.update()
+            self._watch_trace(job)
+
+        self.page.run_thread(prepare)
 
     def _watch_trace(self, job: Job[TraceResult]) -> None:
         def wait() -> None:
@@ -3631,7 +3677,16 @@ class Shell:
                         overview.metadata_section(
                             (
                                 ("Kind", plot.kind.value),
-                                ("Displayed shape", str(list(plot.shape))),
+                                (
+                                    "Bins"
+                                    if plot.kind.value == "histogram"
+                                    else "Displayed shape",
+                                    (
+                                        str(len(plot.values))
+                                        if plot.kind.value == "histogram"
+                                        else str(list(plot.shape))
+                                    ),
+                                ),
                                 ("Colormap", plot.colormap),
                                 ("Normalization", plot.normalization),
                                 ("Downsampling", plot.downsampling),
@@ -3729,6 +3784,41 @@ class Shell:
         height: float = 82.0,
     ) -> ft.Control:
         """Render a bounded adapter view; sampling/color choices came from core."""
+        if view.layer_pngs:
+            return build_activation_layer_viewer(
+                view,
+                width=width,
+                height=max(height, 190.0),
+                panel_color=_PANEL,
+                border_color=_BORDER,
+                accent_color=_ACCENT,
+                muted_color=_MUTED,
+            )
+        if view.raster_png and view.raster_size is not None:
+            raster_width, raster_height = view.raster_size
+            scale = min(
+                width / max(raster_width, 1),
+                height / max(raster_height, 1),
+            )
+            rendered_width = max(1.0, raster_width * scale)
+            rendered_height = max(1.0, raster_height * scale)
+            return ft.Container(
+                data=f"activation-plot:{view.kind.value}",
+                content=ft.Image(
+                    src=view.raster_png,
+                    width=rendered_width,
+                    height=rendered_height,
+                    fit=ft.BoxFit.FILL,
+                    filter_quality=ft.FilterQuality.NONE,
+                ),
+                width=rendered_width,
+                height=rendered_height,
+                alignment=ft.Alignment.CENTER,
+                padding=8,
+                bgcolor=_PANEL,
+                border=ft.Border.all(1, _BORDER),
+                border_radius=8,
+            )
         shapes: list[cv.Shape] = []
         if view.kind.value == "feature-map-grid" and len(view.shape) == 3:
             maps, rows, columns = view.shape
@@ -3987,7 +4077,16 @@ class Shell:
                         overview.metadata_section(
                             (
                                 ("Source shape", str(list(plot.source_shape))),
-                                ("Displayed shape", str(list(plot.shape))),
+                                (
+                                    "Bins"
+                                    if plot.kind.value == "histogram"
+                                    else "Displayed shape",
+                                    (
+                                        str(len(plot.values))
+                                        if plot.kind.value == "histogram"
+                                        else str(list(plot.shape))
+                                    ),
+                                ),
                                 ("Colormap", plot.colormap),
                                 ("Normalization", plot.normalization),
                                 ("Downsampling", plot.downsampling),

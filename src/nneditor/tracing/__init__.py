@@ -67,6 +67,9 @@ from nneditor.tracing.runner import (
     TraceError as TraceError,
 )
 from nneditor.tracing.runner import (
+    recommended_trace_limits as recommended_trace_limits,
+)
+from nneditor.tracing.runner import (
     run_onnx_trace as run_onnx_trace,
 )
 from nneditor.tracing.store import (
@@ -110,6 +113,7 @@ __all__ = [
     "compare_traces",
     "comparison_scene_patch",
     "default_input_specification",
+    "recommended_trace_limits",
     "run_onnx_trace",
     "tensor_file_binding",
     "tensor_file_binding_for_input",

@@ -24,19 +24,62 @@ from nneditor.ir.core import Document
 from nneditor.tracing.contracts import (
     ActivationRecord,
     TraceKey,
+    TraceLimits,
     TraceRequest,
     TraceResult,
 )
 from nneditor.tracing.inputs import bind_inputs
 from nneditor.tracing.store import ActivationStore
 
-__all__ = ["TraceError", "run_onnx_trace"]
+__all__ = ["TraceError", "recommended_trace_limits", "run_onnx_trace"]
 
 ModelBuilder = Callable[[Path, CancellationToken], None]
+_MIB = 1024 * 1024
+_GIB = 1024 * _MIB
+_DEFAULT_TRACE_MEMORY_BYTES = 2 * _GIB
+_DEFAULT_TRACE_CAPTURE_BYTES = 256 * _MIB
+_DEFAULT_TRACE_CHUNK_BYTES = _MIB
 
 
 class TraceError(RuntimeError):
     """An approved isolated trace could not produce a trustworthy result."""
+
+
+def _next_power_of_two(value: int) -> int:
+    return 1 << max(0, value - 1).bit_length()
+
+
+def recommended_trace_limits(model_bytes: int) -> TraceLimits:
+    """Return practical isolated-worker defaults for an artifact's size."""
+    if model_bytes < 0:
+        raise ValueError("model byte size cannot be negative")
+    # ONNX first reads the serialized protobuf, then retains parsed tensors,
+    # evaluator state, and live activations. Six model-sized working sets plus
+    # fixed headroom covers attention-heavy inline-weight models such as the
+    # Qwen vision tower while keeping small-model defaults unchanged.
+    estimated_memory = model_bytes * 6 + 512 * _MIB + _DEFAULT_TRACE_CAPTURE_BYTES
+    memory_bytes = max(
+        _DEFAULT_TRACE_MEMORY_BYTES,
+        _next_power_of_two(estimated_memory),
+    )
+    size_units = math.ceil(model_bytes / (256 * _MIB))
+    wall_seconds = 30.0 if size_units <= 1 else float(size_units * 60)
+    return TraceLimits(
+        wall_seconds=wall_seconds,
+        memory_bytes=memory_bytes,
+        capture_bytes=_DEFAULT_TRACE_CAPTURE_BYTES,
+        chunk_bytes=_DEFAULT_TRACE_CHUNK_BYTES,
+    )
+
+
+def _minimum_model_load_bytes(model_bytes: int, input_bytes: int) -> int:
+    # onnx.load_model temporarily needs both serialized and parsed protobuf
+    # storage. This is a hard preflight floor, not the larger practical default.
+    return model_bytes * 2 + input_bytes + 256 * _MIB
+
+
+def _staged_model_bytes(directory: Path) -> int:
+    return sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
 
 
 def _targets(
@@ -77,6 +120,7 @@ def _targets(
                 "value_name": value.name,
                 "node_id": node_id,
                 "role": role,
+                "graph_output": value.id in graph.outputs,
                 "element_type": value.element_type or "unknown",
                 "shape": [
                     dimension if isinstance(dimension, int) else -1
@@ -130,6 +174,18 @@ def run_onnx_trace(
     try:
         build_model(model_path, token)
         token.raise_if_cancelled()
+        model_bytes = _staged_model_bytes(scratch)
+        minimum_memory = _minimum_model_load_bytes(model_bytes, input_bytes)
+        if request.limits.memory_bytes < minimum_memory:
+            recommended = recommended_trace_limits(model_bytes)
+            raise TraceError(
+                f"the approved trace memory limit is "
+                f"{request.limits.memory_bytes / _MIB:,.0f} MiB, but loading "
+                f"this {model_bytes / _MIB:,.0f} MiB model requires at least "
+                f"{minimum_memory / _MIB:,.0f} MiB before evaluation; set "
+                f"Memory limit to {recommended.memory_bytes // _MIB:,} MiB "
+                "and approve the trace again"
+            )
         np.savez(inputs_path, **feeds)  # type: ignore[arg-type]
         payload = {
             "model": str(model_path),

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from enum import StrEnum
 
 import numpy as np
+from PIL import Image
 
 from nneditor.tracing.contracts import ActivationRecord, CaptureState
 
@@ -22,6 +24,9 @@ class PlotKind(StrEnum):
     HEATMAP = "heatmap"
     FEATURE_MAP_GRID = "feature-map-grid"
     ATTENTION_MAP = "attention-map"
+    RGB_IMAGE = "rgb-image"
+    IMAGE_CHANNEL_STACK = "image-channel-stack"
+    TENSOR_LAYER_STACK = "tensor-layer-stack"
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +44,12 @@ class ActivationVisualization:
     partial: bool
     bin_edges: tuple[float, ...] = ()
     colors: tuple[str, ...] = ()
+    raster_png: bytes = b""
+    raster_size: tuple[int, int] | None = None
+    layer_pngs: tuple[bytes, ...] = ()
+    layer_labels: tuple[str, ...] = ()
+    layer_indices: tuple[int, ...] = ()
+    layer_shape: tuple[int, int] | None = None
 
 
 _VIRIDIS = (
@@ -50,29 +61,301 @@ _VIRIDIS = (
 )
 
 
-def _viridis_colors(values: np.ndarray) -> tuple[str, ...]:
-    numeric = values.astype(np.float64, copy=False).ravel()
+def _viridis_lut() -> np.ndarray:
+    anchors = np.linspace(0, 255, len(_VIRIDIS))
+    positions = np.arange(256)
+    palette = np.asarray(_VIRIDIS, dtype=np.float64)
+    channels = [
+        np.interp(positions, anchors, palette[:, channel]) for channel in range(3)
+    ]
+    return np.asarray(np.rint(np.stack(channels, axis=1)), dtype=np.uint8)
+
+
+_VIRIDIS_LUT = _viridis_lut()
+
+
+def _viridis_rgb(
+    values: np.ndarray,
+    *,
+    minimum: float,
+    maximum: float,
+) -> np.ndarray:
+    numeric = values.astype(np.float32, copy=False)
+    finite = np.isfinite(numeric)
+    if not finite.any():
+        return np.full((*numeric.shape, 3), (152, 162, 179), dtype=np.uint8)
+    span = maximum - minimum
+    normalized = (
+        np.full(numeric.shape, 0.5, dtype=np.float32)
+        if span == 0.0
+        else np.clip((numeric - minimum) / span, 0.0, 1.0)
+    )
+    normalized[~finite] = 0.5
+    indices = np.asarray(
+        np.rint(normalized * (len(_VIRIDIS_LUT) - 1)),
+        dtype=np.uint8,
+    )
+    rgb = _VIRIDIS_LUT[indices]
+    rgb[~finite] = (152, 162, 179)
+    return np.asarray(rgb, dtype=np.uint8)
+
+
+def _feature_map_raster(maps: np.ndarray) -> tuple[bytes, tuple[int, int]]:
+    count, rows, columns = maps.shape
+    grid_columns = max(1, int(np.ceil(np.sqrt(count))))
+    grid_rows = max(1, int(np.ceil(count / grid_columns)))
+    gap = 1
+    width = grid_columns * columns + (grid_columns - 1) * gap
+    height = grid_rows * rows + (grid_rows - 1) * gap
+    raster = np.full((height, width, 3), 255, dtype=np.uint8)
+    minimum = float("inf")
+    maximum = float("-inf")
+    for feature in maps:
+        numeric = feature.astype(np.float32, copy=False)
+        finite = np.isfinite(numeric)
+        if finite.any():
+            minimum = min(minimum, float(np.min(numeric[finite])))
+            maximum = max(maximum, float(np.max(numeric[finite])))
+    if not np.isfinite(minimum) or not np.isfinite(maximum):
+        minimum = maximum = 0.0
+    for index in range(count):
+        column = index % grid_columns
+        row = index // grid_columns
+        left = column * (columns + gap)
+        top = row * (rows + gap)
+        raster[top : top + rows, left : left + columns] = _viridis_rgb(
+            maps[index],
+            minimum=minimum,
+            maximum=maximum,
+        )
+    encoded = io.BytesIO()
+    Image.fromarray(raster).save(encoded, format="PNG")
+    return encoded.getvalue(), (width, height)
+
+
+def _encode_png(array: np.ndarray) -> bytes:
+    encoded = io.BytesIO()
+    Image.fromarray(array).save(encoded, format="PNG")
+    return encoded.getvalue()
+
+
+def _qwen_patch_grid(patch_count: int) -> tuple[int, int] | None:
+    candidates = [
+        (height, patch_count // height)
+        for height in range(2, int(np.sqrt(patch_count)) + 1, 2)
+        if patch_count % height == 0 and (patch_count // height) % 2 == 0
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[1] / item[0])
+
+
+def _qwen_image_planes(array: np.ndarray) -> np.ndarray | None:
+    if array.ndim != 2 or array.shape[1] != 3 * 2 * 16 * 16:
+        return None
+    grid = _qwen_patch_grid(int(array.shape[0]))
+    if grid is None:
+        return None
+    grid_height, grid_width = grid
+    packed = array.reshape(
+        1,
+        grid_height // 2,
+        grid_width // 2,
+        2,
+        2,
+        3,
+        2,
+        16,
+        16,
+    )
+    one_temporal_frame = packed[:, :, :, :, :, :, 0, :, :]
+    channel_first = np.transpose(
+        one_temporal_frame,
+        (0, 5, 1, 3, 6, 2, 4, 7),
+    )
+    return channel_first.reshape((3, grid_height * 16, grid_width * 16))
+
+
+def _image_planes(
+    record: ActivationRecord,
+    array: np.ndarray,
+) -> tuple[np.ndarray, str] | None:
+    normalized_name = record.value_name.lower().replace("-", "_")
+    if "pixel" in normalized_name:
+        qwen = _qwen_image_planes(array)
+        if qwen is not None:
+            return qwen, "Qwen3-VL flattened patches"
+    if not any(marker in normalized_name for marker in ("pixel", "image", "rgb")):
+        return None
+    candidate = array
+    if candidate.ndim == 4 and candidate.shape[0] == 1:
+        candidate = candidate[0]
+    if candidate.ndim != 3:
+        return None
+    if candidate.shape[0] == 3:
+        return candidate, "channel-first RGB tensor"
+    if candidate.shape[-1] == 3:
+        return np.transpose(candidate, (2, 0, 1)), "channel-last RGB tensor"
+    return None
+
+
+def _rgb_pixels(planes: np.ndarray) -> tuple[np.ndarray, str]:
+    numeric = planes.astype(np.float32, copy=False)
     finite = numeric[np.isfinite(numeric)]
     if not finite.size:
-        return tuple("#98A2B3" for _ in numeric)
+        return (
+            np.full((*numeric.shape[1:], 3), 152, dtype=np.uint8),
+            "non-finite values masked",
+        )
     minimum = float(np.min(finite))
     maximum = float(np.max(finite))
-    span = maximum - minimum
-    colors: list[str] = []
-    for value in numeric:
-        if not np.isfinite(value):
-            colors.append("#98A2B3")
-            continue
-        normalized = 0.5 if span == 0.0 else (float(value) - minimum) / span
-        position = normalized * (len(_VIRIDIS) - 1)
-        lower = min(int(position), len(_VIRIDIS) - 2)
-        fraction = position - lower
-        rgb = tuple(
-            round(start + (end - start) * fraction)
-            for start, end in zip(_VIRIDIS[lower], _VIRIDIS[lower + 1], strict=True)
+    if minimum >= -1.001 and maximum <= 1.001 and minimum < 0.0:
+        normalized = (numeric + 1.0) / 2.0
+        disclosure = "-1 to 1 values restored to RGB"
+    elif minimum >= 0.0 and maximum <= 1.001:
+        normalized = numeric
+        disclosure = "0 to 1 values restored to RGB"
+    elif minimum >= 0.0 and maximum <= 255.0:
+        normalized = numeric / 255.0
+        disclosure = "0 to 255 values restored to RGB"
+    else:
+        span = maximum - minimum
+        normalized = (
+            np.full(numeric.shape, 0.5, dtype=np.float32)
+            if span == 0.0
+            else (numeric - minimum) / span
         )
-        colors.append("#" + "".join(f"{channel:02X}" for channel in rgb))
-    return tuple(colors)
+        disclosure = "finite values min-max normalized for RGB display"
+    normalized = np.where(np.isfinite(normalized), normalized, 0.5)
+    pixels = np.asarray(
+        np.rint(np.clip(normalized, 0.0, 1.0) * 255.0),
+        dtype=np.uint8,
+    )
+    return np.transpose(pixels, (1, 2, 0)), disclosure
+
+
+def _layer_pngs(
+    maps: np.ndarray,
+    *,
+    channel_tints: tuple[int, ...] | None = None,
+) -> tuple[bytes, ...]:
+    numeric = maps.astype(np.float32, copy=False)
+    finite = numeric[np.isfinite(numeric)]
+    minimum = float(np.min(finite)) if finite.size else 0.0
+    maximum = float(np.max(finite)) if finite.size else 0.0
+    encoded: list[bytes] = []
+    for index, layer in enumerate(numeric):
+        if channel_tints is None:
+            pixels = _viridis_rgb(
+                layer,
+                minimum=minimum,
+                maximum=maximum,
+            )
+        else:
+            span = maximum - minimum
+            normalized = (
+                np.full(layer.shape, 0.5, dtype=np.float32)
+                if span == 0.0
+                else np.clip((layer - minimum) / span, 0.0, 1.0)
+            )
+            normalized = np.where(np.isfinite(normalized), normalized, 0.5)
+            values = np.asarray(np.rint(normalized * 255), dtype=np.uint8)
+            pixels = np.zeros((*layer.shape, 3), dtype=np.uint8)
+            pixels[..., channel_tints[index]] = values
+        encoded.append(_encode_png(pixels))
+    return tuple(encoded)
+
+
+def _tensor_layer_view(
+    record: ActivationRecord,
+    array: np.ndarray,
+    *,
+    maximum_layers: int,
+) -> ActivationVisualization | None:
+    if array.ndim < 2 or array.ndim > 4:
+        return None
+    leading_shape = array.shape[:-2]
+    maps = np.asarray(array).reshape((-1, *array.shape[-2:]))
+    indices = _sample_axis(maps.shape[0], maximum_layers)
+    selected = maps[indices]
+    labels: list[str] = []
+    for index in indices:
+        coordinates = (
+            np.unravel_index(int(index), leading_shape) if leading_shape else ()
+        )
+        prefix = ", ".join(str(int(item)) for item in coordinates)
+        labels.append(f"[{prefix + ', ' if prefix else ''}:, :]")
+    rows, columns = selected.shape[-2:]
+    reduced = len(indices) != maps.shape[0]
+    return ActivationVisualization(
+        kind=PlotKind.TENSOR_LAYER_STACK,
+        title="Activation layers",
+        values=(),
+        shape=tuple(int(item) for item in array.shape),
+        source_shape=record.shape,
+        colormap="viridis (sequential), shared across layers",
+        normalization="global finite-value min-max across displayed layers",
+        downsampling=(
+            f"deterministic evenly-spaced selection of {len(indices)} from "
+            f"{maps.shape[0]} layers; exact {rows}x{columns} spatial axes"
+            if reduced
+            else f"all {maps.shape[0]} layers; exact {rows}x{columns} spatial axes"
+        ),
+        partial=False,
+        layer_pngs=_layer_pngs(selected),
+        layer_labels=tuple(labels),
+        layer_indices=tuple(int(index) for index in indices),
+        layer_shape=(rows, columns),
+    )
+
+
+def _image_views(
+    record: ActivationRecord,
+    array: np.ndarray,
+    *,
+    partial: bool,
+) -> tuple[ActivationVisualization, ...]:
+    resolved = _image_planes(record, array)
+    if resolved is None:
+        return ()
+    planes, layout = resolved
+    rgb, normalization = _rgb_pixels(planes)
+    rows, columns = planes.shape[-2:]
+    image_png = _encode_png(rgb)
+    exact = f"{layout}; exact {rows}x{columns} spatial axes"
+    return (
+        ActivationVisualization(
+            kind=PlotKind.RGB_IMAGE,
+            title="Reconstructed RGB image",
+            values=(),
+            shape=(rows, columns, 3),
+            source_shape=record.shape,
+            colormap="RGB",
+            normalization=normalization,
+            downsampling=exact,
+            partial=partial,
+            raster_png=image_png,
+            raster_size=(columns, rows),
+        ),
+        ActivationVisualization(
+            kind=PlotKind.IMAGE_CHANNEL_STACK,
+            title="RGB channel planes",
+            values=(),
+            shape=(3, rows, columns),
+            source_shape=record.shape,
+            colormap="red, green, and blue channel tints",
+            normalization=normalization,
+            downsampling=exact + "; three planes offset for depth",
+            partial=partial,
+            layer_pngs=_layer_pngs(
+                planes,
+                channel_tints=(0, 1, 2),
+            ),
+            layer_labels=("Red · [0, :, :]", "Green · [1, :, :]", "Blue · [2, :, :]"),
+            layer_indices=(0, 1, 2),
+            layer_shape=(rows, columns),
+        ),
+    )
 
 
 def _finite(values: np.ndarray) -> np.ndarray:
@@ -91,31 +374,26 @@ def _matrix_view(
     kind: PlotKind,
     source_shape: tuple[int, ...],
     partial: bool,
-    maximum: int,
     leading_selection: str = "",
 ) -> ActivationVisualization:
-    rows = _sample_axis(matrix.shape[-2], maximum)
-    columns = _sample_axis(matrix.shape[-1], maximum)
-    sampled = matrix[np.ix_(rows, columns)]
-    reduced = sampled.shape != matrix.shape
+    raster_png, raster_size = _feature_map_raster(matrix.reshape((1, *matrix.shape)))
+    rows, columns = matrix.shape[-2:]
     return ActivationVisualization(
         kind=kind,
         title=(
             "Attention map" if kind is PlotKind.ATTENTION_MAP else "Activation heatmap"
         ),
-        values=tuple(float(value) for value in sampled.ravel()),
-        shape=tuple(int(item) for item in sampled.shape),
+        values=(),
+        shape=tuple(int(item) for item in matrix.shape),
         source_shape=source_shape,
         colormap="viridis (sequential)",
         normalization="global finite-value min-max; non-finite values are masked",
         downsampling=(
-            leading_selection
-            + f"deterministic evenly-spaced axes to at most {maximum}x{maximum}"
-            if reduced
-            else leading_selection or "none"
+            leading_selection + f"spatial axes preserved at exact {rows}x{columns}"
         ),
         partial=partial,
-        colors=_viridis_colors(sampled),
+        raster_png=raster_png,
+        raster_size=raster_size,
     )
 
 
@@ -170,6 +448,22 @@ def build_activation_visualizations(
             )
         )
 
+    image_views = _image_views(
+        record,
+        array,
+        partial=partial,
+    )
+    if image_views:
+        return (*image_views, *views)
+
+    layer_view = _tensor_layer_view(
+        record,
+        array,
+        maximum_layers=max_feature_maps,
+    )
+    if layer_view is not None:
+        views.insert(0, layer_view)
+
     if array.ndim <= 1:
         indices = _sample_axis(flat.size, max_points)
         views.append(
@@ -201,7 +495,6 @@ def build_activation_visualizations(
                 kind=PlotKind.ATTENTION_MAP,
                 source_shape=source_shape,
                 partial=partial,
-                maximum=max_map_extent,
                 leading_selection=(
                     "first leading-index matrix; " if array.ndim > 2 else ""
                 ),
@@ -214,7 +507,6 @@ def build_activation_visualizations(
                 kind=PlotKind.HEATMAP,
                 source_shape=source_shape,
                 partial=partial,
-                maximum=max_map_extent,
             )
         )
     else:
@@ -225,29 +517,30 @@ def build_activation_visualizations(
             maps = maps[0]
         maps = maps.reshape((-1, *maps.shape[-2:]))
         map_indices = _sample_axis(maps.shape[0], max_feature_maps)
-        row_indices = _sample_axis(maps.shape[-2], max_map_extent)
-        column_indices = _sample_axis(maps.shape[-1], max_map_extent)
-        sampled = maps[map_indices][:, row_indices][:, :, column_indices]
-        reduced = sampled.shape != maps.shape
+        sampled = maps[map_indices]
+        reduced = len(map_indices) != maps.shape[0]
+        raster_png, raster_size = _feature_map_raster(sampled)
+        rows, columns = sampled.shape[-2:]
         views.append(
             ActivationVisualization(
                 kind=PlotKind.FEATURE_MAP_GRID,
                 title="Feature maps",
-                values=tuple(float(value) for value in sampled.ravel()),
+                values=(),
                 shape=tuple(int(item) for item in sampled.shape),
                 source_shape=source_shape,
                 colormap="viridis (sequential), shared across maps",
                 normalization="global finite-value min-max across displayed maps",
                 downsampling=(
                     leading_selection
-                    + "deterministic evenly-spaced maps and spatial axes to "
-                    f"{max_feature_maps} maps of at most "
-                    f"{max_map_extent}x{max_map_extent}"
+                    + f"deterministic evenly-spaced maps to {max_feature_maps}; "
+                    f"spatial axes preserved at exact {rows}x{columns}"
                     if reduced
-                    else leading_selection or "none"
+                    else leading_selection
+                    + f"spatial axes preserved at exact {rows}x{columns}"
                 ),
                 partial=partial,
-                colors=_viridis_colors(sampled),
+                raster_png=raster_png,
+                raster_size=raster_size,
             )
         )
     return tuple(views)
