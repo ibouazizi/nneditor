@@ -254,6 +254,11 @@ Mobile packaging is outside the 1.0 release.
 - The original Python, module definitions, and training code cannot be
   reconstructed from serialized artifacts.
 
+## License
+
+NNEditor is licensed under the [Apache License 2.0](LICENSE). Attribution and
+copyright information is provided in [NOTICE](NOTICE).
+
 ## Development
 
 The development environment is managed with

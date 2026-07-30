@@ -20,8 +20,11 @@ def test_distribution_metadata_matches_package() -> None:
         if entry.group == "console_scripts"
     }
     project_urls = distribution.metadata.get_all("Project-URL") or []
+    license_files = distribution.metadata.get_all("License-File") or []
 
     assert distribution.version == nneditor.__version__
+    assert distribution.metadata["License-Expression"] == "Apache-2.0"
+    assert set(license_files) == {"LICENSE", "NOTICE"}
     assert console_scripts["nneditor"] == "nneditor.ui.app:cli"
     assert "Repository, https://github.com/ibouazizi/nneditor" in project_urls
 
