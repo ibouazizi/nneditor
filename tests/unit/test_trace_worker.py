@@ -889,3 +889,88 @@ def test_onnxruntime_reads_a_staged_capture_file_not_serialized_bytes(
     assert reason is None
     assert array is not None
     assert float(array[0]) == 7.0
+
+
+def _fake_session_options() -> type:
+    class FakeSessionOptions:
+        def __init__(self) -> None:
+            self.enable_cpu_mem_arena = True
+            self.enable_mem_pattern = True
+            self.execution_mode: Any = None
+            self.graph_optimization_level: Any = None
+            self.inter_op_num_threads = 0
+            self.intra_op_num_threads = 0
+            self.log_severity_level = 0
+
+        def add_session_config_entry(self, key: str, value: str) -> None:
+            pass
+
+    return FakeSessionOptions
+
+
+def test_nvidia_dlls_are_preloaded_and_skipped_providers_disclosed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA wheels live in site-packages, so the worker must ask ONNX
+    Runtime to preload them; a candidate that still fails must stay
+    visible in the diagnostics of the candidate that finally served."""
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=4)
+    model = onnx.load_model(str(path))
+    feeds = {"input": np.ones(4, dtype=np.float32)}
+    targets = [_target("val:scaled", "scaled")]
+    calls: list[str] = []
+
+    class FakeInferenceSession:
+        def __init__(
+            self,
+            model_source: object,
+            sess_options: Any = None,
+            providers: Any = None,
+            provider_options: Any = None,
+        ) -> None:
+            if "CUDAExecutionProvider" in (providers or []):
+                raise RuntimeError(
+                    "[ONNXRuntimeError] : 1 : FAIL : This session contains "
+                    "graph nodes that are assigned to the default CPU EP, "
+                    "but fallback to CPU EP has been explicitly disabled "
+                    "by the user."
+                )
+
+        def run(
+            self,
+            names: list[str],
+            run_feeds: dict[str, Any],
+        ) -> list[Any]:
+            return [np.zeros(4, dtype=np.float32) for _ in names]
+
+    fake = SimpleNamespace(
+        SessionOptions=_fake_session_options(),
+        ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL=0),
+        GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_BASIC=1),
+        InferenceSession=FakeInferenceSession,
+        get_available_providers=lambda: [
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ],
+        preload_dlls=lambda: calls.append("preload"),
+        __version__="0-test",
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", cast(Any, fake))
+
+    source, _runtime, device, provider = trace_worker._open_backend(
+        model,
+        path,
+        feeds,
+        targets,
+        TraceBackend.ONNX_RUNTIME,
+    )
+
+    assert calls == ["preload"]
+    assert provider == "CPUExecutionProvider"
+    assert device is TraceDevice.CPU
+    skipped = source.diagnostics[0]
+    assert "skipped" in skipped
+    assert "CUDA" in skipped
+    assert "native libraries likely failed to load" in skipped

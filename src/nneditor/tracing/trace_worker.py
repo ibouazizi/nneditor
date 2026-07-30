@@ -582,6 +582,15 @@ def _open_onnxruntime(
     except ImportError as error:
         raise RuntimeError(_missing_runtime_message(device)) from error
 
+    # NVIDIA runtime wheels put their DLLs inside site-packages, where the
+    # Windows DLL search never looks; ONNX Runtime's own preloader resolves
+    # them when present. Its absence or failure must never block tracing —
+    # provider candidates that cannot load fail per-candidate below.
+    preload = getattr(ort, "preload_dlls", None)
+    if preload is not None:
+        with contextlib.suppress(Exception):
+            preload()
+
     available = list(ort.get_available_providers())
     candidates = _provider_candidates(available, device)
     if not candidates:
@@ -620,8 +629,30 @@ def _open_onnxruntime(
                     candidate,
                 )
             except Exception as error:
-                failures.append(f"{candidate.label}: {type(error).__name__}: {error}")
+                detail = f"{type(error).__name__}: {error}"
+                # ONNX Runtime words this two ways: "disabled fallback to
+                # the CPU EP" and "fallback to CPU EP has been explicitly
+                # disabled".
+                if "fallback to" in detail and "CPU EP" in detail:
+                    # ONNX Runtime reports this generic conflict when a
+                    # strict accelerator candidate cannot serve the model —
+                    # most often because the provider's native libraries
+                    # (CUDA, cuDNN, TensorRT) failed to load.
+                    detail += (
+                        " (the provider's native libraries likely failed to"
+                        " load, or the model needs CPU-assigned nodes)"
+                    )
+                failures.append(f"{candidate.label}: {detail}")
                 continue
+            if failures:
+                # A lower-priority provider serving the trace is honest but
+                # surprising; the user must be able to see why the faster
+                # candidates were passed over.
+                source.diagnostics.insert(
+                    0,
+                    "higher-priority execution providers failed and were "
+                    "skipped: " + "; ".join(failures),
+                )
             runtime = f"onnxruntime {ort.__version__} · {candidate.label}"
             return source, runtime, candidate.device, candidate.provider
     finally:

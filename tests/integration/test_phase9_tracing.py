@@ -237,6 +237,15 @@ def test_large_inline_onnx_model_gets_practical_trace_defaults() -> None:
     assert limits.wall_seconds == 300
 
 
+def test_small_models_get_the_accelerator_warmup_wall_clock_floor() -> None:
+    # A TensorRT session compiles an engine before the first inference, so
+    # the recommendation must cover first-run warm-up even for tiny models.
+    assert recommended_trace_limits(1024).wall_seconds == 300
+    assert recommended_trace_limits(255 * 1024 * 1024).wall_seconds == 300
+    # Larger models keep the size-scaled allowance beyond the floor.
+    assert recommended_trace_limits(2 * 1024**3).wall_seconds == 480
+
+
 def test_cancellation_discards_worker_staging(tmp_path: Path) -> None:
     path = tmp_path / "model.onnx"
     build_embedded_model(path, elements=512 * 1024)

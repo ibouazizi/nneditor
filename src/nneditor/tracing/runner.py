@@ -64,7 +64,11 @@ def recommended_trace_limits(model_bytes: int) -> TraceLimits:
         _next_power_of_two(estimated_memory),
     )
     size_units = math.ceil(model_bytes / (256 * _MIB))
-    wall_seconds = 30.0 if size_units <= 1 else float(size_units * 60)
+    # Accelerator sessions can spend minutes before the first inference runs
+    # — TensorRT compiles an engine per model, CUDA loads kernels — so even a
+    # small model needs a first-run allowance far beyond its execution time,
+    # and the reference-evaluator fallback is slower still.
+    wall_seconds = max(300.0, float(size_units * 60))
     return TraceLimits(
         wall_seconds=wall_seconds,
         memory_bytes=memory_bytes,
