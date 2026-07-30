@@ -32,6 +32,7 @@ from nneditor.analysis.hierarchy import (
 )
 from nneditor.application.persistence import default_state_directory
 from nneditor.cancellation import CancellationToken
+from nneditor.diagnostics import Diagnostic, DiagnosticLog
 from nneditor.ir.core import Document
 from nneditor.ir.identity import user_group_id
 
@@ -270,7 +271,11 @@ def _rank(group: Group) -> tuple[int, int, float, int, str]:
     )
 
 
-def _nest(graph_id: str, groups: list[Group]) -> Hierarchy:
+def _nest(
+    graph_id: str,
+    groups: list[Group],
+    diagnostics: tuple[Diagnostic, ...] = (),
+) -> Hierarchy:
     accepted: list[Group] = []
     for candidate in sorted(groups, key=_rank, reverse=True):
         if any(
@@ -295,6 +300,7 @@ def _nest(graph_id: str, groups: list[Group]) -> Hierarchy:
         graph_id,
         nested,
         revision=hierarchy_revision(graph_id, nested),
+        diagnostics=diagnostics,
     )
 
 
@@ -334,6 +340,7 @@ class HierarchyController:
     __slots__ = (
         "_automatic_by_mode",
         "_candidates",
+        "_diagnostics",
         "_document",
         "_hierarchies",
         "_overrides",
@@ -359,9 +366,16 @@ class HierarchyController:
         # only filter this pool before reconciliation, so switching modes is
         # a re-reconcile, never a re-detect.
         active = pipeline or DetectionPipeline()
+        # Detectors report the analysis they declined to run (a graph over a
+        # scan bound, say) so the shell can explain missing blocks instead of
+        # showing an unexplained gap.
+        logs = {graph.id: DiagnosticLog() for graph in document.graphs.values()}
         self._candidates: dict[str, tuple[GroupCandidate, ...]] = {
-            graph.id: active.candidates(document, graph, token)
+            graph.id: active.candidates(document, graph, token, logs[graph.id])
             for graph in document.graphs.values()
+        }
+        self._diagnostics: dict[str, tuple[Diagnostic, ...]] = {
+            graph_id: tuple(log) for graph_id, log in logs.items()
         }
         self._automatic_by_mode: dict[OrganizationMode, dict[str, Hierarchy]] = {}
         self._hierarchies: dict[str, Hierarchy] = {}
@@ -370,6 +384,11 @@ class HierarchyController:
     @_read_overrides_locked
     def hierarchy(self, graph_id: str) -> Hierarchy:
         return self._hierarchies[graph_id]
+
+    @_read_overrides_locked
+    def diagnostics(self, graph_id: str) -> tuple[Diagnostic, ...]:
+        """Coded reasons that automatic analysis skipped part of this graph."""
+        return self._diagnostics.get(graph_id, ())
 
     @property
     @_read_overrides_locked
@@ -614,5 +633,7 @@ class HierarchyController:
                 for group in self._overrides.manual_groups.values()
                 if group.graph_id == graph_id
             )
-            result[graph_id] = _nest(graph_id, groups)
+            result[graph_id] = _nest(
+                graph_id, groups, self._diagnostics.get(graph_id, ())
+            )
         self._hierarchies = result

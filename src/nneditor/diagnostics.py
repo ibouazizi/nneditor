@@ -256,6 +256,27 @@ _PYTORCH_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
     ),
 )
 
+_HIERARCHY_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
+    CodeDescriptor(
+        "hierarchy.structural-analysis-skipped",
+        DiagnosticCategory.UNSUPPORTED,
+        "Structural block detection was skipped",
+        "The graph has more nodes than the exact dominator analysis is allowed "
+        "to sweep, so branch/merge and residual regions were not detected. "
+        "Blocks still come from exporter scopes, repeated structure, and "
+        "operator motifs; group manually where a region matters.",
+    ),
+    CodeDescriptor(
+        "hierarchy.repeat-analysis-skipped",
+        DiagnosticCategory.UNSUPPORTED,
+        "Repeated block detection was skipped",
+        "The graph has more nodes than the repeated-structure scan is allowed "
+        "to examine, so identical blocks were not grouped by structure. Blocks "
+        "still come from exporter scopes and operator motifs.",
+    ),
+)
+
+
 _JAX_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
     CodeDescriptor(
         "jax.opaque-operation",
@@ -323,6 +344,7 @@ _JAX_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
 
 _DESCRIPTORS: tuple[CodeDescriptor, ...] = (
     _PYTORCH_DESCRIPTORS
+    + _HIERARCHY_DESCRIPTORS
     + _JAX_DESCRIPTORS
     + (
         CodeDescriptor(

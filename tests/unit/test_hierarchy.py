@@ -11,6 +11,7 @@ import pytest
 from nneditor.analysis.detectors import (
     DetectionPipeline,
     GraphTopology,
+    Pattern,
     PatternDetector,
     RepeatedSubgraphDetector,
     SourceHierarchyDetector,
@@ -29,6 +30,7 @@ from nneditor.application.hierarchy import (
     HierarchySidecarStore,
 )
 from nneditor.cancellation import CancellationToken, OperationCancelled
+from nneditor.diagnostics import DiagnosticLog, describe
 from nneditor.ir.capabilities import ArtifactKind, contract_for
 from nneditor.ir.core import ArtifactRef, Document, Graph, Node, Value
 from nneditor.ir.identity import NodeIdStability
@@ -249,6 +251,171 @@ class TestEvidenceDetectors:
         assert "Attention" in labels
         assert "Feed-forward" in labels
         assert all("motif" in item.evidence[0].summary for item in candidates)
+
+    def test_attention_motif_matches_across_scale_and_mask_operators(self) -> None:
+        """Exported attention scales and masks scores before the softmax.
+
+        Strict immediate-successor matching never fired on a real transformer,
+        which left the layer level of detail with nothing to collapse.
+        """
+        graph = linear_graph(("MatMul", "Div", "Add", "Softmax", "MatMul"))
+        candidates = PatternDetector().detect(make_document(graph), graph)
+        attention = [item for item in candidates if item.label == "Attention"]
+        assert len(attention) == 1
+        # The bridged scale and mask ops belong to the motif, not beside it.
+        assert attention[0].members == frozenset(("n0", "n1", "n2", "n3", "n4"))
+        assert "bridging" in attention[0].evidence[0].summary
+        assert "MatMul → Div → Add → Softmax → MatMul" in (
+            attention[0].evidence[0].summary
+        )
+
+    def test_pattern_matching_stops_at_the_connector_run_bound(self) -> None:
+        """Bridging is bounded, so unrelated chains do not fuse into a motif."""
+        within = linear_graph(
+            ("MatMul", "Div", "Add", "Mul", "Cast", "Softmax", "Gemm")
+        )
+        assert [
+            item
+            for item in PatternDetector().detect(make_document(within), within)
+            if item.label == "Attention"
+        ]
+
+        beyond = linear_graph(
+            ("MatMul", "Div", "Add", "Mul", "Sub", "Cast", "Softmax", "Gemm")
+        )
+        assert not [
+            item
+            for item in PatternDetector().detect(make_document(beyond), beyond)
+            if item.label == "Attention"
+        ]
+
+    def test_pattern_rejects_a_stage_that_is_also_a_connector(self) -> None:
+        with pytest.raises(ValueError, match="both a stage and a connector"):
+            Pattern(
+                "bad",
+                "Bad",
+                (frozenset(("MatMul",)), frozenset(("Softmax",))),
+                0.5,
+                connectors=frozenset(("Softmax",)),
+                max_connector_run=1,
+            )
+
+    def test_scan_limits_are_disclosed_rather_than_silent(self) -> None:
+        """A graph over a scan bound must say why its blocks are missing."""
+        graph = linear_graph(("Relu",) * 12)
+        document = make_document(graph)
+
+        log = DiagnosticLog()
+        assert StructuralRegionDetector().detect(document, graph, None, log) == ()
+        # The detector is bounded far above this fixture, so nothing is skipped.
+        assert not list(log)
+
+        structural = DiagnosticLog()
+        assert (
+            StructuralRegionDetector(max_nodes=4).detect(
+                document, graph, None, structural
+            )
+            == ()
+        )
+        codes = {item.code for item in structural}
+        assert "hierarchy.structural-analysis-skipped" in codes
+        assert all(describe(code).guidance.strip() for code in codes)
+
+        repeats = DiagnosticLog()
+        assert (
+            RepeatedSubgraphDetector(max_graph_nodes=4).detect(
+                document, graph, None, repeats
+            )
+            == ()
+        )
+        assert {item.code for item in repeats} == {"hierarchy.repeat-analysis-skipped"}
+
+    def test_controller_exposes_skipped_analysis_per_graph(self) -> None:
+        graph = linear_graph(("Relu",) * 12)
+        controller = HierarchyController(
+            make_document(graph),
+            pipeline=DetectionPipeline((RepeatedSubgraphDetector(max_graph_nodes=4),)),
+        )
+        assert {item.code for item in controller.diagnostics(graph.id)} == {
+            "hierarchy.repeat-analysis-skipped"
+        }
+        # The hierarchy the shell renders carries the same explanation.
+        assert controller.hierarchy(graph.id).diagnostics == controller.diagnostics(
+            graph.id
+        )
+
+    def test_repeated_detector_finds_blocks_larger_than_the_old_cap(self) -> None:
+        """A transformer layer is far bigger than the old twelve-node window.
+
+        The previous cap fragmented one layer into sub-chunks, so a stripped
+        model never showed its repeated blocks.
+        """
+        block = (
+            "MatMul",
+            "Add",
+            "Mul",
+            "Div",
+            "Softmax",
+            "MatMul",
+            "Gemm",
+            "Gelu",
+            "Gemm",
+            "Relu",
+            "Sub",
+            "Cast",
+            "Reshape",
+            "Transpose",
+            "Sqrt",
+            "Neg",
+        )
+        graph = linear_graph(("Identity", *block * 3))
+        candidates = RepeatedSubgraphDetector().detect(make_document(graph), graph)
+        assert len(candidates) == 3
+        assert all(len(item.members) == len(block) for item in candidates)
+        # One consolidated block, not a pile of two-node fragments.
+        assert len({item.label for item in candidates}) == 1
+
+    def test_repeated_detector_reports_the_fundamental_period(self) -> None:
+        """Stacked identical blocks are N blocks, not N/2 double blocks."""
+        block = ("MatMul", "Gelu", "Gemm", "Relu", "Add", "Cast")
+        graph = linear_graph(("Identity", *block * 4))
+        candidates = RepeatedSubgraphDetector().detect(make_document(graph), graph)
+        assert len(candidates) == 4
+        assert all(len(item.members) == len(block) for item in candidates)
+
+    def test_repeated_detector_survives_interleaved_declaration_order(self) -> None:
+        """Dependency order finds blocks that declaration order splits apart.
+
+        Two independent identical chains are declared alternately, which the
+        old declaration-order window scan could not group.
+        """
+        values = tuple(
+            Value(
+                id=f"v{index}", name=f"v{index}", element_type="float32", shape=(4, 4)
+            )
+            for index in range(8)
+        )
+        ops = ("MatMul", "Gelu", "Gemm", "Relu")
+        nodes = []
+        for step, op in enumerate(ops):
+            for chain in (0, 1):
+                index = chain * len(ops) + step
+                nodes.append(
+                    Node(
+                        id=f"n{index}",
+                        id_stability=NodeIdStability.NAMED,
+                        op_type=op,
+                        inputs=() if step == 0 else (f"v{index - 1}",),
+                        outputs=(f"v{index}",),
+                    )
+                )
+        graph = Graph(
+            id="g:main", name="interleaved", nodes=tuple(nodes), values=values
+        )
+        candidates = RepeatedSubgraphDetector().detect(make_document(graph), graph)
+        memberships = {item.members for item in candidates}
+        assert frozenset(("n0", "n1", "n2", "n3")) in memberships
+        assert frozenset(("n4", "n5", "n6", "n7")) in memberships
 
     def test_repeated_detector_emits_each_occurrence(self) -> None:
         graph = repeated_graph()

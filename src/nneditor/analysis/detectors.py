@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final
@@ -26,6 +26,7 @@ from nneditor.analysis.hierarchy import (
     reconcile_candidates,
 )
 from nneditor.cancellation import CancellationToken
+from nneditor.diagnostics import DiagnosticLog, Severity
 from nneditor.ir.core import Attribute, Document, Graph, Node
 
 __all__ = [
@@ -279,8 +280,9 @@ class SourceHierarchyDetector:
         document: Document,
         graph: Graph,
         token: CancellationToken | None = None,
+        log: DiagnosticLog | None = None,
     ) -> tuple[GroupCandidate, ...]:
-        del document
+        del document, log
         prefixes: dict[tuple[str, ...], set[str]] = {}
         for node in graph.nodes:
             if token is not None:
@@ -343,14 +345,31 @@ class StructuralRegionDetector:
     name = "structural-region"
     version = 1
 
+    def __init__(self, *, max_nodes: int = MAX_EXACT_DOMINATOR_NODES) -> None:
+        if max_nodes < 1:
+            raise ValueError("max_nodes must be positive")
+        self.max_nodes = max_nodes
+
     def detect(
         self,
         document: Document,
         graph: Graph,
         token: CancellationToken | None = None,
+        log: DiagnosticLog | None = None,
     ) -> tuple[GroupCandidate, ...]:
         del document
-        if len(graph.nodes) > MAX_EXACT_DOMINATOR_NODES:
+        if len(graph.nodes) > self.max_nodes:
+            # Say so rather than silently returning nothing: a large model
+            # otherwise loses every structural block with no explanation.
+            if log is not None:
+                log.add(
+                    "hierarchy.structural-analysis-skipped",
+                    Severity.INFO,
+                    f"{len(graph.nodes)} nodes exceed the "
+                    f"{self.max_nodes}-node exact dominator limit, so "
+                    "branch/merge and residual regions were not detected.",
+                    graph.id,
+                )
             return ()
         topology = GraphTopology(graph)
         postdom = _fixed_point_dominators(topology, reverse=True, token=token)
@@ -443,12 +462,27 @@ class StructuralRegionDetector:
 
 @dataclass(frozen=True, slots=True)
 class Pattern:
-    """A versioned, human-readable linear operator motif."""
+    """A versioned, human-readable operator motif with optional bridging ops.
+
+    ``stages`` are the ops that define the motif and must all be present.
+    ``connectors`` are ops that a real exporter interposes *between* stages
+    without changing what the motif is — the scale ``Div``/``Mul`` and mask
+    ``Add`` an attention core carries between its score ``MatMul`` and
+    ``Softmax``, for instance. Up to ``max_connector_run`` of them may be
+    skipped through per stage transition, and any that are traversed join the
+    group, because they belong to the motif rather than sitting outside it.
+
+    Without this, matching was a strict chain of immediate successors, so the
+    attention motif never fired on ordinary exported transformers and the
+    layer level of detail had nothing to show.
+    """
 
     name: str
     label: str
     stages: tuple[frozenset[str], ...]
     confidence: float
+    connectors: frozenset[str] = frozenset()
+    max_connector_run: int = 0
 
     def __post_init__(self) -> None:
         if not self.name or not self.label or len(self.stages) < 2:
@@ -457,6 +491,18 @@ class Pattern:
             raise ValueError("pattern stages cannot be empty")
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("pattern confidence must be in [0, 1]")
+        if self.max_connector_run < 0:
+            raise ValueError("max_connector_run cannot be negative")
+        if self.connectors and self.max_connector_run < 1:
+            raise ValueError("connectors need a positive max_connector_run")
+        if self.max_connector_run and not self.connectors:
+            raise ValueError("max_connector_run needs connector op types")
+        for stage in self.stages:
+            if stage & self.connectors:
+                raise ValueError(
+                    "an op type cannot be both a stage and a connector: "
+                    f"{sorted(stage & self.connectors)}"
+                )
 
 
 _LINEAR = frozenset(("Gemm", "MatMul"))
@@ -470,30 +516,48 @@ _NORMS = frozenset(
 )
 _ACTIVATIONS = frozenset(("Relu", "LeakyRelu", "Gelu", "Sigmoid", "Tanh", "Clip"))
 
+# Shape/layout ops that move data without changing what a motif computes.
+_RESHAPES: Final = frozenset(("Reshape", "Transpose", "Cast", "Squeeze", "Unsqueeze"))
+# Elementwise ops an exporter emits for attention scaling and mask application.
+_SCALE_MASK: Final = frozenset(("Div", "Mul", "Add", "Sub", "Where"))
+
 DEFAULT_PATTERNS: Final[tuple[Pattern, ...]] = (
     Pattern(
         "conv-norm-activation",
         "Conv + norm + activation",
         (frozenset(("Conv", "ConvTranspose")), _NORMS, _ACTIVATIONS),
         0.96,
+        connectors=frozenset(("Add", "Cast")),
+        max_connector_run=1,
     ),
     Pattern(
         "attention-core",
         "Attention",
         (_LINEAR, frozenset(("Softmax",)), _LINEAR),
         0.94,
+        # Scores are scaled and masked before the softmax and the context
+        # product is usually reshaped after it; an exported attention core
+        # essentially never has softmax as an immediate successor of MatMul.
+        connectors=_SCALE_MASK | _RESHAPES,
+        max_connector_run=4,
     ),
     Pattern(
         "feed-forward",
         "Feed-forward",
         (_LINEAR, _ACTIVATIONS, _LINEAR),
         0.94,
+        # Gated feed-forward variants multiply the activated branch, and
+        # exporters interpose shape ops around the projections.
+        connectors=frozenset(("Mul",)) | _RESHAPES,
+        max_connector_run=2,
     ),
     Pattern(
         "norm-activation",
         "Normalization",
         (_NORMS, _ACTIVATIONS),
         0.82,
+        connectors=frozenset(("Cast",)),
+        max_connector_run=1,
     ),
 )
 
@@ -502,18 +566,57 @@ class PatternDetector:
     """Matches the deterministic, versioned motif library."""
 
     name = "operator-pattern"
-    version = 1
+    # Version 2 added bounded connector traversal, so a match may now include
+    # bridging ops. Group ids embed the detector version, which means version 1
+    # pattern ids (and any correction that referenced one) no longer resolve.
+    version = 2
 
     def __init__(self, patterns: tuple[Pattern, ...] = DEFAULT_PATTERNS) -> None:
         self.patterns = patterns
+
+    @staticmethod
+    def _advance(
+        graph: Graph,
+        topology: GraphTopology,
+        current: str,
+        stage: frozenset[str],
+        pattern: Pattern,
+    ) -> tuple[tuple[str, ...], str] | None:
+        """Walk from ``current`` to the next stage across bridging ops.
+
+        Returns the traversed connector ids and the matching stage node, or
+        ``None`` when the next stage is absent or the step is ambiguous. Every
+        hop demands exactly one candidate so a match stays deterministic and a
+        fan-out never silently picks a branch.
+        """
+        bridge: list[str] = []
+        node_id = current
+        for _ in range(pattern.max_connector_run + 1):
+            successors = topology.successors(node_id)
+            direct = [item for item in successors if graph.node(item).op_type in stage]
+            if len(direct) == 1:
+                return tuple(bridge), direct[0]
+            if len(direct) > 1:
+                return None
+            hops = [
+                item
+                for item in successors
+                if graph.node(item).op_type in pattern.connectors
+            ]
+            if len(hops) != 1 or hops[0] in bridge:
+                return None
+            bridge.append(hops[0])
+            node_id = hops[0]
+        return None
 
     def detect(
         self,
         document: Document,
         graph: Graph,
         token: CancellationToken | None = None,
+        log: DiagnosticLog | None = None,
     ) -> tuple[GroupCandidate, ...]:
-        del document
+        del document, log
         topology = GraphTopology(graph)
         candidates: list[GroupCandidate] = []
         for start in graph.nodes:
@@ -523,17 +626,17 @@ class PatternDetector:
                 if start.op_type not in pattern.stages[0]:
                     continue
                 matched = [start.id]
+                stage_nodes = [start.id]
                 current = start.id
                 for stage in pattern.stages[1:]:
-                    successors = topology.successors(current)
-                    choices = [
-                        item for item in successors if graph.node(item).op_type in stage
-                    ]
-                    if len(choices) != 1:
+                    step = self._advance(graph, topology, current, stage, pattern)
+                    if step is None:
                         break
-                    current = choices[0]
+                    bridge, current = step
+                    matched.extend(bridge)
                     matched.append(current)
-                if len(matched) != len(pattern.stages):
+                    stage_nodes.append(current)
+                if len(stage_nodes) != len(pattern.stages):
                     continue
                 members = frozenset(matched)
                 candidates.append(
@@ -553,7 +656,14 @@ class PatternDetector:
                                 + " → ".join(
                                     graph.node(item).op_type for item in matched
                                 )
-                                + ".",
+                                + "."
+                                + (
+                                    ""
+                                    if len(matched) == len(stage_nodes)
+                                    else f" {len(matched) - len(stage_nodes)} "
+                                    "bridging operator(s) between motif stages "
+                                    "were included in the group."
+                                ),
                                 tuple(matched),
                             ),
                         ),
@@ -592,19 +702,21 @@ def _node_signature(graph: Graph, node: Node) -> object:
 def _window_signature(
     graph: Graph, topology: GraphTopology, node_ids: tuple[str, ...]
 ) -> str:
-    member_set = set(node_ids)
+    # Order edges by their position *within the window*, never by node id.
+    # Sorting the id strings first made the signature depend on how ids happen
+    # to collate: a window over "n1".."n16" sorts as n1, n10, n11, ..., n2,
+    # while "n17".."n32" sorts numerically, so two structurally identical
+    # blocks produced different edge lists and were never grouped.
+    position = {node_id: index for index, node_id in enumerate(node_ids)}
     internal_edges = sorted(
-        (source, target)
+        (position[source], position[target])
         for source in node_ids
         for target in topology.successors(source)
-        if target in member_set
+        if target in position
     )
     payload = {
         "nodes": [_node_signature(graph, graph.node(item)) for item in node_ids],
-        "edges": [
-            [node_ids.index(source), node_ids.index(target)]
-            for source, target in internal_edges
-        ],
+        "edges": [[source, target] for source, target in internal_edges],
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -616,8 +728,64 @@ def _default_digest(signature: str) -> str:
     return hashlib.blake2b(signature.encode(), digest_size=16).hexdigest()
 
 
+def _block_scan_order(topology: GraphTopology) -> tuple[str, ...]:
+    """Depth-first dependency order for repeat scanning.
+
+    Repeat detection compares windows of consecutive nodes, so the ordering
+    decides what can be found at all, and raw declaration order fails whenever
+    an exporter interleaves the nodes of separate blocks. Depth-first reverse
+    postorder follows one path to its end before starting the next, so each
+    block's nodes land together and corresponding nodes of identical blocks
+    land at corresponding offsets. A breadth-first or index-ordered
+    topological sort would not: it interleaves independent parallel chains
+    exactly the way the declaration order already did.
+
+    Reverse postorder is also a valid topological order, and nodes left
+    unreachable by a malformed cycle are appended in declaration order rather
+    than dropped.
+    """
+    graph = topology.graph
+    roots = topology.entries or tuple(node.id for node in graph.nodes)
+    ordered = _reverse_postorder(roots, topology.successors)
+    if len(ordered) != len(graph.nodes):
+        seen = set(ordered)
+        ordered.extend(node.id for node in graph.nodes if node.id not in seen)
+    return tuple(ordered)
+
+
+_HASH_BASE: Final = 1_000_003
+_HASH_MODULUS: Final = (1 << 61) - 1
+
+
+def _prefix_hashes(sequence: Sequence[int]) -> tuple[list[int], list[int]]:
+    """Polynomial prefix hashes so any window's hash is a constant-time read.
+
+    Bucketing windows by hash keeps the scan linear per window size, which is
+    what makes an unbounded window size affordable; the full canonical
+    signature is still compared before anything is grouped.
+    """
+    prefix = [0] * (len(sequence) + 1)
+    powers = [1] * (len(sequence) + 1)
+    for index, value in enumerate(sequence):
+        prefix[index + 1] = (prefix[index] * _HASH_BASE + value + 1) % _HASH_MODULUS
+        powers[index + 1] = powers[index] * _HASH_BASE % _HASH_MODULUS
+    return prefix, powers
+
+
 class RepeatedSubgraphDetector:
-    """Finds repeated, shape- and attribute-aware declaration-order windows.
+    """Finds repeated, shape- and attribute-aware windows of the graph.
+
+    Windows are runs of consecutive nodes in *dependency* order (see
+    :func:`_stable_topological_order`) rather than declaration order, so a
+    block whose nodes an exporter interleaved with its neighbours is still
+    found. Window size is bounded only by half the graph, because a real
+    transformer layer is far larger than the twelve nodes this detector used to
+    allow — a layer was previously fragmented into sub-chunks instead of being
+    recognised.
+
+    When a size matches, a smaller size that divides it and explains at least
+    as many nodes is preferred, so twenty-four layers are reported as
+    twenty-four blocks and not twelve double-layer blocks.
 
     Hashes are only bucket keys. Full canonical signatures are compared before
     a group is emitted, so a collision can at worst reduce performance; it
@@ -625,13 +793,15 @@ class RepeatedSubgraphDetector:
     """
 
     name = "repeated-subgraph"
-    version = 1
+    # Version 2 changed the ordering, the size bound, and the period choice, so
+    # ids from version 1 (and any correction referencing one) no longer resolve.
+    version = 2
 
     def __init__(
         self,
         *,
         min_size: int = 2,
-        max_size: int = 12,
+        max_size: int = 96,
         max_graph_nodes: int = MAX_REPEAT_SCAN_NODES,
         digest: DigestFunction = _default_digest,
     ) -> None:
@@ -644,75 +814,186 @@ class RepeatedSubgraphDetector:
         self.max_graph_nodes = max_graph_nodes
         self._digest = digest
 
+    def _groups_for_size(
+        self,
+        graph: Graph,
+        topology: GraphTopology,
+        order: tuple[str, ...],
+        size: int,
+        prefix: list[int],
+        powers: list[int],
+        blocked: list[bool],
+        position: dict[str, int],
+        token: CancellationToken | None,
+    ) -> list[tuple[str, list[tuple[str, ...]]]]:
+        """Confirmed, non-overlapping repeat groups for one window size."""
+        occupied = [0] * (len(order) + 1)
+        for index, flag in enumerate(blocked):
+            occupied[index + 1] = occupied[index] + (1 if flag else 0)
+        buckets: dict[int, list[int]] = {}
+        for start in range(len(order) - size + 1):
+            if token is not None and start % 512 == 0:
+                token.raise_if_cancelled()
+            if occupied[start + size] - occupied[start]:
+                continue
+            window_hash = (
+                prefix[start + size] - prefix[start] * powers[size]
+            ) % _HASH_MODULUS
+            buckets.setdefault(window_hash, []).append(start)
+        groups: list[tuple[str, list[tuple[str, ...]]]] = []
+        for window_hash in sorted(buckets):
+            starts = buckets[window_hash]
+            if len(starts) < 2:
+                continue
+            picked: list[tuple[str, ...]] = []
+            used: set[str] = set()
+            for start in starts:
+                window = order[start : start + size]
+                if used.intersection(window):
+                    continue
+                picked.append(window)
+                used.update(window)
+            if len(picked) < 2:
+                continue
+            # Confirm against full canonical signatures: equal hashes are only
+            # a bucket key, so anything that disagrees is dropped rather than
+            # grouped.
+            reference = _window_signature(graph, topology, picked[0])
+            confirmed = [
+                window
+                for window in picked
+                if _window_signature(graph, topology, window) == reference
+            ]
+            if len(confirmed) < 2:
+                continue
+            groups.append((self._digest(reference), confirmed))
+
+        # Different alignments of the same size land in different buckets and
+        # can overlap each other, so accept the alignment that explains the
+        # most nodes first. Without this, an arbitrary shifted alignment could
+        # win and leave the aligned blocks fragmented.
+        selected: list[tuple[str, list[tuple[str, ...]]]] = []
+        taken: set[str] = set()
+        for digest, windows in sorted(
+            groups,
+            key=lambda item: (-len(item[1]), position[item[1][0][0]]),
+        ):
+            kept = [window for window in windows if not taken.intersection(window)]
+            if len(kept) < 2:
+                continue
+            selected.append((digest, kept))
+            taken.update(node_id for window in kept for node_id in window)
+        return selected
+
     def detect(
         self,
         document: Document,
         graph: Graph,
         token: CancellationToken | None = None,
+        log: DiagnosticLog | None = None,
     ) -> tuple[GroupCandidate, ...]:
         del document
         if len(graph.nodes) > self.max_graph_nodes:
+            if log is not None:
+                log.add(
+                    "hierarchy.repeat-analysis-skipped",
+                    Severity.INFO,
+                    f"{len(graph.nodes)} nodes exceed the "
+                    f"{self.max_graph_nodes}-node repeated-structure scan "
+                    "limit, so identical blocks were not grouped.",
+                    graph.id,
+                )
             return ()
         topology = GraphTopology(graph)
-        order = tuple(node.id for node in graph.nodes)
-        claimed: set[str] = set()
+        order = _block_scan_order(topology)
+        if len(order) < 2 * self.min_size:
+            return ()
+        sequence: list[int] = []
+        seen_signatures: dict[str, int] = {}
+        for node_id in order:
+            signature = json.dumps(
+                _node_signature(graph, graph.node(node_id)),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            sequence.append(seen_signatures.setdefault(signature, len(seen_signatures)))
+        prefix, powers = _prefix_hashes(sequence)
+        position = {node_id: index for index, node_id in enumerate(order)}
+        blocked = [False] * len(order)
         candidates: list[GroupCandidate] = []
         largest = min(self.max_size, len(order) // 2)
         for size in range(largest, self.min_size - 1, -1):
             if token is not None:
                 token.raise_if_cancelled()
-            buckets: dict[str, dict[str, list[tuple[str, ...]]]] = {}
-            for start in range(0, len(order) - size + 1):
-                if token is not None and start % 256 == 0:
-                    token.raise_if_cancelled()
-                window = order[start : start + size]
-                if set(window) & claimed:
+            groups = self._groups_for_size(
+                graph, topology, order, size, prefix, powers, blocked, position, token
+            )
+            if not groups:
+                continue
+            coverage = sum(len(windows) for _, windows in groups) * size
+            chosen_size, chosen = size, groups
+            # A block that is itself periodic should be reported at its own
+            # period: two stacked layers match as one window, but the single
+            # layer explains just as many nodes and is the useful block.
+            for divisor in range(self.min_size, size):
+                if size % divisor:
                     continue
-                signature = _window_signature(graph, topology, window)
-                digest = self._digest(signature)
-                buckets.setdefault(digest, {}).setdefault(signature, []).append(window)
-            for digest, by_signature in sorted(buckets.items()):
-                # Different signatures in this bucket are an explicit hash
-                # collision and stay isolated.
-                for _signature, windows in sorted(by_signature.items()):
-                    selected: list[tuple[str, ...]] = []
-                    used: set[str] = set()
-                    for window in windows:
-                        if not (set(window) & used):
-                            selected.append(window)
-                            used.update(window)
-                    if len(selected) < 2:
-                        continue
-                    label_ops = " → ".join(
-                        graph.node(item).op_type for item in selected[0][:3]
-                    )
-                    if size > 3:
-                        label_ops += " → …"
-                    for occurrence, window in enumerate(selected, 1):
-                        members = frozenset(window)
-                        candidates.append(
-                            GroupCandidate(
-                                graph_id=graph.id,
-                                detector=self.name,
-                                detector_version=self.version,
-                                label=f"Repeated block: {label_ops}",
-                                members=members,
-                                kind=CandidateKind.REPEATED,
-                                confidence=min(0.98, 0.84 + size * 0.01),
-                                evidence=(
-                                    DetectionEvidence(
-                                        "repeat.canonical-signature",
-                                        f"Occurrence {occurrence} of "
-                                        f"{len(selected)} has the same canonical "
-                                        "operator, attribute, shape, and internal "
-                                        f"edge signature ({digest}); the full "
-                                        "signature was compared after hashing.",
-                                        window,
-                                    ),
+                alternative = self._groups_for_size(
+                    graph,
+                    topology,
+                    order,
+                    divisor,
+                    prefix,
+                    powers,
+                    blocked,
+                    position,
+                    token,
+                )
+                # Explaining the same nodes is not enough: many *different*
+                # small windows can tile the same span, which would demote one
+                # meaningful block into a pile of fragments. Only accept a
+                # divisor that keeps the grouping at least as consolidated,
+                # which is what genuine internal periodicity looks like.
+                if (
+                    alternative
+                    and len(alternative) <= len(groups)
+                    and sum(len(windows) for _, windows in alternative) * divisor
+                    >= coverage
+                ):
+                    chosen_size, chosen = divisor, alternative
+                    break
+            for digest, windows in chosen:
+                label_ops = " → ".join(
+                    graph.node(item).op_type for item in windows[0][:3]
+                )
+                if chosen_size > 3:
+                    label_ops += " → …"
+                for occurrence, window in enumerate(windows, 1):
+                    candidates.append(
+                        GroupCandidate(
+                            graph_id=graph.id,
+                            detector=self.name,
+                            detector_version=self.version,
+                            label=f"Repeated block: {label_ops}",
+                            members=frozenset(window),
+                            kind=CandidateKind.REPEATED,
+                            confidence=min(0.98, 0.84 + chosen_size * 0.01),
+                            evidence=(
+                                DetectionEvidence(
+                                    "repeat.canonical-signature",
+                                    f"Occurrence {occurrence} of "
+                                    f"{len(windows)} has the same canonical "
+                                    "operator, attribute, shape, and internal "
+                                    f"edge signature ({digest}); the full "
+                                    "signature was compared after hashing.",
+                                    window,
                                 ),
-                            )
+                            ),
                         )
-                    claimed.update(used)
+                    )
+                for window in windows:
+                    for node_id in window:
+                        blocked[position[node_id]] = True
         return tuple(candidates)
 
 
@@ -739,12 +1020,13 @@ class DetectionPipeline:
         document: Document,
         graph: Graph,
         token: CancellationToken | None = None,
+        log: DiagnosticLog | None = None,
     ) -> tuple[GroupCandidate, ...]:
         found: list[GroupCandidate] = []
         for detector in self.detectors:
             if token is not None:
                 token.raise_if_cancelled()
-            found.extend(detector.detect(document, graph, token))
+            found.extend(detector.detect(document, graph, token, log))
         return tuple(found)
 
     def detect_graph(
@@ -753,7 +1035,15 @@ class DetectionPipeline:
         graph: Graph,
         token: CancellationToken | None = None,
     ) -> Hierarchy:
-        return reconcile_candidates(graph, self.candidates(document, graph, token))
+        log = DiagnosticLog()
+        candidates = self.candidates(document, graph, token, log)
+        hierarchy = reconcile_candidates(graph, candidates)
+        return Hierarchy(
+            hierarchy.graph_id,
+            hierarchy.groups,
+            revision=hierarchy.revision,
+            diagnostics=tuple(log),
+        )
 
     def detect_document(
         self,
