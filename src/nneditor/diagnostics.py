@@ -503,6 +503,42 @@ _DESCRIPTORS: tuple[CodeDescriptor, ...] = (
             "value is not imported.",
         ),
         CodeDescriptor(
+            "onnx.type-annotation-conflict",
+            DiagnosticCategory.IDENTITY,
+            "Type annotation contradicts its initializer",
+            "A value_info entry declares a different element type from the "
+            "initializer of the same name. The annotation is redundant — the "
+            "initializer already carries its type — but ONNX type inference "
+            "treats the disagreement as fatal, so export and tracing are "
+            "blocked until the annotation is removed or corrected. Exporters "
+            "sometimes emit this; the initializer is normally the truth.",
+        ),
+        CodeDescriptor(
+            "onnx.shape-annotation-conflict",
+            DiagnosticCategory.SHAPE,
+            "Shape annotation contradicts its initializer",
+            "A value_info entry declares a rank or extent the initializer of "
+            "the same name does not have. ONNX shape inference rejects the "
+            "model, so export and tracing cannot run until the annotation is "
+            "removed or corrected.",
+        ),
+        CodeDescriptor(
+            "onnx.duplicate-initializer",
+            DiagnosticCategory.IDENTITY,
+            "Initializer name declared more than once",
+            "Two initializers in one graph share a name, so which tensor a "
+            "consumer receives depends on the runtime's resolution order. "
+            "Rename or remove one before relying on this model.",
+        ),
+        CodeDescriptor(
+            "onnx.unresolved-input",
+            DiagnosticCategory.IDENTITY,
+            "Node input has no producer in scope",
+            "A node reads a value that no initializer, graph input, or node "
+            "output supplies, counting enclosing scopes for subgraphs. The "
+            "graph is incomplete and will not execute.",
+        ),
+        CodeDescriptor(
             "onnx.nameless-attribute",
             DiagnosticCategory.METADATA_LOSS,
             "Attribute without a name",

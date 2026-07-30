@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.metadata
 from typing import Final
 
+from nneditor.adapters.onnx.checks import check_model_index
 from nneditor.adapters.onnx.dtypes import ElementType
 from nneditor.adapters.onnx.index import (
     GraphIndex,
@@ -337,6 +338,11 @@ def _conversion_diagnostics(index: ModelIndex) -> list[Diagnostic]:
                     entry.id,
                 )
             )
+    # Structural consistency checks (see `checks`): these catch artifacts that
+    # load but that ONNX's own inference later rejects, so the problem is
+    # reported at import rather than surfacing as an opaque failure at export
+    # or trace time.
+    found.extend(check_model_index(index))
     return found
 
 
