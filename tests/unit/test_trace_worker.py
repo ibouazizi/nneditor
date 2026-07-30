@@ -36,6 +36,24 @@ def _target(
     }
 
 
+def _capture_all(
+    model: onnx.ModelProto,
+    feeds: dict[str, np.ndarray[Any, Any]],
+    targets: list[dict[str, object]],
+) -> tuple[dict[str, np.ndarray[Any, Any]], list[str], dict[str, str]]:
+    """Drain a capture source eagerly, the way the worker drains it lazily."""
+    source = trace_worker.open_captures(model, feeds, targets)
+    captures: dict[str, np.ndarray[Any, Any]] = {}
+    failures: dict[str, str] = {}
+    for target in targets:
+        array, reason = source.take(target)
+        if array is not None:
+            captures[str(target["value_id"])] = array
+        elif reason is not None:
+            failures[str(target["value_name"])] = reason
+    return captures, source.diagnostics, failures
+
+
 def test_worker_run_captures_augmented_outputs_in_bounded_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -180,7 +198,7 @@ def test_worker_unsupported_operator_returns_inputs_and_diagnostics(
     build_custom_domain_model(path)
     model = onnx.load_model(path)
     feed = np.arange(4, dtype=np.float32)
-    captures, diagnostics, _failures = trace_worker._evaluate(
+    captures, diagnostics, _failures = _capture_all(
         model,
         {"input": feed},
         [
@@ -233,7 +251,7 @@ def test_worker_prefix_fallback_restores_model_without_copying_weights() -> None
     )
     before = model.SerializeToString()
 
-    captures, diagnostics, _failures = trace_worker._evaluate(
+    captures, diagnostics, _failures = _capture_all(
         model,
         {"input": np.arange(4, dtype=np.float32)},
         [
@@ -273,7 +291,7 @@ def test_worker_memory_exhaustion_does_not_retry_every_value(
             raise MemoryError("allocation failed")
 
     monkeypatch.setattr(trace_worker, "ReferenceEvaluator", ExhaustedEvaluator)
-    captures, diagnostics, _failures = trace_worker._evaluate(
+    captures, diagnostics, _failures = _capture_all(
         model,
         {"input": np.arange(4, dtype=np.float32)},
         [
@@ -320,7 +338,7 @@ def test_evaluate_attributes_failures_to_the_value_that_failed(
     model = onnx.load(model_path)
     feeds = {"input": np.arange(4, dtype=np.float32)}
 
-    captures, diagnostics, failures = trace_worker._evaluate(
+    captures, diagnostics, failures = _capture_all(
         model,
         feeds,
         [
@@ -386,7 +404,7 @@ def test_unbuildable_runtime_still_captures_and_names_the_real_cause(
         "series": np.zeros((1, 4), dtype=np.float32),
     }
 
-    _captures, diagnostics, failures = trace_worker._evaluate(
+    _captures, diagnostics, failures = _capture_all(
         model, feeds, [_target("final-id", "final")]
     )
 
@@ -431,18 +449,130 @@ def test_prefix_capture_stops_once_memory_is_exhausted() -> None:
         opset_imports=[onnx.helper.make_opsetid("", 20)],
     )
 
+    source = trace_worker.CaptureSource(
+        model, {}, None, [], len(model.graph.node), None
+    )
     original = trace_worker._evaluate_prefix
     trace_worker._evaluate_prefix = exploding
     try:
-        captures, diagnostics, failures = trace_worker._evaluate_by_prefix(
-            model, {}, targets, {}, [], {}
-        )
+        results = [source.take(target) for target in targets]
     finally:
         trace_worker._evaluate_prefix = original
 
-    assert not captures
+    assert all(array is None for array, _reason in results)
     # Only the first value was attempted; the rest inherit the same reason.
     assert calls == ["v0"]
-    assert len(failures) == 5
-    assert all("memory limit" in reason for reason in failures.values())
-    assert sum("ran out of memory" in item for item in diagnostics) == 1
+    reasons = [reason for _array, reason in results]
+    assert all(reason is not None and "memory limit" in reason for reason in reasons)
+    assert sum("ran out of memory" in item for item in source.diagnostics) == 1
+
+
+def _scan_axis_one_model(leading: int) -> onnx.ModelProto:
+    """`leading` buildable Identity nodes, then a Scan the runtime refuses."""
+    body = onnx.helper.make_graph(
+        nodes=[onnx.helper.make_node("Identity", ["s_in"], ["s_out"])],
+        name="body",
+        inputs=[
+            onnx.helper.make_tensor_value_info("s_in", onnx.TensorProto.FLOAT, [1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("s_out", onnx.TensorProto.FLOAT, [1])
+        ],
+    )
+    nodes = [
+        onnx.helper.make_node("Identity", ["x" if i == 0 else f"v{i - 1}"], [f"v{i}"])
+        for i in range(leading)
+    ]
+    nodes.append(
+        onnx.helper.make_node(
+            "Scan",
+            ["state", "series"],
+            ["final"],
+            body=body,
+            num_scan_inputs=1,
+            scan_input_axes=[1],
+        )
+    )
+    graph = onnx.helper.make_graph(
+        nodes=nodes,
+        name="frontier",
+        inputs=[
+            onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1]),
+            onnx.helper.make_tensor_value_info("state", onnx.TensorProto.FLOAT, [1]),
+            onnx.helper.make_tensor_value_info(
+                "series", onnx.TensorProto.FLOAT, [1, 2]
+            ),
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("final", onnx.TensorProto.FLOAT, [1])
+        ],
+    )
+    return onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 20)]
+    )
+
+
+def test_buildable_frontier_finds_the_first_refused_node() -> None:
+    """The frontier is found by binary search, not by probing every node."""
+    model = _scan_axis_one_model(leading=6)
+    assert trace_worker._buildable_frontier(model) == 6
+    # Probing must leave the model exactly as it was.
+    assert len(model.graph.node) == 7
+    assert model.graph.node[6].op_type == "Scan"
+
+    # A model the runtime accepts end to end has no frontier.
+    clean = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            nodes=[onnx.helper.make_node("Identity", ["x"], ["y"])],
+            name="clean",
+            inputs=[
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1])
+            ],
+            outputs=[
+                onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 20)],
+    )
+    assert trace_worker._buildable_frontier(clean) == 1
+
+
+def test_values_beyond_the_frontier_are_reported_without_being_attempted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rebuilding an evaluator for a value that cannot build only wastes time."""
+    model = _scan_axis_one_model(leading=3)
+    feeds = {
+        "x": np.zeros((1,), dtype=np.float32),
+        "state": np.zeros((1,), dtype=np.float32),
+        "series": np.zeros((1, 2), dtype=np.float32),
+    }
+    targets = [
+        _target("v0-id", "v0"),
+        _target("v2-id", "v2"),
+        _target("final-id", "final", graph_output=True),
+    ]
+
+    attempted: list[str] = []
+    original = trace_worker._evaluate_prefix
+
+    def counting(
+        model_: onnx.ModelProto,
+        feeds_: dict[str, np.ndarray[Any, Any]],
+        name: str,
+        *,
+        producer_limit: int,
+    ) -> np.ndarray[Any, Any]:
+        attempted.append(name)
+        return original(model_, feeds_, name, producer_limit=producer_limit)
+
+    monkeypatch.setattr(trace_worker, "_evaluate_prefix", counting)
+    captures, diagnostics, failures = _capture_all(model, feeds, targets)
+
+    # Values before the Scan are captured; the one that needs it is not
+    # attempted at all, and says why.
+    assert attempted == ["v0", "v2"]
+    assert set(captures) == {"v0-id", "v2-id"}
+    assert "Scan" in failures["final"]
+    assert "unavailable" in failures["final"]
+    assert any("cannot build Scan" in item for item in diagnostics)
