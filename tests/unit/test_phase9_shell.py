@@ -21,6 +21,7 @@ from nneditor.tracing import (
     ActivationRecord,
     CaptureState,
     TraceApproval,
+    TraceBackend,
     TraceLimits,
     TraceRequest,
     build_activation_visualizations,
@@ -862,6 +863,24 @@ def test_unticked_capture_scope_still_traces_every_value(
         assert not shell.trace.capture_selected_only.value
         assert shell.trace.capture_value_ids() == frozenset()
         assert _approved_request(shell, page, monkeypatch).value_ids == frozenset()
+
+
+def test_trace_backend_is_visible_and_bound_into_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        shell.trace.backend.value = TraceBackend.REFERENCE_NORMALIZED.value
+
+        request = _approved_request(shell, page, monkeypatch)
+
+        assert request.backend is TraceBackend.REFERENCE_NORMALIZED
+        assert request.approval.backend is TraceBackend.REFERENCE_NORMALIZED
 
 
 def test_ticked_capture_scope_narrows_the_request_to_selected_nodes(

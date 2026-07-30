@@ -88,7 +88,7 @@ actions explain the format-specific reason directly in the interface.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.1.0
+python -m pip install nneditor==1.1.1
 ```
 
 Start the desktop application with either command:
@@ -152,8 +152,12 @@ Desktop tracing is available for ONNX models:
    the model-compatible flattened-patch profile.
    Required `*_mask` inputs left unchanged use an automatically generated
    all-valid mask; other inputs use deterministic random data.
-2. Open **Trace activations**, review the input specification and the
-   wall-clock, memory, capture, and chunk limits.
+2. Open **Trace activations**, review the execution backend, input
+   specification, and wall-clock, memory, capture, and chunk limits. Automatic
+   mode uses ONNX Runtime first and falls back to NNEditor's axis-aware ONNX
+   reference evaluator. The normalized reference option rewrites nonzero
+   `Scan` axes with semantics-preserving transposes inside the private worker
+   model.
 3. Select **Approve & run trace**. This click creates an approval bound to the
    current model, inputs, and limits for that run only.
 4. Click any operator, semantic block, visible connection, model input, or model
@@ -172,10 +176,11 @@ input or limit cannot reuse stale consent. The UI captures graph inputs and
 operator outputs by default so inspection does not depend on the selection that
 was active when the trace began.
 
-Tracing uses the ONNX reference evaluator in a separate, resource-limited
-process. A failed or cancelled run publishes no trace. Desktop subprocess
-isolation is not a multi-tenant security boundary, so tracing is disabled in
-the browser application until a dedicated worker service is available.
+Tracing uses ONNX Runtime or an ONNX reference-evaluator mode in a separate,
+resource-limited process. A failed or cancelled run publishes no trace.
+Desktop subprocess isolation is not a multi-tenant security boundary, so
+tracing is disabled in the browser application until a dedicated worker
+service is available.
 
 ## Editing and optimization
 

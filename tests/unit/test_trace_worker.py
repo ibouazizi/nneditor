@@ -40,9 +40,16 @@ def _capture_all(
     model: onnx.ModelProto,
     feeds: dict[str, np.ndarray[Any, Any]],
     targets: list[dict[str, object]],
+    *,
+    evaluator_factory: trace_worker.EvaluatorFactory | None = None,
 ) -> tuple[dict[str, np.ndarray[Any, Any]], list[str], dict[str, str]]:
     """Drain a capture source eagerly, the way the worker drains it lazily."""
-    source = trace_worker.open_captures(model, feeds, targets)
+    source = trace_worker.open_captures(
+        model,
+        feeds,
+        targets,
+        evaluator_factory=evaluator_factory,
+    )
     captures: dict[str, np.ndarray[Any, Any]] = {}
     failures: dict[str, str] = {}
     for target in targets:
@@ -95,7 +102,7 @@ def test_worker_run_captures_augmented_outputs_in_bounded_files(
     trace_worker.run(request)
 
     payload = json.loads(response.read_text(encoding="utf-8"))
-    assert payload["runtime"].startswith("onnx.reference")
+    assert payload["runtime"].startswith("onnxruntime")
     assert [record["state"] for record in payload["records"]] == [
         "complete",
         "complete",
@@ -150,6 +157,91 @@ def test_worker_prioritizes_boundaries_and_shares_remaining_capture_budget(
     assert by_name["output"]["state"] == "complete"
     assert by_name["scaled"]["state"] == "truncated"
     assert by_name["scaled"]["stored_byte_length"] == 8
+
+
+def test_worker_does_not_truncate_known_captures_when_the_total_fits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_info = onnx.helper.make_tensor_value_info(
+        "input",
+        onnx.TensorProto.FLOAT,
+        [100],
+    )
+    output_info = onnx.helper.make_tensor_value_info(
+        "scalar19",
+        onnx.TensorProto.FLOAT,
+        [],
+    )
+    index = onnx.helper.make_tensor(
+        "index",
+        onnx.TensorProto.INT64,
+        [],
+        [0],
+    )
+    nodes = [
+        onnx.helper.make_node("Identity", ["input"], ["big"]),
+        onnx.helper.make_node("Gather", ["input", "index"], ["scalar0"], axis=0),
+        *[
+            onnx.helper.make_node(
+                "Identity",
+                [f"scalar{position - 1}"],
+                [f"scalar{position}"],
+            )
+            for position in range(1, 20)
+        ],
+    ]
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            nodes,
+            "known-sizes",
+            [input_info],
+            [output_info],
+            [index],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 20)],
+    )
+    model_path = tmp_path / "model.onnx"
+    onnx.save_model(model, model_path)
+    inputs = tmp_path / "inputs.npz"
+    np.savez(inputs, input=np.arange(100, dtype=np.float32))
+    output = tmp_path / "output"
+    output.mkdir()
+    response = tmp_path / "response.json"
+    request = tmp_path / "request.json"
+    targets = [
+        _target("input-id", "input", node_id=None),
+        _target("big-id", "big"),
+        *[
+            _target(f"scalar{position}-id", f"scalar{position}")
+            for position in range(20)
+        ],
+    ]
+    request.write_text(
+        json.dumps(
+            {
+                "model": str(model_path),
+                "inputs": str(inputs),
+                "output": str(output),
+                "response": str(response),
+                "targets": targets,
+                "wall_seconds": 10,
+                "memory_bytes": 1024 * 1024 * 1024,
+                # input + big + twenty scalars = 400 + 400 + 20 * 4
+                "capture_bytes": 880,
+                "chunk_bytes": 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NNEDITOR_TRACE_WORKER", "1")
+    monkeypatch.setattr(trace_worker, "_limit_process", lambda raw: None)
+
+    trace_worker.run(request)
+
+    records = json.loads(response.read_text(encoding="utf-8"))["records"]
+    assert {record["state"] for record in records} == {"complete"}
+    assert sum(record["stored_byte_length"] for record in records) == 880
 
 
 def test_worker_capture_states_are_explicit(tmp_path: Path) -> None:
@@ -279,7 +371,7 @@ def test_worker_memory_exhaustion_does_not_retry_every_value(
     calls = 0
 
     class ExhaustedEvaluator:
-        def __init__(self, _model: onnx.ModelProto) -> None:
+        def __init__(self, _model: onnx.ModelProto, **_kwargs: object) -> None:
             nonlocal calls
             calls += 1
 
@@ -355,19 +447,16 @@ def test_evaluate_attributes_failures_to_the_value_that_failed(
     assert "scaled-id" in captures
 
 
-def test_unbuildable_runtime_still_captures_and_names_the_real_cause(
+def test_axis_aware_reference_runtime_executes_scan_axis_one(
     tmp_path: Path,
 ) -> None:
-    """An operator the runtime cannot build must name itself, not MemoryError.
-
-    Reproduces a real xLSTM export whose Scan uses input axis 1, which the
-    reference runtime refuses outright.
-    """
+    """The reference backend supports the xLSTM export's nonzero Scan axis."""
     body = onnx.helper.make_graph(
         nodes=[onnx.helper.make_node("Identity", ["state_in"], ["state_out"])],
         name="scan_body",
         inputs=[
-            onnx.helper.make_tensor_value_info("state_in", onnx.TensorProto.FLOAT, [1])
+            onnx.helper.make_tensor_value_info("state_in", onnx.TensorProto.FLOAT, [1]),
+            onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1]),
         ],
         outputs=[
             onnx.helper.make_tensor_value_info("state_out", onnx.TensorProto.FLOAT, [1])
@@ -404,17 +493,13 @@ def test_unbuildable_runtime_still_captures_and_names_the_real_cause(
         "series": np.zeros((1, 4), dtype=np.float32),
     }
 
-    _captures, diagnostics, failures = _capture_all(
+    captures, diagnostics, failures = _capture_all(
         model, feeds, [_target("final-id", "final")]
     )
 
-    joined = " ".join(diagnostics)
-    assert "cannot execute the whole model" in joined
-    assert "Scan" in joined
-    # The reason the model will not run must survive into the value's own
-    # failure text rather than being replaced by a memory error.
-    assert "Scan" in failures["final"] or "not captured" in failures["final"]
-    assert not any("MemoryError" in item for item in diagnostics)
+    assert np.array_equal(captures["final-id"], np.zeros((1,), dtype=np.float32))
+    assert diagnostics == []
+    assert failures == {}
 
 
 def test_prefix_capture_stops_once_memory_is_exhausted() -> None:
@@ -427,6 +512,7 @@ def test_prefix_capture_stops_once_memory_is_exhausted() -> None:
         name: str,
         *,
         producer_limit: int,
+        evaluator_factory: trace_worker.EvaluatorFactory | None = None,
     ) -> np.ndarray[Any, Any]:
         calls.append(name)
         raise MemoryError("cap reached")
@@ -473,7 +559,8 @@ def _scan_axis_one_model(leading: int) -> onnx.ModelProto:
         nodes=[onnx.helper.make_node("Identity", ["s_in"], ["s_out"])],
         name="body",
         inputs=[
-            onnx.helper.make_tensor_value_info("s_in", onnx.TensorProto.FLOAT, [1])
+            onnx.helper.make_tensor_value_info("s_in", onnx.TensorProto.FLOAT, [1]),
+            onnx.helper.make_tensor_value_info("x_in", onnx.TensorProto.FLOAT, [1]),
         ],
         outputs=[
             onnx.helper.make_tensor_value_info("s_out", onnx.TensorProto.FLOAT, [1])
@@ -515,7 +602,14 @@ def _scan_axis_one_model(leading: int) -> onnx.ModelProto:
 def test_buildable_frontier_finds_the_first_refused_node() -> None:
     """The frontier is found by binary search, not by probing every node."""
     model = _scan_axis_one_model(leading=6)
-    assert trace_worker._buildable_frontier(model) == 6
+    assert trace_worker._buildable_frontier(model) == 7
+    assert (
+        trace_worker._buildable_frontier(
+            model,
+            trace_worker._standard_reference_evaluator,
+        )
+        == 6
+    )
     # Probing must leave the model exactly as it was.
     assert len(model.graph.node) == 7
     assert model.graph.node[6].op_type == "Scan"
@@ -562,12 +656,24 @@ def test_values_beyond_the_frontier_are_reported_without_being_attempted(
         name: str,
         *,
         producer_limit: int,
+        evaluator_factory: trace_worker.EvaluatorFactory | None = None,
     ) -> np.ndarray[Any, Any]:
         attempted.append(name)
-        return original(model_, feeds_, name, producer_limit=producer_limit)
+        return original(
+            model_,
+            feeds_,
+            name,
+            producer_limit=producer_limit,
+            evaluator_factory=evaluator_factory,
+        )
 
     monkeypatch.setattr(trace_worker, "_evaluate_prefix", counting)
-    captures, diagnostics, failures = _capture_all(model, feeds, targets)
+    captures, diagnostics, failures = _capture_all(
+        model,
+        feeds,
+        targets,
+        evaluator_factory=trace_worker._standard_reference_evaluator,
+    )
 
     # Values before the Scan are captured; the one that needs it is not
     # attempted at all, and says why.

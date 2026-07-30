@@ -148,6 +148,7 @@ def run_onnx_trace(
         artifact_hash=document.source.content_hash,
         specification=request.specification,
         limits=request.limits,
+        backend=request.backend,
     )
     token.raise_if_cancelled()
     try:
@@ -193,6 +194,7 @@ def run_onnx_trace(
             "output": str(staging),
             "response": str(response_path),
             "targets": _targets(document, request.value_ids),
+            "backend": request.backend.value,
             **request.limits.to_json(),
         }
         request_path.write_text(

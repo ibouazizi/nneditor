@@ -6,12 +6,26 @@ import hashlib
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
 import onnx
 from onnx.reference import ReferenceEvaluator
+
+from nneditor.tracing.contracts import TraceBackend
+from nneditor.tracing.scan import AxisAwareScan, normalize_scan_axes
+
+EvaluatorFactory = Callable[[onnx.ModelProto], Any]
+
+
+def _axis_reference_evaluator(model: onnx.ModelProto) -> Any:
+    return ReferenceEvaluator(model, new_ops=[AxisAwareScan])
+
+
+def _standard_reference_evaluator(model: onnx.ModelProto) -> Any:
+    return ReferenceEvaluator(model)
 
 
 def _limit_process(raw: dict[str, object]) -> None:
@@ -52,6 +66,7 @@ def _evaluate_prefix(
     name: str,
     *,
     producer_limit: int,
+    evaluator_factory: EvaluatorFactory | None = None,
 ) -> np.ndarray[Any, Any]:
     """Evaluate one value without copying the model's weights.
 
@@ -65,7 +80,7 @@ def _evaluate_prefix(
     try:
         values = cast(
             list[np.ndarray[Any, Any]],
-            ReferenceEvaluator(model).run([name], feeds),
+            (evaluator_factory or _axis_reference_evaluator)(model).run([name], feeds),
         )
         return np.asarray(values[0])
     finally:
@@ -76,6 +91,7 @@ def _prefix_builds(
     model: onnx.ModelProto,
     all_nodes: list[onnx.NodeProto],
     limit: int,
+    evaluator_factory: EvaluatorFactory | None = None,
 ) -> bool:
     """Whether the runtime can build an evaluator over ``nodes[:limit + 1]``.
 
@@ -85,7 +101,7 @@ def _prefix_builds(
     model.graph.ClearField("node")
     model.graph.node.extend(all_nodes[: limit + 1])
     try:
-        ReferenceEvaluator(model)
+        (evaluator_factory or _axis_reference_evaluator)(model)
         return True
     except Exception:
         # Any build failure answers the question this probe asks.
@@ -95,7 +111,10 @@ def _prefix_builds(
         model.graph.node.extend(all_nodes)
 
 
-def _buildable_frontier(model: onnx.ModelProto) -> int:
+def _buildable_frontier(
+    model: onnx.ModelProto,
+    evaluator_factory: EvaluatorFactory | None = None,
+) -> int:
     """Index of the first node the runtime cannot build an evaluator over.
 
     Buildability is prefix-closed: if the runtime refuses node *j*, it refuses
@@ -110,7 +129,7 @@ def _buildable_frontier(model: onnx.ModelProto) -> int:
     low, high = 0, len(all_nodes)
     while low < high:
         middle = (low + high) // 2
-        if _prefix_builds(model, all_nodes, middle):
+        if _prefix_builds(model, all_nodes, middle, evaluator_factory):
             low = middle + 1
         else:
             high = middle
@@ -128,6 +147,7 @@ class CaptureSource:
     """
 
     __slots__ = (
+        "_evaluator_factory",
         "_exhausted",
         "_feeds",
         "_frontier",
@@ -146,9 +166,11 @@ class CaptureSource:
         diagnostics: list[str],
         frontier: int,
         frontier_reason: str | None,
+        evaluator_factory: EvaluatorFactory | None = None,
     ) -> None:
         self._model = model
         self._feeds = feeds
+        self._evaluator_factory = evaluator_factory
         self._whole = whole
         self._frontier = frontier
         self._frontier_reason = frontier_reason
@@ -188,8 +210,21 @@ class CaptureSource:
             return None, self._frontier_reason
         try:
             return (
-                _evaluate_prefix(
-                    self._model, self._feeds, name, producer_limit=producer
+                (
+                    _evaluate_prefix(
+                        self._model,
+                        self._feeds,
+                        name,
+                        producer_limit=producer,
+                    )
+                    if self._evaluator_factory is None
+                    else _evaluate_prefix(
+                        self._model,
+                        self._feeds,
+                        name,
+                        producer_limit=producer,
+                        evaluator_factory=self._evaluator_factory,
+                    )
                 ),
                 None,
             )
@@ -209,11 +244,23 @@ class CaptureSource:
             self.diagnostics.append(f"value {name!r} was {reason}")
             return None, reason
 
+    def size_hint(self, target: dict[str, object]) -> int | None:
+        """Return an already-materialized capture size without producing it."""
+        name = str(target["value_name"])
+        if name in self._feeds:
+            return int(self._feeds[name].nbytes)
+        if self._whole is None:
+            return None
+        captured = self._whole.get(str(target["value_id"]))
+        return None if captured is None else int(captured.nbytes)
+
 
 def open_captures(
     model: onnx.ModelProto,
     feeds: dict[str, np.ndarray[Any, Any]],
     targets: list[dict[str, object]],
+    *,
+    evaluator_factory: EvaluatorFactory | None = None,
 ) -> CaptureSource:
     """Prepare capture, choosing whole-model evaluation when it is possible."""
     diagnostics: list[str] = []
@@ -222,11 +269,19 @@ def open_captures(
         target for target in targets if str(target["value_name"]) not in input_names
     ]
     if not runtime_targets:
-        return CaptureSource(model, feeds, {}, diagnostics, len(model.graph.node), None)
+        return CaptureSource(
+            model,
+            feeds,
+            {},
+            diagnostics,
+            len(model.graph.node),
+            None,
+            evaluator_factory,
+        )
 
     names = [str(target["value_name"]) for target in runtime_targets]
     try:
-        evaluator = ReferenceEvaluator(model)
+        evaluator = (evaluator_factory or _axis_reference_evaluator)(model)
     except MemoryError as error:
         diagnostics.append(
             "building the reference runtime exhausted the approved memory "
@@ -234,14 +289,20 @@ def open_captures(
             "again"
         )
         return CaptureSource(
-            model, feeds, {}, diagnostics, 0, "the runtime ran out of memory"
+            model,
+            feeds,
+            {},
+            diagnostics,
+            0,
+            "the runtime ran out of memory",
+            evaluator_factory,
         )
     except Exception as error:
         diagnostics.append(
             "the reference runtime cannot execute the whole model: "
             f"{type(error).__name__}: {error}; capturing per value instead"
         )
-        return _prefix_source(model, feeds, diagnostics)
+        return _prefix_source(model, feeds, diagnostics, evaluator_factory)
     try:
         values = evaluator.run(names, feeds)
     except MemoryError as error:
@@ -250,25 +311,40 @@ def open_captures(
             f"{error}; increase the Memory limit and approve the trace again"
         )
         return CaptureSource(
-            model, feeds, {}, diagnostics, 0, "the runtime ran out of memory"
+            model,
+            feeds,
+            {},
+            diagnostics,
+            0,
+            "the runtime ran out of memory",
+            evaluator_factory,
         )
     except Exception as error:
         diagnostics.append(
             "full trace degraded to per-value prefix evaluation: "
             f"{type(error).__name__}: {error}"
         )
-        return _prefix_source(model, feeds, diagnostics)
+        return _prefix_source(model, feeds, diagnostics, evaluator_factory)
     whole = {
         str(target["value_id"]): np.asarray(value)
         for target, value in zip(runtime_targets, values, strict=True)
     }
-    return CaptureSource(model, feeds, whole, diagnostics, len(model.graph.node), None)
+    return CaptureSource(
+        model,
+        feeds,
+        whole,
+        diagnostics,
+        len(model.graph.node),
+        None,
+        evaluator_factory,
+    )
 
 
 def _prefix_source(
     model: onnx.ModelProto,
     feeds: dict[str, np.ndarray[Any, Any]],
     diagnostics: list[str],
+    evaluator_factory: EvaluatorFactory | None = None,
 ) -> CaptureSource:
     """Set up per-value capture, first locating what the runtime cannot build.
 
@@ -276,7 +352,7 @@ def _prefix_source(
     value beyond it a rebuild that is guaranteed to fail — the difference
     between ten probes and hundreds of futile evaluations on a large graph.
     """
-    frontier = _buildable_frontier(model)
+    frontier = _buildable_frontier(model, evaluator_factory)
     reason: str | None = None
     if frontier < len(model.graph.node):
         blocking = model.graph.node[frontier]
@@ -290,7 +366,129 @@ def _prefix_source(
             f"index {frontier} of {len(model.graph.node)}; values produced at "
             "or after it were reported unavailable without being attempted"
         )
-    return CaptureSource(model, feeds, None, diagnostics, frontier, reason)
+    return CaptureSource(
+        model,
+        feeds,
+        None,
+        diagnostics,
+        frontier,
+        reason,
+        evaluator_factory,
+    )
+
+
+def _onnxruntime_captures(
+    model: onnx.ModelProto,
+    feeds: dict[str, np.ndarray[Any, Any]],
+    targets: list[dict[str, object]],
+) -> CaptureSource:
+    """Capture requested values through an augmented ONNX Runtime session."""
+    import onnxruntime as ort  # type: ignore[import-untyped]
+
+    diagnostics: list[str] = []
+    input_names = set(feeds)
+    runtime_targets = [
+        target for target in targets if str(target["value_name"]) not in input_names
+    ]
+    if not runtime_targets:
+        return CaptureSource(model, feeds, {}, diagnostics, len(model.graph.node), None)
+
+    existing_outputs = {value.name for value in model.graph.output}
+    original_output_count = len(model.graph.output)
+    try:
+        for target in runtime_targets:
+            name = str(target["value_name"])
+            if name in existing_outputs:
+                continue
+            value_info = onnx.ValueInfoProto()
+            value_info.name = name
+            model.graph.output.append(value_info)
+            existing_outputs.add(name)
+        options = ort.SessionOptions()
+        options.enable_cpu_mem_arena = False
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        options.inter_op_num_threads = 1
+        options.intra_op_num_threads = 1
+        options.log_severity_level = 3
+        session = ort.InferenceSession(
+            model.SerializeToString(),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        names = [str(target["value_name"]) for target in runtime_targets]
+        values = session.run(names, feeds)
+    finally:
+        del model.graph.output[original_output_count:]
+    whole = {
+        str(target["value_id"]): np.asarray(value)
+        for target, value in zip(runtime_targets, values, strict=True)
+    }
+    return CaptureSource(model, feeds, whole, diagnostics, len(model.graph.node), None)
+
+
+def _failed_runtime_source(
+    model: onnx.ModelProto,
+    feeds: dict[str, np.ndarray[Any, Any]],
+    message: str,
+) -> CaptureSource:
+    return CaptureSource(model, feeds, None, [message], 0, message)
+
+
+def _open_backend(
+    model: onnx.ModelProto,
+    feeds: dict[str, np.ndarray[Any, Any]],
+    targets: list[dict[str, object]],
+    backend: TraceBackend,
+) -> tuple[CaptureSource, str]:
+    if backend is TraceBackend.ONNX_RUNTIME:
+        try:
+            return _onnxruntime_captures(model, feeds, targets), (
+                f"onnxruntime {__import__('onnxruntime').__version__}"
+            )
+        except Exception as error:
+            message = (
+                "ONNX Runtime could not execute the trace: "
+                f"{type(error).__name__}: {error}"
+            )
+            return _failed_runtime_source(model, feeds, message), "onnxruntime failed"
+    if backend is TraceBackend.REFERENCE:
+        return open_captures(model, feeds, targets), (
+            f"onnx.reference axis-aware {onnx.__version__}"
+        )
+    if backend is TraceBackend.REFERENCE_NORMALIZED:
+        try:
+            normalized, report = normalize_scan_axes(model, in_place=True)
+        except Exception as error:
+            message = f"Scan axis normalization failed: {type(error).__name__}: {error}"
+            return _failed_runtime_source(model, feeds, message), (
+                "onnx.reference normalized failed"
+            )
+        source = open_captures(
+            normalized,
+            feeds,
+            targets,
+            evaluator_factory=_standard_reference_evaluator,
+        )
+        detail = (
+            f"; {report.rewritten_scans} Scan / {report.inserted_transposes} Transpose"
+            if report.rewritten_scans
+            else ""
+        )
+        return source, f"onnx.reference normalized {onnx.__version__}{detail}"
+
+    try:
+        return _onnxruntime_captures(model, feeds, targets), (
+            f"onnxruntime {__import__('onnxruntime').__version__}"
+        )
+    except Exception as error:
+        source = open_captures(model, feeds, targets)
+        source.diagnostics.insert(
+            0,
+            "automatic backend selection fell back from ONNX Runtime to the "
+            f"axis-aware reference evaluator: {type(error).__name__}: {error}",
+        )
+        return source, f"onnx.reference axis-aware {onnx.__version__}"
 
 
 def _write_capture(
@@ -327,6 +525,24 @@ def _write_capture(
             remaining,
         )
     contiguous = np.ascontiguousarray(array)
+    if contiguous.dtype.hasobject:
+        return (
+            {
+                **base,
+                "element_type": str(contiguous.dtype),
+                "numpy_dtype": str(contiguous.dtype),
+                "shape": list(contiguous.shape),
+                "state": "dropped",
+                "full_byte_length": 0,
+                "stored_byte_length": 0,
+                "file_name": None,
+                "reason": (
+                    "object-backed activations require typed serialization and "
+                    "cannot be captured as raw bytes"
+                ),
+            },
+            remaining,
+        )
     full_length = int(contiguous.nbytes)
     itemsize = max(1, int(contiguous.dtype.itemsize))
     stored = min(full_length, remaining)
@@ -400,7 +616,11 @@ def run(request_path: Path) -> None:
             "the Memory limit and approve the trace again"
         ) from error
     targets = [dict(item) for item in raw["targets"] if isinstance(item, dict)]
-    source = open_captures(model, feeds, targets)
+    try:
+        backend = TraceBackend(str(raw.get("backend", TraceBackend.AUTO.value)))
+    except ValueError as error:
+        raise ValueError(f"unknown trace backend {raw.get('backend')!r}") from error
+    source, runtime = _open_backend(model, feeds, targets, backend)
     diagnostics = source.diagnostics
     output = Path(str(raw["output"]))
     remaining = int(raw["capture_bytes"])
@@ -418,6 +638,11 @@ def run(request_path: Path) -> None:
         index for index in range(len(targets)) if index not in prioritized_indices
     ]
     for phase in (prioritized, ordinary):
+        sizes = [source.size_hint(targets[index]) for index in phase]
+        exact_budgets = (
+            all(size is not None for size in sizes)
+            and sum(cast(int, size) for size in sizes) <= remaining
+        )
         for offset, index in enumerate(phase):
             target = targets[index]
             # Produce this value only now, and drop it once written, so peak
@@ -430,8 +655,11 @@ def run(request_path: Path) -> None:
             # When the even share floors to zero the pool is nearly spent, so
             # offer what is genuinely left rather than dropping a value while
             # bytes remain free.
-            share = remaining // (len(phase) - offset)
-            budget = share if share > 0 else remaining
+            if exact_budgets:
+                budget = cast(int, sizes[offset])
+            else:
+                share = remaining // (len(phase) - offset)
+                budget = share if share > 0 else remaining
             record, unused_budget = _write_capture(
                 output,
                 target,
@@ -447,7 +675,7 @@ def run(request_path: Path) -> None:
             capture = None
     records = [records_by_index[index] for index in range(len(targets))]
     response = {
-        "runtime": f"onnx.reference {onnx.__version__}",
+        "runtime": runtime,
         "records": records,
         "diagnostics": diagnostics,
     }

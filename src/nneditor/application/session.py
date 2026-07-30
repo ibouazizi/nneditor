@@ -488,6 +488,7 @@ class ModelSession:
             snapshot.source.content_hash,
             revision_id,
             request.specification.hash,
+            request.backend,
         )
 
         def work(token: CancellationToken) -> TraceResult:
