@@ -76,9 +76,17 @@ def _evaluate(
     model: onnx.ModelProto,
     feeds: dict[str, np.ndarray[Any, Any]],
     targets: list[dict[str, object]],
-) -> tuple[dict[str, np.ndarray[Any, Any]], list[str]]:
+) -> tuple[dict[str, np.ndarray[Any, Any]], list[str], dict[str, str]]:
+    """Capture requested values, reporting per-value failures explicitly.
+
+    The third element maps a value *name* to the reason that value alone could
+    not be captured. Attributing failures by matching diagnostic text would
+    mis-blame a value whose name merely appears inside an unrelated runtime
+    error message.
+    """
     captures: dict[str, np.ndarray[Any, Any]] = {}
     diagnostics: list[str] = []
+    failures: dict[str, str] = {}
     input_names = set(feeds)
     runtime_targets = [
         target for target in targets if str(target["value_name"]) not in input_names
@@ -88,19 +96,19 @@ def _evaluate(
         if name in feeds:
             captures[str(target["value_id"])] = feeds[name]
     if not runtime_targets:
-        return captures, diagnostics
+        return captures, diagnostics, failures
     names = [str(target["value_name"]) for target in runtime_targets]
     try:
         values = ReferenceEvaluator(model).run(names, feeds)
         for target, value in zip(runtime_targets, values, strict=True):
             captures[str(target["value_id"])] = np.asarray(value)
-        return captures, diagnostics
+        return captures, diagnostics, failures
     except MemoryError as error:
         diagnostics.append(
             "full trace exhausted the approved memory limit during evaluation: "
             f"{error}; increase the Memory limit and approve the trace again"
         )
-        return captures, diagnostics
+        return captures, diagnostics, failures
     except Exception as error:
         diagnostics.append(
             "full trace degraded to per-value prefix evaluation: "
@@ -117,7 +125,9 @@ def _evaluate(
         name = str(target["value_name"])
         producer = producer_by_output.get(name)
         if producer is None:
+            reason = "this value has no executable producer"
             diagnostics.append(f"value {name!r} has no executable producer")
+            failures[name] = reason
             continue
         try:
             captures[str(target["value_id"])] = _evaluate_prefix(
@@ -127,10 +137,10 @@ def _evaluate(
                 producer_limit=producer,
             )
         except Exception as error:
-            diagnostics.append(
-                f"value {name!r} was not captured: {type(error).__name__}: {error}"
-            )
-    return captures, diagnostics
+            reason = f"not captured: {type(error).__name__}: {error}"
+            diagnostics.append(f"value {name!r} was {reason}")
+            failures[name] = reason
+    return captures, diagnostics, failures
 
 
 def _write_capture(
@@ -240,7 +250,7 @@ def run(request_path: Path) -> None:
             "the Memory limit and approve the trace again"
         ) from error
     targets = [dict(item) for item in raw["targets"] if isinstance(item, dict)]
-    captures, diagnostics = _evaluate(model, feeds, targets)
+    captures, diagnostics, failures = _evaluate(model, feeds, targets)
     output = Path(str(raw["output"]))
     remaining = int(raw["capture_bytes"])
     chunk_bytes = int(raw["chunk_bytes"])
@@ -250,24 +260,26 @@ def run(request_path: Path) -> None:
         for index, target in enumerate(targets)
         if target["role"] == "graph-input" or bool(target.get("graph_output"))
     ]
-    ordinary = [index for index in range(len(targets)) if index not in prioritized]
+    # Membership is tested once per target, so keep it O(1): a list scan here
+    # is quadratic in the number of captured values.
+    prioritized_indices = set(prioritized)
+    ordinary = [
+        index for index in range(len(targets)) if index not in prioritized_indices
+    ]
     for phase in (prioritized, ordinary):
         for offset, index in enumerate(phase):
             target = targets[index]
             value_id = str(target["value_id"])
             capture = captures.get(value_id)
-            failure = next(
-                (
-                    diagnostic
-                    for diagnostic in diagnostics
-                    if repr(str(target["value_name"])) in diagnostic
-                ),
-                None,
-            )
+            failure = failures.get(str(target["value_name"]))
             # Reserve an equal share for each remaining value in this phase.
             # Small tensors return their unused share to the pool, while large
             # tensors keep a useful prefix rather than starving later nodes.
-            budget = remaining // (len(phase) - offset)
+            # When the even share floors to zero the pool is nearly spent, so
+            # offer what is genuinely left rather than dropping a value while
+            # bytes remain free.
+            share = remaining // (len(phase) - offset)
+            budget = share if share > 0 else remaining
             record, unused_budget = _write_capture(
                 output,
                 target,

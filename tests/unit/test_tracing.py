@@ -14,6 +14,7 @@ from PIL import Image
 from nneditor.analysis.lod import DetailLevel
 from nneditor.application.session import ApplicationService
 from nneditor.application.slices import GraphSlice
+from nneditor.cancellation import CancellationToken, OperationCancelled
 from nneditor.input_generation import generate_image_tensor
 from nneditor.rendering.scene import NodeGlyph, Scene
 from nneditor.storage.store import TensorUnavailableError
@@ -374,6 +375,62 @@ def test_narrowed_rerun_preserves_other_values_under_the_value_key(
     assert first.id == second.id
     assert {record.value_id for record in second.records} == {"a", "b"}
     assert store.open(second.id).read("b") == np.float32(2.0).tobytes()
+
+    # A narrowed rerun copies the retained capture into the new trace
+    # directory, so its bytes must be charged to the budget. Counting only the
+    # rerun's own records left them on disk but outside the budget, and a
+    # reload — which recomputes from the manifest — then disagreed.
+    readable = sum(
+        record.stored_byte_length for record in second.records if record.readable
+    )
+    assert store.current_bytes == readable
+    assert ActivationStore(tmp_path / "captures").current_bytes == readable
+
+
+def test_large_matrix_views_are_bounded_and_disclose_the_sampling() -> None:
+    matrix = np.arange(1600, dtype=np.float32).reshape(40, 40)
+    record = _record("matrix", matrix.tobytes(), shape=matrix.shape)
+
+    bounded = build_activation_visualizations(
+        record,
+        matrix.tobytes(),
+        max_map_extent=8,
+    )
+    heatmap = next(view for view in bounded if view.kind is PlotKind.HEATMAP)
+    assert heatmap.raster_size == (8, 8)
+    assert "sampled to 8x8 from 40x40" in heatmap.downsampling
+    # The source shape still reports the real tensor, so a sampled view is
+    # never mistaken for the whole activation.
+    assert heatmap.source_shape == (40, 40)
+    assert bounded == build_activation_visualizations(
+        record,
+        matrix.tobytes(),
+        max_map_extent=8,
+    )
+
+    exact = build_activation_visualizations(record, matrix.tobytes())
+    exact_heatmap = next(view for view in exact if view.kind is PlotKind.HEATMAP)
+    assert exact_heatmap.raster_size == (40, 40)
+    assert "exact 40x40" in exact_heatmap.downsampling
+
+
+def test_trace_comparison_stops_at_the_next_cancellation_checkpoint(
+    tmp_path: Path,
+) -> None:
+    store = ActivationStore(tmp_path / "captures")
+    payload = np.arange(64, dtype=np.float32)
+    left = _commit(store, TraceKey("artifact", None, "inputs"), {"a": payload})
+    right = _commit(store, TraceKey("artifact", "revision", "inputs"), {"a": payload})
+
+    token = CancellationToken()
+    token.cancel()
+    with pytest.raises(OperationCancelled):
+        compare_traces(store, left, right, token=token)
+
+    # An un-cancelled token still produces the full comparison.
+    assert compare_traces(store, left, right, token=CancellationToken()).values[
+        0
+    ].max_absolute == pytest.approx(0.0)
 
 
 def test_visualization_builders_preserve_exact_matrix_shape() -> None:
