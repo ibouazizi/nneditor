@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from nneditor.cancellation import CancellationToken
+from nneditor.diagnostics import Diagnostic, DiagnosticLog
 from nneditor.ir.core import Document, Graph
 from nneditor.ir.identity import auto_group_id
 
@@ -106,8 +107,14 @@ class GroupDetector(Protocol):
         document: Document,
         graph: Graph,
         token: CancellationToken | None = None,
+        log: DiagnosticLog | None = None,
     ) -> tuple[GroupCandidate, ...]:
-        """Return deterministic candidates for ``graph``."""
+        """Return deterministic candidates for ``graph``.
+
+        A detector that declines to analyse a graph — because it exceeds one of
+        its bounds, for instance — records a coded diagnostic in ``log`` so the
+        absence of groups is explained rather than silent.
+        """
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +148,14 @@ class Group:
 class Hierarchy:
     """A validated forest of nested, non-partially-overlapping groups."""
 
-    __slots__ = ("_children", "_groups", "_node_groups", "graph_id", "revision")
+    __slots__ = (
+        "_children",
+        "_groups",
+        "_node_groups",
+        "diagnostics",
+        "graph_id",
+        "revision",
+    )
 
     def __init__(
         self,
@@ -149,8 +163,13 @@ class Hierarchy:
         groups: Iterable[Group] = (),
         *,
         revision: str | None = None,
+        diagnostics: tuple[Diagnostic, ...] = (),
     ) -> None:
         self.graph_id = graph_id
+        # Analysis that declined to run, so a missing block is explainable.
+        # Deliberately outside the revision hash: it is derived from the same
+        # content and must not fragment layout cache keys.
+        self.diagnostics = diagnostics
         group_map: dict[str, Group] = {}
         for group in groups:
             if group.graph_id != graph_id:
