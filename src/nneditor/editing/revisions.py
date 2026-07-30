@@ -173,6 +173,43 @@ class RevisionChain:
         self._cursor = 0
         self._lock = threading.RLock()
 
+    @classmethod
+    def pinned(
+        cls,
+        applied: tuple[Revision, ...],
+        read_base: BaseTensorReader,
+        *,
+        read_range: BaseTensorRangeReader | None = None,
+        tensor_length: TensorLengthReader | None = None,
+        base_document: Document | None = None,
+    ) -> RevisionChain:
+        """A detached chain fixed at ``applied``, for snapshot readers.
+
+        Background jobs capture the applied revisions once and then read
+        through a chain of their own: it has its own lock and never observes
+        later commits to the live chain. The revisions were validated when
+        first committed and the base artifact is immutable, so the byte
+        re-verification :meth:`restore` performs is skipped — only the
+        parent links are checked, which costs no reads.
+        """
+        parent = BASE_PARENT
+        for revision in applied:
+            if revision.parent_id != parent:
+                raise EditError(
+                    f"revision {revision.id!r} does not chain from {parent!r}; "
+                    "the snapshot is not a valid applied prefix"
+                )
+            parent = revision.id
+        chain = cls(
+            read_base,
+            read_range=read_range,
+            tensor_length=tensor_length,
+            base_document=base_document,
+        )
+        chain._revisions = list(applied)
+        chain._cursor = len(applied)
+        return chain
+
     # -- state -------------------------------------------------------------
 
     @property

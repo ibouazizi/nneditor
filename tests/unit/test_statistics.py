@@ -7,6 +7,7 @@ with the reference stack.
 
 from __future__ import annotations
 
+import math
 import struct
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import pytest
 from nneditor.analysis.statistics import (
     STATISTICS_VERSION,
     compute_statistics,
+    decode_packed,
     statistics_from_json,
     statistics_to_json,
 )
@@ -104,6 +106,59 @@ class TestFloatStatistics:
         assert stats.histogram_counts == (4,)
 
 
+class TestFloat8Statistics:
+    def test_float8e4m3fn_end_to_end(self, tmp_path: Path) -> None:
+        # Codes decode to [1.0, 2.0, -1.0, 0.0, 448.0, NaN]; every expectation
+        # below is hand-computed from those values.
+        raw = bytes([0x38, 0x40, 0xB8, 0x00, 0x7E, 0x7F])
+        store, tensor_id = store_for_raw(
+            tmp_path, raw, dims=[6], data_type=17
+        )  # TensorProto.FLOAT8E4M3FN
+        with store:
+            stats = compute_statistics(store, tensor_id, bins=4)
+        assert stats.element_type == "float8e4m3fn"
+        assert stats.element_count == 6
+        assert stats.minimum == -1.0 and stats.maximum == 448.0
+        assert stats.mean == pytest.approx(90.0)  # (1 + 2 - 1 + 0 + 448) / 5
+        assert stats.std == pytest.approx(math.sqrt(32042.0))  # 160210 / 5
+        assert stats.nan_count == 1 and stats.inf_count == 0
+        assert stats.zero_count == 1
+        assert stats.histogram_counts == (4, 0, 0, 1)
+        assert len(stats.histogram_edges) == 5
+        assert stats.histogram_edges[0] == -1.0
+        assert stats.histogram_edges[-1] == 448.0
+
+    def test_float8e5m2_infinities_are_counted(self, tmp_path: Path) -> None:
+        # Codes decode to [1.0, +inf, -inf, -1.0].
+        raw = bytes([0x3C, 0x7C, 0xFC, 0xBC])
+        store, tensor_id = store_for_raw(
+            tmp_path, raw, dims=[4], data_type=19
+        )  # TensorProto.FLOAT8E5M2
+        with store:
+            stats = compute_statistics(store, tensor_id)
+        assert stats.inf_count == 2 and stats.nan_count == 0
+        assert stats.minimum == -1.0 and stats.maximum == 1.0
+        assert stats.mean == pytest.approx(0.0)
+
+
+class TestBfloat16Differential:
+    def test_decoding_matches_the_reference_widening(self) -> None:
+        """bfloat16 must keep decoding exactly as the pre-registry code did:
+        each 2-byte pattern is the high half of the equal-valued float32."""
+        base = np.random.default_rng(7).standard_normal(64).astype(np.float32)
+        raw32 = base.tobytes()
+        bf16_raw = b"".join(raw32[i + 2 : i + 4] for i in range(0, len(raw32), 4))
+        widened = np.frombuffer(
+            b"".join(
+                b"\x00\x00" + bf16_raw[i : i + 2] for i in range(0, len(bf16_raw), 2)
+            ),
+            dtype="<f4",
+        )
+        decoded = decode_packed("bfloat16", bf16_raw)
+        assert decoded is not None
+        assert list(decoded) == widened.tolist()
+
+
 class TestIntegerStatistics:
     def test_int64_sparsity_and_extrema(self, tmp_path: Path) -> None:
         values = np.array([0, 0, -5, 10, 0, 3], dtype=np.int64)
@@ -133,6 +188,14 @@ class TestFailureModes:
         object.__setattr__(document.tensors[weight_id], "element_type", "complex64")
         with TensorStore(document) as store:
             with pytest.raises(TensorUnavailableError, match="not supported"):
+                compute_statistics(store, weight_id)
+
+    def test_unsupported_dtype_error_discloses_the_reason(self, tmp_path: Path) -> None:
+        document, _values = embedded_document(tmp_path)
+        weight_id = document.main_graph.initializers[0]
+        object.__setattr__(document.tensors[weight_id], "element_type", "int4")
+        with TensorStore(document) as store:
+            with pytest.raises(TensorUnavailableError, match="packed two per byte"):
                 compute_statistics(store, weight_id)
 
     def test_absent_payloads_are_reported(self, tmp_path: Path) -> None:

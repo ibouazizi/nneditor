@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -141,13 +142,20 @@ def test_axis_aware_scan_and_normalized_model_match_expected_values() -> None:
 )
 def test_every_trace_backend_executes_nonzero_scan_axes(
     backend: TraceBackend,
+    tmp_path: Path,
 ) -> None:
     targets: list[dict[str, object]] = [
         {"value_id": "final-id", "value_name": "final"},
         {"value_id": "ys-id", "value_name": "ys"},
     ]
+    model = _scan_model()
+    # The runtime backends read the model from disk, the way the worker
+    # always receives it staged by the runner.
+    model_path = tmp_path / "model.onnx"
+    onnx.save_model(model, str(model_path))
     source, runtime, execution_device, provider = _open_backend(
-        _scan_model(),
+        model,
+        model_path,
         _feeds(),
         targets,
         backend,

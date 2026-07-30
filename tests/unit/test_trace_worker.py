@@ -5,14 +5,15 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import numpy as np
 import onnx
 import pytest
 
 from nneditor.tracing import trace_worker
-from nneditor.tracing.contracts import TraceDevice
+from nneditor.tracing.contracts import TraceBackend, TraceDevice
 from tests.fixtures.onnx_models import (
     build_custom_domain_model,
     build_embedded_model,
@@ -742,3 +743,149 @@ def test_values_beyond_the_frontier_are_reported_without_being_attempted(
     assert "Scan" in failures["final"]
     assert "unavailable" in failures["final"]
     assert any("cannot build Scan" in item for item in diagnostics)
+
+
+def test_missing_onnxruntime_auto_falls_back_with_install_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=4)
+    model = onnx.load_model(str(path))
+    feeds = {"input": np.ones(4, dtype=np.float32)}
+    targets = [_target("val:scaled", "scaled")]
+    # A None entry makes `import onnxruntime` raise ImportError, exactly as
+    # in an install without any runtime extra.
+    monkeypatch.setitem(sys.modules, "onnxruntime", cast(Any, None))
+
+    source, runtime, device, provider = trace_worker._open_backend(
+        model,
+        path,
+        feeds,
+        targets,
+        TraceBackend.AUTO,
+    )
+
+    assert provider == "ReferenceEvaluator"
+    assert device is TraceDevice.CPU
+    assert runtime.startswith("onnx.reference")
+    assert "nneditor[runtime]" in source.diagnostics[0]
+
+
+def test_missing_onnxruntime_gpu_request_names_accelerator_extras(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=4)
+    model = onnx.load_model(str(path))
+    feeds = {"input": np.ones(4, dtype=np.float32)}
+    targets = [_target("val:scaled", "scaled")]
+    monkeypatch.setitem(sys.modules, "onnxruntime", cast(Any, None))
+
+    source, runtime, device, provider = trace_worker._open_backend(
+        model,
+        path,
+        feeds,
+        targets,
+        TraceBackend.AUTO,
+        TraceDevice.GPU,
+    )
+
+    assert provider == "Unavailable"
+    assert device is TraceDevice.GPU
+    assert runtime == "onnxruntime accelerator unavailable"
+    assert "nneditor[runtime-gpu]" in source.diagnostics[0]
+    assert "nneditor[runtime-directml]" in source.diagnostics[0]
+
+
+def test_onnxruntime_reads_a_staged_capture_file_not_serialized_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=4)
+    model = onnx.load_model(str(path))
+    original_bytes = path.read_bytes()
+    feeds = {"input": np.ones(4, dtype=np.float32)}
+    targets = [
+        _target("val:input", "input", node_id=None),
+        _target("val:scaled", "scaled"),
+        _target("val:output", "output", graph_output=True),
+    ]
+    observed: dict[str, Any] = {}
+
+    class FakeSessionOptions:
+        def __init__(self) -> None:
+            self.enable_cpu_mem_arena = True
+            self.enable_mem_pattern = True
+            self.execution_mode: Any = None
+            self.graph_optimization_level: Any = None
+            self.inter_op_num_threads = 0
+            self.intra_op_num_threads = 0
+            self.log_severity_level = 0
+
+        def add_session_config_entry(self, key: str, value: str) -> None:
+            observed.setdefault("config", {})[key] = value
+
+    class FakeInferenceSession:
+        def __init__(
+            self,
+            model_source: object,
+            sess_options: Any = None,
+            providers: Any = None,
+            provider_options: Any = None,
+        ) -> None:
+            # The whole point of the staged file: the runtime receives a
+            # path, never a serialized copy of the loaded model.
+            assert isinstance(model_source, str)
+            staged = Path(model_source)
+            observed["staged_path"] = staged
+            observed["staged_exists"] = staged.exists()
+            loaded = onnx.load_model(model_source)
+            observed["staged_outputs"] = [value.name for value in loaded.graph.output]
+
+        def run(
+            self,
+            names: list[str],
+            run_feeds: dict[str, Any],
+        ) -> list[Any]:
+            observed["run_names"] = list(names)
+            return [np.full(4, 7.0, dtype=np.float32) for _ in names]
+
+    fake = SimpleNamespace(
+        SessionOptions=FakeSessionOptions,
+        ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL=0),
+        GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_BASIC=1),
+        InferenceSession=FakeInferenceSession,
+        get_available_providers=lambda: ["CPUExecutionProvider"],
+        __version__="0-test",
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", cast(Any, fake))
+
+    source, runtime, device, provider = trace_worker._open_backend(
+        model,
+        path,
+        feeds,
+        targets,
+        TraceBackend.ONNX_RUNTIME,
+    )
+
+    assert observed["staged_exists"] is True
+    assert observed["staged_path"].name == "model.onnx.capture.onnx"
+    # The in-graph input is served from feeds, not fetched from the runtime.
+    assert observed["run_names"] == ["scaled", "output"]
+    # The staged file was augmented with the intermediate value; the
+    # in-memory model and the source artifact were left untouched.
+    assert "scaled" in observed["staged_outputs"]
+    assert [value.name for value in model.graph.output] == ["output"]
+    assert path.read_bytes() == original_bytes
+    # The staged copies do not outlive the runtime phase.
+    assert not observed["staged_path"].exists()
+    assert provider == "CPUExecutionProvider"
+    assert device is TraceDevice.CPU
+    assert "0-test" in runtime
+    array, reason = source.take(targets[1])
+    assert reason is None
+    assert array is not None
+    assert float(array[0]) == 7.0

@@ -12,9 +12,11 @@ the one-pass ``E[x²] - mean²`` form cancels catastrophically for data with
 a large offset. Non-finite values are counted but excluded from extrema,
 moments, and the histogram — a single NaN must not blank the entire summary.
 
-Everything here is pure Python plus the ``array``/``struct`` decoders (both
-C-speed). The dependency policy keeps numpy test-only; if Phase 5's numeric
-work changes that policy, this module is the seam where it lands.
+Byte decoding is delegated to the dtype registry
+(:mod:`nneditor.ir.dtypes`), the single authority on element widths and
+decoders; everything else here is pure Python. The dependency policy keeps
+numpy test-only; if Phase 5's numeric work changes that policy, this module
+is the seam where it lands.
 
 ``STATISTICS_VERSION`` stamps every result. Persisted statistics whose
 version differs from the running build are discarded and recomputed, never
@@ -24,13 +26,12 @@ migrated — they are derived data.
 from __future__ import annotations
 
 import math
-import struct
-from array import array
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Final
 
 from nneditor.cancellation import CancellationToken
+from nneditor.ir.dtypes import dtype_info
 from nneditor.storage.store import TensorStore, TensorUnavailableError
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "TensorStatistics",
     "compute_statistics",
     "decode_packed",
+    "decode_unavailability",
     "element_width",
     "statistics_from_json",
     "statistics_to_json",
@@ -52,56 +54,19 @@ _CHUNK_ELEMENTS: Final = 262_144
 """Elements decoded per chunk; the checkpoint and memory granularity."""
 
 
-def _array_decoder(typecode: str) -> Callable[[bytes], Sequence[float]]:
-    def decode(raw: bytes) -> Sequence[float]:
-        values = array(typecode)
-        values.frombytes(raw)
-        return values
-
-    return decode
-
-
-def _half_decoder(raw: bytes) -> Sequence[float]:
-    return [value[0] for value in struct.iter_unpack("<e", raw)]
-
-
-def _bfloat16_decoder(raw: bytes) -> Sequence[float]:
-    """Decode packed bfloat16 bit patterns.
-
-    A bfloat16 value is exactly the high 16 bits of the float32 with the
-    same value, so each little-endian 2-byte pattern widens to a float32 bit
-    pattern with two zero low bytes — NaN, infinity, and denormal patterns
-    all survive the widening unchanged.
-    """
-    widened = bytearray(len(raw) * 2)
-    widened[2::4] = raw[0::2]
-    widened[3::4] = raw[1::2]
-    values = array("f")
-    values.frombytes(bytes(widened))
-    return values
-
-
-_DECODERS: Final[dict[str, tuple[int, Callable[[bytes], Sequence[float]], bool]]] = {
-    # name -> (bytes per element, decoder, is floating point)
-    "float32": (4, _array_decoder("f"), True),
-    "float64": (8, _array_decoder("d"), True),
-    "float16": (2, _half_decoder, True),
-    "bfloat16": (2, _bfloat16_decoder, True),
-    "int64": (8, _array_decoder("q"), False),
-    "uint64": (8, _array_decoder("Q"), False),
-    "int32": (4, _array_decoder("i"), False),
-    "uint32": (4, _array_decoder("I"), False),
-    "int16": (2, _array_decoder("h"), False),
-    "uint16": (2, _array_decoder("H"), False),
-    "int8": (1, _array_decoder("b"), False),
-    "uint8": (1, _array_decoder("B"), False),
-    "bool": (1, _array_decoder("B"), False),
-}
+def _decoder_entry(
+    element_type: str,
+) -> tuple[int, Callable[[bytes], Sequence[float]], bool] | None:
+    """``(byte width, decoder, is floating point)`` from the dtype registry."""
+    info = dtype_info(element_type)
+    if info is None or info.decoder is None or info.byte_width is None:
+        return None
+    return info.byte_width, info.decoder, info.is_float
 
 
 def element_width(element_type: str) -> int | None:
-    """Bytes per element for supported packed dtypes."""
-    entry = _DECODERS.get(element_type)
+    """Bytes per element for dtypes whose packed bytes can be decoded."""
+    entry = _decoder_entry(element_type)
     return entry[0] if entry is not None else None
 
 
@@ -111,12 +76,35 @@ def decode_packed(element_type: str, raw: bytes) -> Sequence[float] | None:
     Shared by statistics, diff previews, and the inspector's value previews so
     every feature interprets tensor bytes identically.
     """
-    entry = _DECODERS.get(element_type)
+    entry = _decoder_entry(element_type)
     if entry is None:
         return None
     width, decode, _is_float = entry
     usable = len(raw) - len(raw) % width
     return decode(raw[:usable])
+
+
+def decode_unavailability(element_type: str) -> str | None:
+    """Why this dtype's values cannot be decoded, or ``None`` when they can.
+
+    UI surfaces show this reason instead of a silent blank when statistics,
+    previews, or diffs cannot interpret a tensor's bytes.
+    """
+    info = dtype_info(element_type)
+    if info is None:
+        return f"element type {element_type!r} is not a recognized dtype"
+    if info.decoder is not None and info.byte_width is not None:
+        return None
+    return info.unavailable_reason
+
+
+def _unsupported(element_type: str) -> TensorUnavailableError:
+    """The disclosure raised when a dtype's bytes cannot be summarized."""
+    reason = decode_unavailability(element_type)
+    detail = f": {reason}" if reason else ""
+    return TensorUnavailableError(
+        f"statistics for element type {element_type!r} are not supported{detail}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,11 +149,9 @@ def compute_statistics(
     if bins <= 0:
         raise ValueError(f"bins must be positive, got {bins}")
     tensor = store.metadata(tensor_id)
-    decoder = _DECODERS.get(tensor.element_type)
+    decoder = _decoder_entry(tensor.element_type)
     if decoder is None:
-        raise TensorUnavailableError(
-            f"statistics for element type {tensor.element_type!r} are not supported"
-        )
+        raise _unsupported(tensor.element_type)
     width, decode, is_float = decoder
     total_bytes = store.byte_length(tensor_id)
     if total_bytes is None:

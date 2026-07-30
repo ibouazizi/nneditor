@@ -9,7 +9,7 @@ from nneditor import __main__ as package_main
 
 
 def test_version_is_exposed() -> None:
-    assert nneditor.__version__ == "1.1.1"
+    assert nneditor.__version__ == "1.2.0"
 
 
 def test_distribution_metadata_matches_package() -> None:

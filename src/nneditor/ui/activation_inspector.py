@@ -21,6 +21,7 @@ from nneditor.analysis.statistics import TensorStatistics, element_width
 from nneditor.application.session import ModelSession
 from nneditor.application.slices import GraphSlice
 from nneditor.ir.core import Storage
+from nneditor.storage.cache import BudgetedCache
 from nneditor.tracing.contracts import ActivationRecord
 from nneditor.tracing.visualization import ActivationVisualization
 from nneditor.ui import overview, tensor_tools, viewmodel
@@ -28,6 +29,29 @@ from nneditor.ui.activation_layers import build_activation_layer_viewer
 from nneditor.ui.shell_layout import ShellPalette
 
 __all__ = ["ActivationInspector", "build_activation_plot"]
+
+# One view tuple can hold sixteen 512x512 RGB layer PNGs plus a raster PNG
+# (the tracing/visualization.py caps), so clicking through a few hundred
+# traced nodes would otherwise accumulate unbounded memory. 128 MiB retains
+# dozens of recent views; an evicted one costs only a click to rebuild.
+_VISUALIZATION_CACHE_BUDGET = 128 * 1024 * 1024
+
+# The session job pool runs 4 workers. A selected semantic block can span
+# hundreds of boundary values; auto-building them all would queue hundreds of
+# jobs behind those workers and starve every manual request, so automatic
+# view-building stops here and later records keep their build button.
+_AUTOLOAD_VIEW_LIMIT = 6
+
+
+def _visualization_cost(views: tuple[ActivationVisualization, ...]) -> int:
+    """Bytes one cached view tuple actually retains, never below one unit."""
+    total = sum(
+        len(view.raster_png)
+        + sum(len(png) for png in view.layer_pngs)
+        + 8 * len(view.values)
+        for view in views
+    )
+    return max(1, total)
 
 
 class ActivationInspector:
@@ -51,6 +75,7 @@ class ActivationInspector:
         on_error: Callable[[str], None],
         on_status: Callable[[str], None],
         watch_text_focus: Callable[[ft.TextField], ft.TextField],
+        visualization_cache_budget: int = _VISUALIZATION_CACHE_BUDGET,
     ) -> None:
         self.page = page
         self.palette = palette
@@ -76,11 +101,19 @@ class ActivationInspector:
         # interaction does not re-collapse every card the user opened.
         self.tensor_card_expanded: dict[str, bool] = {}
         self.activation_statistics: dict[tuple[str, str], TensorStatistics] = {}
-        self.activation_visualizations: dict[
-            tuple[str, str], tuple[ActivationVisualization, ...]
-        ] = {}
+        self._visualization_cache_budget = visualization_cache_budget
+        self.activation_visualizations = self._new_visualization_cache()
         self.activation_visualization_errors: dict[tuple[str, str], str] = {}
         self.activation_loading: set[tuple[str, str, str]] = set()
+
+    def _new_visualization_cache(
+        self,
+    ) -> BudgetedCache[tuple[str, str], tuple[ActivationVisualization, ...]]:
+        return BudgetedCache(
+            "activation-visualizations",
+            self._visualization_cache_budget,
+            cost=_visualization_cost,
+        )
 
     def reset(self) -> None:
         """Drop every per-session cache, consent, and draft."""
@@ -90,7 +123,9 @@ class ActivationInspector:
         self.hex_errors.clear()
         self.tensor_card_expanded.clear()
         self.activation_statistics.clear()
-        self.activation_visualizations.clear()
+        # A fresh cache also resets its hit/miss/eviction counters, so the
+        # numbers a diagnostics reader sees are always for one session.
+        self.activation_visualizations = self._new_visualization_cache()
         self.activation_visualization_errors.clear()
         self.activation_loading.clear()
 
@@ -211,14 +246,24 @@ class ActivationInspector:
         )
 
     def autoload_views(self, ids: frozenset[str]) -> None:
-        """Start bounded activation views as soon as a traced glyph is selected."""
+        """Start bounded activation views as soon as a traced glyph is selected.
+
+        At most ``_AUTOLOAD_VIEW_LIMIT`` jobs start per selection change, in
+        the records' deterministic order; every remaining record keeps its
+        manual "Build activation views now" button.
+        """
         trace_id = self._active_trace_id()
         if trace_id is None or len(ids) != 1:
             return
         (owner_id,) = ids
+        started = 0
         for record in self._records_for_selection(ids):
-            if record.readable:
-                self._request_views(trace_id, record.value_id, owner_id)
+            if started >= _AUTOLOAD_VIEW_LIMIT:
+                break
+            if record.readable and self._request_views(
+                trace_id, record.value_id, owner_id
+            ):
+                started += 1
 
     # -- trace record selection -------------------------------------------
 
@@ -665,7 +710,12 @@ class ActivationInspector:
             return False
         key = (trace_id, value_id)
         loading = (trace_id, value_id, "visualization")
-        if key in self.activation_visualizations or loading in self.activation_loading:
+        # peek keeps the presence probe out of the hit/miss counters and makes
+        # a repeated request while a job is in flight a no-op.
+        if (
+            self.activation_visualizations.peek(key) is not None
+            or loading in self.activation_loading
+        ):
             return False
         if key in self.activation_visualization_errors and not force:
             return False
@@ -687,7 +737,7 @@ class ActivationInspector:
             self.activation_loading.discard(loading)
             active = self._session() is session and self._active_trace_id() == trace_id
             if active and job.state.value == "succeeded":
-                self.activation_visualizations[key] = job.result()
+                self.activation_visualizations.put(key, job.result())
                 self.activation_visualization_errors.pop(key, None)
             elif active and job.state.value == "failed":
                 self.activation_visualization_errors[key] = str(job.error)
@@ -1436,6 +1486,138 @@ class ActivationInspector:
         return compute
 
 
+def _format_count(value: float) -> str:
+    """Format a histogram bar count compactly enough for a narrow axis."""
+    number = round(value)
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.1f}M"
+    if number >= 10_000:
+        return f"{number / 1_000:.1f}k"
+    return f"{number:,}"
+
+
+def _format_axis_value(value: float) -> str:
+    """Format a bin-edge value without fake precision."""
+    if value == 0.0:
+        return "0"
+    magnitude = abs(value)
+    if magnitude >= 100_000 or magnitude < 0.001:
+        return f"{value:.1e}"
+    return f"{value:.3g}"
+
+
+def _histogram_shapes(
+    view: ActivationVisualization,
+    *,
+    palette: ShellPalette,
+    width: float,
+    height: float,
+) -> list[cv.Shape]:
+    """Draw histogram bars with count and value axes labelled from the data.
+
+    The x axis spans the actual bin edges the statistics pass produced, so
+    the labels are real captured values, not normalized positions; the y
+    axis is labelled with raw bar counts.
+    """
+    large = width >= 400.0
+    label_size = 11.0 if large else 8.0
+    axis_left = label_size * 4.0
+    axis_bottom = label_size * 2.0
+    plot_width = max(1.0, width - axis_left)
+    plot_height = max(1.0, height - axis_bottom)
+    maximum = max(view.values, default=0.0)
+    label_style = ft.TextStyle(size=label_size, color=palette.muted)
+    axis_paint = ft.Paint(
+        color=palette.muted,
+        stroke_width=1,
+        style=ft.PaintingStyle.STROKE,
+    )
+    shapes: list[cv.Shape] = []
+    bar_width = plot_width / max(len(view.values), 1)
+    for index, value in enumerate(view.values):
+        bar_height = 0.0 if maximum == 0 else value / maximum * plot_height
+        shapes.append(
+            cv.Rect(
+                x=axis_left + index * bar_width,
+                y=plot_height - bar_height,
+                width=max(1.0, bar_width - 1.0),
+                height=bar_height,
+                paint=ft.Paint(
+                    color=view.colors[index],
+                    style=ft.PaintingStyle.FILL,
+                ),
+            )
+        )
+    shapes.append(
+        cv.Line(x1=axis_left, y1=0.0, x2=axis_left, y2=plot_height, paint=axis_paint)
+    )
+    shapes.append(
+        cv.Line(
+            x1=axis_left,
+            y1=plot_height,
+            x2=width,
+            y2=plot_height,
+            paint=axis_paint,
+        )
+    )
+    count_ticks = (0.0, maximum / 2.0, maximum) if large and maximum else (0.0, maximum)
+    seen_counts: set[str] = set()
+    for count in count_ticks:
+        label = _format_count(count)
+        if label in seen_counts:
+            continue
+        seen_counts.add(label)
+        y = plot_height if maximum == 0 else plot_height - count / maximum * plot_height
+        shapes.append(
+            cv.Line(x1=axis_left - 3.0, y1=y, x2=axis_left, y2=y, paint=axis_paint)
+        )
+        shapes.append(
+            cv.Text(
+                x=axis_left - 5.0,
+                # Keep the topmost label's upper half inside the canvas.
+                y=max(y, label_size * 0.6),
+                value=label,
+                style=label_style,
+                alignment=ft.Alignment.CENTER_RIGHT,
+                text_align=ft.TextAlign.RIGHT,
+                max_lines=1,
+            )
+        )
+    edges = view.bin_edges
+    if len(edges) >= 2:
+        tick_count = 5 if large else 3
+        for step in range(tick_count):
+            fraction = step / (tick_count - 1)
+            edge = edges[0] + (edges[-1] - edges[0]) * fraction
+            x = axis_left + fraction * plot_width
+            shapes.append(
+                cv.Line(
+                    x1=x,
+                    y1=plot_height,
+                    x2=x,
+                    y2=plot_height + 3.0,
+                    paint=axis_paint,
+                )
+            )
+            alignment = ft.Alignment.TOP_CENTER
+            if step == 0:
+                alignment = ft.Alignment.TOP_LEFT
+            elif step == tick_count - 1:
+                alignment = ft.Alignment.TOP_RIGHT
+            shapes.append(
+                cv.Text(
+                    x=x,
+                    y=plot_height + 4.0,
+                    value=_format_axis_value(edge),
+                    style=label_style,
+                    alignment=alignment,
+                    text_align=ft.TextAlign.CENTER,
+                    max_lines=1,
+                )
+            )
+    return shapes
+
+
 def build_activation_plot(
     view: ActivationVisualization,
     *,
@@ -1534,22 +1716,9 @@ def build_activation_plot(
         width = columns * cell
         height = rows * cell
     elif view.kind.value == "histogram":
-        maximum = max(view.values, default=0.0)
-        bar_width = width / max(len(view.values), 1)
-        for index, value in enumerate(view.values):
-            bar_height = 0.0 if maximum == 0 else value / maximum * height
-            shapes.append(
-                cv.Rect(
-                    x=index * bar_width,
-                    y=height - bar_height,
-                    width=max(1.0, bar_width - 1.0),
-                    height=bar_height,
-                    paint=ft.Paint(
-                        color=view.colors[index],
-                        style=ft.PaintingStyle.FILL,
-                    ),
-                )
-            )
+        shapes.extend(
+            _histogram_shapes(view, palette=palette, width=width, height=height)
+        )
     else:
         finite = [value for value in view.values if math.isfinite(value)]
         minimum = min(finite, default=0.0)

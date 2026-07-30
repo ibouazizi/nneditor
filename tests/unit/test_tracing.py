@@ -82,6 +82,7 @@ def _commit(
     values: dict[str, np.ndarray],
     *,
     state: CaptureState = CaptureState.COMPLETE,
+    execution_provider: str | None = None,
 ) -> TraceResult:
     staging = store.begin_staging()
     (staging / "captures").mkdir()
@@ -97,7 +98,16 @@ def _commit(
                 shape=tuple(int(item) for item in array.shape),
             )
         )
-    return store.commit(key, tuple(records), "test-runtime", (), staging)
+    if execution_provider is None:
+        return store.commit(key, tuple(records), "test-runtime", (), staging)
+    return store.commit(
+        key,
+        tuple(records),
+        "test-runtime",
+        (),
+        staging,
+        execution_provider=execution_provider,
+    )
 
 
 def test_seeded_inputs_are_deterministic_and_persist_by_hash(
@@ -388,6 +398,131 @@ def test_narrowed_rerun_preserves_other_values_under_the_value_key(
     )
     assert store.current_bytes == readable
     assert ActivationStore(tmp_path / "captures").current_bytes == readable
+
+
+def test_same_provider_recommit_keeps_merge_semantics(tmp_path: Path) -> None:
+    store = ActivationStore(tmp_path / "captures")
+    key = TraceKey("artifact", None, "inputs")
+    _commit(
+        store,
+        key,
+        {
+            "a": np.array([1.0], dtype=np.float32),
+            "b": np.array([2.0], dtype=np.float32),
+        },
+        execution_provider="CUDAExecutionProvider",
+    )
+    second = _commit(
+        store,
+        key,
+        {"a": np.array([3.0], dtype=np.float32)},
+        execution_provider="CUDAExecutionProvider",
+    )
+    # A narrowed rerun on the same runtime still merges: the untouched value
+    # survives, the rerun value wins, and no replacement is disclosed.
+    assert {record.value_id for record in second.records} == {"a", "b"}
+    assert store.open(second.id).read("a") == np.float32(3.0).tobytes()
+    assert store.open(second.id).read("b") == np.float32(2.0).tobytes()
+    assert second.execution_provider == "CUDAExecutionProvider"
+    assert second.diagnostics == ()
+
+
+def test_cross_provider_recommit_replaces_the_stored_trace(tmp_path: Path) -> None:
+    store = ActivationStore(tmp_path / "captures")
+    key = TraceKey("artifact", None, "inputs")
+    first = _commit(
+        store,
+        key,
+        {
+            "a": np.array([1.0], dtype=np.float32),
+            "b": np.array([2.0], dtype=np.float32),
+        },
+        execution_provider="CUDAExecutionProvider",
+    )
+    second = _commit(
+        store,
+        key,
+        {"a": np.array([3.0], dtype=np.float32)},
+        execution_provider="ReferenceEvaluator",
+    )
+    assert second.id == first.id
+    # Nothing merges across runtimes: the CUDA records are gone entirely.
+    assert {record.value_id for record in second.records} == {"a"}
+    assert store.open(second.id).read("a") == np.float32(3.0).tobytes()
+    with pytest.raises(KeyError):
+        store.result(second.id).record("b")
+    # The replaced capture files are reclaimed on disk and in the budget.
+    directory = store._trace_directory(second.id)
+    assert not (directory / "captures" / "b.bin").exists()
+    assert store.current_bytes == 4
+    # The committed result and its manifest single-source the surviving
+    # runtime, on this store and after a cold reload.
+    assert second.execution_provider == "ReferenceEvaluator"
+    reloaded = ActivationStore(store.root)
+    assert reloaded.result(second.id).execution_provider == "ReferenceEvaluator"
+    assert {record.value_id for record in reloaded.result(second.id).records} == {"a"}
+    assert reloaded.current_bytes == 4
+
+
+def test_provider_absent_and_present_commits_never_merge(tmp_path: Path) -> None:
+    # A commit that never reported which runtime executed must not merge with
+    # one that did, in either direction, even for the same trace key.
+    store = ActivationStore(tmp_path / "captures")
+    key = TraceKey("artifact", None, "inputs")
+    _commit(
+        store,
+        key,
+        {
+            "a": np.array([1.0], dtype=np.float32),
+            "b": np.array([2.0], dtype=np.float32),
+        },
+    )
+    explicit = _commit(
+        store,
+        key,
+        {"a": np.array([3.0], dtype=np.float32)},
+        execution_provider="CPUExecutionProvider",
+    )
+    assert {record.value_id for record in explicit.records} == {"a"}
+    assert explicit.execution_provider == "CPUExecutionProvider"
+    absent = _commit(store, key, {"b": np.array([4.0], dtype=np.float32)})
+    assert {record.value_id for record in absent.records} == {"b"}
+
+    # An empty provider is identified by its runtime string alone and never
+    # matches a provider-bearing commit, even when the strings coincide.
+    identity = ActivationStore._execution_identity
+    assert identity("", "same-string") != identity("same-string", "other")
+    assert identity("", "runtime") == identity("", "runtime")
+
+
+def test_cross_provider_replacement_is_disclosed_on_the_manifest(
+    tmp_path: Path,
+) -> None:
+    store = ActivationStore(tmp_path / "captures")
+    key = TraceKey("artifact", None, "inputs")
+    _commit(
+        store,
+        key,
+        {"a": np.array([1.0], dtype=np.float32)},
+        execution_provider="CUDAExecutionProvider",
+    )
+    second = _commit(
+        store,
+        key,
+        {"a": np.array([2.0], dtype=np.float32)},
+        execution_provider="ReferenceEvaluator",
+    )
+    disclosure = next(
+        diagnostic
+        for diagnostic in second.diagnostics
+        if "never mixes execution runtimes" in diagnostic
+    )
+    assert "CUDAExecutionProvider" in disclosure
+    assert "ReferenceEvaluator" in disclosure
+    assert second.partial
+    # The disclosure is part of the manifest, so it survives a cold reload.
+    reloaded = ActivationStore(store.root)
+    assert disclosure in reloaded.result(second.id).diagnostics
 
 
 def test_large_matrix_views_are_bounded_and_disclose_the_sampling() -> None:

@@ -353,8 +353,12 @@ class ModelSession:
     def _loaded_stats(self) -> dict[str, TensorStatistics]:
         with self._stats_lock:
             if self._stats is None:
+                # The content hash comes from the immutable source ref, not
+                # the live document: reading the live document here would
+                # take _state_lock while holding _stats_lock, inverting the
+                # _state_lock -> _stats_lock order used by statistics().
                 self._stats = (
-                    self._stats_sidecar.load(self.document.source.content_hash)
+                    self._stats_sidecar.load(self._source_document.source.content_hash)
                     if self._stats_sidecar is not None
                     else {}
                 )
@@ -392,35 +396,79 @@ class ModelSession:
         editing chain and cached only in this session, keyed by the current
         revision id — their bytes do not belong to the content hash, so
         persisting them would poison the shared sidecar.
+
+        The session lock is held only to capture the revision at the start
+        and to commit the result at the end; the pass itself runs unlocked,
+        so UI reads and ``close()`` never wait behind it.
         """
         self._ensure_open()
+        # Capture once, briefly. The streaming pass below runs without
+        # _state_lock or the controller lock: holding either for the whole
+        # pass would freeze document/scene reads and block close().
         with self._state_lock, self.editing.stable_view():
-            if self._serves_edited_bytes(tensor_id):
-                key = (self.editing.current_revision_id, tensor_id)
-                cached = self._edited_stats.get(key)
-                if cached is not None:
-                    return cached
-                view = _EditedBytesView(self.document, self.editing)
-                stats = compute_statistics(
-                    cast(TensorStore, view),
-                    tensor_id,
-                    token=token,
+            document = self.editing.document
+            revision_id = self.editing.current_revision_id
+            edited = self._serves_edited_bytes(tensor_id)
+            cached = (
+                self._edited_stats.get((revision_id, tensor_id))
+                if edited
+                else self._loaded_stats().get(tensor_id)
+            )
+        if cached is not None:
+            return cached
+        if edited:
+            return self._stream_edited_statistics(
+                document, revision_id, tensor_id, token
+            )
+        return self._stream_base_statistics(tensor_id, token)
+
+    def _stream_edited_statistics(
+        self,
+        document: Document,
+        revision_id: str | None,
+        tensor_id: str,
+        token: CancellationToken | None,
+    ) -> TensorStatistics:
+        """Stream chain-served bytes unlocked; commit only if still current.
+
+        Each chunk read takes the controller lock for just that read, so a
+        commit landing mid-pass makes later chunks serve a newer revision's
+        bytes. That torn pass is acceptable *only because* the revision
+        check below discards the result on mismatch instead of caching it
+        under the captured key — a stale pass reports itself and is rerun.
+        """
+        view = _EditedBytesView(document, self.editing)
+        stats = compute_statistics(cast(TensorStore, view), tensor_id, token=token)
+        with self._state_lock:
+            if self.editing.current_revision_id != revision_id:
+                raise SessionError(
+                    f"the revision changed while streaming statistics for "
+                    f"{tensor_id!r}; the stale result was discarded — compute "
+                    "again on the new revision"
                 )
-                self._edited_stats.put(key, stats)
-                return stats
-            known = self._loaded_stats()
-            cached = known.get(tensor_id)
-            if cached is not None:
-                return cached
-            stats = compute_statistics(self.store, tensor_id, token=token)
-            with self._stats_lock:
-                known[tensor_id] = stats
-                if self._stats_sidecar is not None:
-                    self._stats_sidecar.save(
-                        self.document.source.content_hash,
-                        dict(known),
-                    )
-            return stats
+            self._edited_stats.put((revision_id, tensor_id), stats)
+        return stats
+
+    def _stream_base_statistics(
+        self, tensor_id: str, token: CancellationToken | None
+    ) -> TensorStatistics:
+        """Stream immutable base-artifact bytes and persist them shared.
+
+        Base bytes never change while the artifact is open, so the result
+        stays valid for the content hash no matter which revisions commit
+        mid-pass; no staleness check is needed. A session closed mid-pass
+        makes the store raise, which surfaces through the job-error path.
+        """
+        stats = compute_statistics(self.store, tensor_id, token=token)
+        known = self._loaded_stats()
+        with self._stats_lock:
+            known[tensor_id] = stats
+            if self._stats_sidecar is not None:
+                self._stats_sidecar.save(
+                    self._source_document.source.content_hash,
+                    dict(known),
+                )
+        return stats
 
     def compute_statistics_async(self, tensor_id: str) -> Job[TensorStatistics]:
         """Statistics as a cancellable background job."""
@@ -480,10 +528,14 @@ class ModelSession:
         if self._jobs is None or self._activation_store is None:
             raise SessionError("this session has no trace worker/store")
         self.save_trace_inputs(request.specification)
+        # Capture once, briefly: the export below runs on a job thread and
+        # must never hold _state_lock or the controller lock while it
+        # materializes a full model to disk.
         with self._state_lock, self.editing.stable_view():
             snapshot = self.editing.document
             revision_id = self.editing.current_revision_id
             revisions = self.editing.applied_revisions
+            read_snapshot = self.editing.reader_at(revisions)
         key = TraceKey(
             snapshot.source.content_hash,
             revision_id,
@@ -494,21 +546,18 @@ class ModelSession:
 
         def work(token: CancellationToken) -> TraceResult:
             def build_model(destination: Path, build_token: CancellationToken) -> None:
-                # Tensor overlays are mutable session state. Hold their stable
-                # view only while materializing the independent worker model.
-                with self._state_lock, self.editing.stable_view():
-                    if self.editing.current_revision_id != revision_id:
-                        raise SessionError(
-                            "the revision changed before its trace model was built; "
-                            "approve and run the trace again"
-                        )
-                    export_revision(
-                        snapshot,
-                        revisions,
-                        destination,
-                        tensor_reader=self.editing.read,
-                        token=build_token,
-                    )
+                # The result is keyed by the captured revision id, so the
+                # captured snapshot and its pinned reader stay the correct
+                # source even while the user keeps editing — no lock and no
+                # staleness check. A session closed mid-export fails the
+                # base read, which surfaces through the job-error path.
+                export_revision(
+                    snapshot,
+                    revisions,
+                    destination,
+                    tensor_reader=read_snapshot,
+                    token=build_token,
+                )
 
             assert self._activation_store is not None
             return run_onnx_trace(

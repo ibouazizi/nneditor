@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -27,7 +28,11 @@ from nneditor.tracing import (
     TraceRequest,
     build_activation_visualizations,
 )
-from nneditor.ui.activation_inspector import build_activation_plot
+from nneditor.ui.activation_inspector import (
+    ActivationInspector,
+    _visualization_cost,
+    build_activation_plot,
+)
 from nneditor.ui.app import SHELL_PALETTE, Shell
 from nneditor.ui.input_workspace import InputTarget
 from tests.fixtures.onnx_models import (
@@ -1057,6 +1062,57 @@ def test_activation_plot_adapter_consumes_headless_view_models() -> None:
     assert large_image.height == 420
 
 
+def test_histogram_plot_labels_its_axes_with_the_captured_range() -> None:
+    vector = np.array([1.0, 2.0, np.nan, 3.0], dtype=np.float32)
+    record = ActivationRecord(
+        "vector",
+        "vector",
+        "node",
+        "node-output",
+        "float32",
+        "float32",
+        vector.shape,
+        CaptureState.COMPLETE,
+        vector.nbytes,
+        vector.nbytes,
+        "captures/vector.bin",
+    )
+    histogram = next(
+        view
+        for view in build_activation_visualizations(record, vector.tobytes())
+        if view.kind.value == "histogram"
+    )
+
+    control = cast(
+        ft.Container, build_activation_plot(histogram, palette=SHELL_PALETTE)
+    )
+    canvas = cast(cv.Canvas, control.content)
+    labels = [shape.value for shape in canvas.shapes if isinstance(shape, cv.Text)]
+    lines = [shape for shape in canvas.shapes if isinstance(shape, cv.Line)]
+    bars = [shape for shape in canvas.shapes if isinstance(shape, cv.Rect)]
+
+    assert len(bars) == len(histogram.values)
+    # Bars sit inside the axis margin instead of at the canvas edge.
+    assert all(bar.x > 0 for bar in bars)
+    # Two axis lines plus one tick mark per label.
+    assert len(lines) == 2 + len(labels)
+    # The count axis shows zero and the tallest bar's actual count; the
+    # value axis spans the captured data's actual bin-edge range.
+    assert {"0", "1", "2", "3"} <= set(labels)
+
+    large = cast(
+        ft.Container,
+        build_activation_plot(histogram, palette=SHELL_PALETTE, width=780, height=420),
+    )
+    large_canvas = cast(cv.Canvas, large.content)
+    large_labels = [
+        shape.value for shape in large_canvas.shapes if isinstance(shape, cv.Text)
+    ]
+    # Five value ticks across the same 1.0-3.0 range, three count ticks.
+    assert {"1", "1.5", "2", "2.5", "3"} <= set(large_labels)
+    assert len(large_labels) == 8
+
+
 def test_feature_plot_uses_exact_resolution_raster() -> None:
     tensor = np.arange(2 * 18 * 47, dtype=np.float32).reshape(1, 2, 18, 47)
     record = ActivationRecord(
@@ -1128,3 +1184,186 @@ def test_tensor_layer_viewer_rotates_and_brings_selected_plane_forward() -> None
     assert controller.planes[1].opacity == 1.0
     assert controller.planes[0].opacity < 1.0
     assert "source 1" in str(controller.selection_text.value)
+
+
+def _traced_shell(
+    service: ApplicationService,
+    path: Path,
+) -> tuple[Shell, StubPage, list[Any], str, ModelSession]:
+    """Open the model, run one approved trace, and defer run_thread waiters."""
+    shell, page = make_shell(service)
+    session = service.open_model(path)
+    shell.show_session(session)
+    callbacks: list[Any] = []
+    cast(Any, page).run_thread = callbacks.append
+    shell.trace.run(cast(ft.Event[ft.Button], cast(Any, SimpleNamespace())))
+    callbacks.pop(0)()
+    callbacks.pop(0)()
+    trace_id = shell.trace.active_trace_id
+    assert trace_id is not None
+    return shell, page, callbacks, trace_id, session
+
+
+def _activation_card(shell: Shell, value_id: str) -> ft.ExpansionTile:
+    return next(
+        control
+        for control in shell.inspector.controls
+        if isinstance(control, ft.ExpansionTile)
+        and control.data == f"activation-card:{value_id}"
+    )
+
+
+def _build_views_button(card: ft.ExpansionTile) -> ft.TextButton | None:
+    assert card.controls
+    body = cast(ft.Column, card.controls[0])
+    return next(
+        (
+            child
+            for child in body.controls
+            if isinstance(child, ft.TextButton)
+            and child.content == "Build activation views now"
+        ),
+        None,
+    )
+
+
+def _count_view_submissions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Record every visualization job the session is asked to start."""
+    submitted: list[str] = []
+    original = ModelSession.activation_visualizations_async
+
+    def counting(
+        session: ModelSession,
+        trace_id: str,
+        value_id: str,
+        *,
+        attention: bool = False,
+    ) -> Any:
+        submitted.append(value_id)
+        return original(session, trace_id, value_id, attention=attention)
+
+    monkeypatch.setattr(ModelSession, "activation_visualizations_async", counting)
+    return submitted
+
+
+def test_visualization_cache_evicts_under_budget_and_rebuilds_on_click(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    # Measure what the selection's two view tuples really cost, on a first
+    # trace of the same deterministic model, so the injected budget admits
+    # either entry alone but never both together.
+    with ApplicationService() as measuring:
+        _shell, _page, _callbacks, trace_id, session = _traced_shell(measuring, path)
+        node_id = session.document.main_graph.nodes[0].id
+        records = session.node_activations(trace_id, node_id)
+        view = session.activations(trace_id)
+        costs = [
+            _visualization_cost(
+                build_activation_visualizations(record, view.read(record.value_id))
+            )
+            for record in records
+        ]
+        assert len(costs) == 2
+
+    monkeypatch.setattr(
+        "nneditor.ui.app.ActivationInspector",
+        partial(ActivationInspector, visualization_cache_budget=max(costs)),
+    )
+    with ApplicationService() as service:
+        shell, page, callbacks, trace_id, session = _traced_shell(service, path)
+        cache = shell.activations.activation_visualizations
+        assert cache.budget == max(costs)
+
+        node_id = session.document.main_graph.nodes[0].id
+        _select_operators(shell, session, node_id)
+        while callbacks:
+            callbacks.pop(0)()
+
+        first, second = session.node_activations(trace_id, node_id)
+        # Both views were built; the budget retained only the more recent one.
+        assert cache.stats.evictions == 1
+        assert cache.peek((trace_id, first.value_id)) is None
+        assert cache.peek((trace_id, second.value_id)) is not None
+
+        shell._refresh_inspector(frozenset({node_id}))
+        button = _build_views_button(_activation_card(shell, first.value_id))
+        assert button is not None
+        assert _build_views_button(_activation_card(shell, second.value_id)) is None
+
+        # The manual button is the recovery path: clicking it rebuilds the
+        # evicted entry through a fresh job.
+        cast(Any, page).run_thread = lambda target: target()
+        cast(Any, button.on_click)(cast(Any, SimpleNamespace()))
+        assert cache.peek((trace_id, first.value_id)) is not None
+        rebuilt_card = _activation_card(shell, first.value_id)
+        assert rebuilt_card.controls
+        rebuilt = cast(ft.Column, rebuilt_card.controls[0])
+        assert any(
+            isinstance(child, ft.FilledButton) and child.content == "Open large view"
+            for child in rebuilt.controls
+        )
+
+
+def test_selection_autoload_is_capped_and_the_rest_keep_the_manual_button(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    monkeypatch.setattr("nneditor.ui.activation_inspector._AUTOLOAD_VIEW_LIMIT", 1)
+    with ApplicationService() as service:
+        shell, _page, callbacks, trace_id, session = _traced_shell(service, path)
+        submitted = _count_view_submissions(monkeypatch)
+
+        node_id = session.document.main_graph.nodes[0].id
+        _select_operators(shell, session, node_id)
+
+        first, second = session.node_activations(trace_id, node_id)
+        # Two readable records but a cap of one: exactly the first record's
+        # job starts, and the second keeps its manual build button.
+        assert submitted == [first.value_id]
+        assert _build_views_button(_activation_card(shell, first.value_id)) is None
+        assert _build_views_button(_activation_card(shell, second.value_id)) is not None
+
+        while callbacks:
+            callbacks.pop(0)()
+        assert submitted == [first.value_id]
+        assert _build_views_button(_activation_card(shell, second.value_id)) is not None
+
+
+def test_inflight_view_request_is_not_resubmitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, _page, callbacks, trace_id, session = _traced_shell(service, path)
+        submitted = _count_view_submissions(monkeypatch)
+
+        node_id = session.document.main_graph.nodes[0].id
+        _select_operators(shell, session, node_id)
+        records = session.node_activations(trace_id, node_id)
+        assert submitted == [record.value_id for record in records]
+
+        # The waiters have not run, so every request is still in flight; a
+        # repeated selection and even a forced manual request submit nothing.
+        before = list(submitted)
+        shell.activations.autoload_views(frozenset({node_id}))
+        first = records[0]
+        assert not shell.activations._request_views(trace_id, first.value_id, node_id)
+        assert not shell.activations._request_views(
+            trace_id, first.value_id, node_id, force=True
+        )
+        assert submitted == before
+
+        while callbacks:
+            callbacks.pop(0)()
+        # Resolved views are cached, so a repeat request stays a no-op.
+        assert not shell.activations._request_views(trace_id, first.value_id, node_id)
+        assert submitted == before

@@ -189,6 +189,26 @@ class EditingController:
     def byte_length(self, tensor_id: str) -> int | None:
         return self._chain.byte_length(tensor_id)
 
+    def reader_at(self, revisions: tuple[Revision, ...]) -> Callable[[str], bytes]:
+        """A tensor reader pinned to one captured revision list.
+
+        Long-running work (a trace's model export) must not run under this
+        controller's lock. The returned callable overlays exactly
+        ``revisions`` on the immutable base artifact through a detached
+        chain with its own lock, so it keeps serving the captured snapshot's
+        bytes no matter what the live chain commits meanwhile. Reads fail
+        rather than block once the session's tensor store closes; callers
+        surface that through their job-error path.
+        """
+        chain = RevisionChain.pinned(
+            revisions,
+            self._read_base,
+            read_range=self._read_range,
+            tensor_length=self._tensor_length,
+            base_document=self._document,
+        )
+        return chain.read
+
     @_editing_locked
     def preview(self) -> DiffPreview:
         """A read-only diff of the applied chain against the base artifact."""

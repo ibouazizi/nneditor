@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Final
 
+from nneditor.ir.dtypes import dtype_info
+
 __all__ = [
     "SERDE_SCALAR_TYPES",
     "STORAGE_CLASS_TYPES",
@@ -78,26 +80,8 @@ TORCH_DTYPE_NAMES: Final[dict[str, str]] = {
     "torch.complex128": "complex128",
 }
 
-_WIDTHS: Final[dict[str, int]] = {
-    "float64": 8,
-    "float32": 4,
-    "float16": 2,
-    "bfloat16": 2,
-    "int64": 8,
-    "int32": 4,
-    "int16": 2,
-    "int8": 1,
-    "uint8": 1,
-    "uint16": 2,
-    "uint32": 4,
-    "uint64": 8,
-    "bool": 1,
-    "complex32": 4,
-    "complex64": 8,
-    "complex128": 16,
-}
-
 
 def element_width_bytes(element_type: str) -> int | None:
-    """Bytes per element for the PyTorch-reachable dtypes."""
-    return _WIDTHS.get(element_type)
+    """Whole bytes per element, answered by the shared dtype registry."""
+    info = dtype_info(element_type)
+    return None if info is None else info.byte_width

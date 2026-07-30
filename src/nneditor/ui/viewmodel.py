@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nneditor.analysis.statistics import TensorStatistics, decode_packed
+from nneditor.analysis.statistics import (
+    TensorStatistics,
+    decode_packed,
+    decode_unavailability,
+)
 from nneditor.diagnostics import describe
 from nneditor.ir.core import Attribute, Document, Storage, Value
 from nneditor.transformations.engine import (
@@ -383,7 +387,9 @@ def preview_values_text(element_type: str, raw: bytes, *, limit: int = 8) -> str
     """A short human-readable slice preview from already-read bytes."""
     decoded = decode_packed(element_type, raw)
     if decoded is None:
-        return f"{len(raw)} raw byte(s); values not decodable for this dtype"
+        reason = decode_unavailability(element_type)
+        detail = f": {reason}" if reason else ""
+        return f"{len(raw)} raw byte(s); values not decodable for this dtype{detail}"
     shown = [f"{float(value):.6g}" for value in list(decoded)[:limit]]
     suffix = ", …" if len(decoded) > limit else ""
     return "[" + ", ".join(shown) + suffix + "]"

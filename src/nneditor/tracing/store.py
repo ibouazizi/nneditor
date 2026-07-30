@@ -213,7 +213,21 @@ class ActivationStore:
             merged = {record.value_id: record for record in records}
             retained_after_drop: list[str] = []
             previous_result = self._results.get(trace_id)
-            if previous_result is not None and target.is_dir():
+            incoming_identity = self._execution_identity(execution_provider, runtime)
+            replaced_runtime: str | None = None
+            if previous_result is not None and incoming_identity != (
+                self._execution_identity(
+                    previous_result.execution_provider,
+                    previous_result.runtime,
+                )
+            ):
+                # One trace, one runtime: a result computed by a different
+                # execution provider is replaced outright, never merged, so a
+                # displayed trace can never mix values from two runtimes.
+                replaced_runtime = previous_result.execution_provider or (
+                    previous_result.runtime
+                )
+            elif previous_result is not None and target.is_dir():
                 for previous_record in previous_result.records:
                     current = merged.get(previous_record.value_id)
                     keep_previous = current is None or (
@@ -252,6 +266,14 @@ class ActivationStore:
                     "this run produced a shorter or unavailable capture for "
                     f"{len(retained_after_drop)} value(s); an earlier capture "
                     "for the identical artifact/revision/input key was retained",
+                )
+            if replaced_runtime is not None:
+                merged_diagnostics = (
+                    *merged_diagnostics,
+                    "an earlier capture for this trace key was computed by "
+                    f"{replaced_runtime}; a trace never mixes execution "
+                    "runtimes, so its records were discarded and replaced by "
+                    f"this {incoming_identity[1]} run",
                 )
             result = TraceResult(
                 key,
@@ -338,6 +360,18 @@ class ActivationStore:
             self._write_manifest(directory, evicted)
             self._results[trace_id] = evicted
             self._slice_cache.invalidate(self._trace_predicate(trace_id))
+
+    @staticmethod
+    def _execution_identity(execution_provider: str, runtime: str) -> tuple[str, str]:
+        """The runtime identity two commits must share before they may merge.
+
+        A provider-less commit is identified by its runtime string alone and
+        never shares identity with a provider-bearing commit, even when the
+        strings coincide.
+        """
+        if execution_provider:
+            return ("provider", execution_provider)
+        return ("runtime", runtime)
 
     @staticmethod
     def _trace_predicate(

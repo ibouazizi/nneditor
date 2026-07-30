@@ -47,8 +47,19 @@ dependencies = [
     # used only after import for Phase 4 schema validation, checking, shape
     # inference, and export.
     "onnx>=1.22,<2",
-    "onnxruntime>=1.22,<2",
 ]
+
+# ONNX Runtime ships one distribution per accelerator family, and every one of
+# them owns the same `onnxruntime` import name — a hard dependency on the CPU
+# wheel would conflict with all of them and make GPU/NPU tracing unreachable.
+# Tracing therefore degrades to the ONNX reference evaluator when no runtime
+# is importable, and each extra names one installable runtime flavour.
+[project.optional-dependencies]
+runtime = ["onnxruntime>=1.22,<2"]
+runtime-gpu = ["onnxruntime-gpu>=1.22,<2"]
+runtime-directml = ["onnxruntime-directml>=1.22,<2"]
+runtime-qnn = ["onnxruntime-qnn>=1.22,<2"]
+runtime-openvino = ["onnxruntime-openvino>=1.22,<2"]
 
 [project.scripts]
 nneditor = "nneditor.ui.app:cli"
@@ -67,6 +78,9 @@ path = "src/nneditor/__init__.py"
 dev = [
     "jax>=0.4.35",
     "mypy>=1.18,<2",
+    # The CPU runtime, so the ONNX Runtime tracing paths stay tested even
+    # though the published package no longer requires a runtime.
+    "onnxruntime>=1.22,<2",
     "pytest>=8.4,<10",
     "pytest-cov>=6,<8",
     "ruff>=0.12,<1",

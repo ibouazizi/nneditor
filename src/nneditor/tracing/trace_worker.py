@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -101,6 +102,31 @@ def _provider_candidates(
     if requested in {TraceDevice.AUTO, TraceDevice.CPU}:
         add(TraceDevice.CPU, "CPU", ("CPUExecutionProvider",))
     return tuple(candidates)
+
+
+# The published package deliberately has no hard ONNX Runtime dependency:
+# every accelerator family ships its own distribution and all of them own the
+# same `onnxruntime` import name, so pinning one would block the others.
+_RUNTIME_INSTALL_HINTS: dict[TraceDevice, str] = {
+    TraceDevice.AUTO: "nneditor[runtime]",
+    TraceDevice.CPU: "nneditor[runtime]",
+    TraceDevice.GPU: (
+        "nneditor[runtime-gpu] for CUDA or nneditor[runtime-directml] "
+        "for any Windows GPU"
+    ),
+    TraceDevice.NPU: (
+        "nneditor[runtime-qnn] for Qualcomm, nneditor[runtime-openvino] "
+        "for Intel, or a vendor ONNX Runtime build"
+    ),
+}
+
+
+def _missing_runtime_message(device: TraceDevice) -> str:
+    """Name the exact extra that enables the requested device."""
+    return (
+        "ONNX Runtime is not installed in this environment; install "
+        f"{_RUNTIME_INSTALL_HINTS[device]} to enable it"
+    )
 
 
 def _axis_reference_evaluator(model: onnx.ModelProto) -> Any:
@@ -460,62 +486,80 @@ def _prefix_source(
     )
 
 
+def _stage_capture_model(model_path: Path, output_names: list[str]) -> Path:
+    """Write an output-augmented copy of the staged model for ONNX Runtime.
+
+    The runtime reads the model from this file, so the fully loaded in-memory
+    proto is never re-serialized: ``SerializeToString`` would peak at twice
+    the model's size and fails outright at the 2 GiB protobuf ceiling. The
+    skeleton loaded here is a private copy, so moving its embedded tensors to
+    external data cannot disturb the reference-evaluator fallback, and the
+    file is written beside the model inside the worker's scratch directory,
+    which keeps the model's existing external-data references valid.
+    """
+    skeleton = onnx.load_model(str(model_path), load_external_data=False)
+    existing = {value.name for value in skeleton.graph.output}
+    for name in output_names:
+        if name in existing:
+            continue
+        value_info = onnx.ValueInfoProto()
+        value_info.name = name
+        skeleton.graph.output.append(value_info)
+        existing.add(name)
+    capture_path = model_path.with_name(model_path.name + ".capture.onnx")
+    data_name = capture_path.name + ".data"
+    # onnx appends to an existing external-data file, so a stale one from an
+    # earlier attempt must not survive into this staging.
+    for stale in (capture_path, capture_path.with_name(data_name)):
+        with contextlib.suppress(OSError):
+            stale.unlink()
+    onnx.save_model(
+        skeleton,
+        str(capture_path),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=data_name,
+        convert_attribute=False,
+    )
+    return capture_path
+
+
 def _onnxruntime_captures(
     model: onnx.ModelProto,
+    capture_model: Path,
     feeds: dict[str, np.ndarray[Any, Any]],
-    targets: list[dict[str, object]],
+    runtime_targets: list[dict[str, object]],
     candidate: OrtProviderCandidate,
 ) -> CaptureSource:
-    """Capture requested values through an augmented ONNX Runtime session."""
+    """Capture requested values through a staged ONNX Runtime session."""
     import onnxruntime as ort  # type: ignore[import-untyped]
 
-    diagnostics: list[str] = []
-    input_names = set(feeds)
-    runtime_targets = [
-        target for target in targets if str(target["value_name"]) not in input_names
-    ]
-    if not runtime_targets:
-        return CaptureSource(model, feeds, {}, diagnostics, len(model.graph.node), None)
-
-    existing_outputs = {value.name for value in model.graph.output}
-    original_output_count = len(model.graph.output)
-    try:
-        for target in runtime_targets:
-            name = str(target["value_name"])
-            if name in existing_outputs:
-                continue
-            value_info = onnx.ValueInfoProto()
-            value_info.name = name
-            model.graph.output.append(value_info)
-            existing_outputs.add(name)
-        options = ort.SessionOptions()
-        options.enable_cpu_mem_arena = False
-        options.enable_mem_pattern = False
-        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
-        options.inter_op_num_threads = 1
-        options.intra_op_num_threads = 1
-        options.log_severity_level = 3
-        if candidate.device is not TraceDevice.CPU:
-            # An explicit accelerator candidate must either execute without
-            # the generic CPU EP or fail so Auto can try the next candidate.
-            # This keeps the reported device honest.
-            options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-        session = ort.InferenceSession(
-            model.SerializeToString(),
-            sess_options=options,
-            providers=list(candidate.providers),
-            provider_options=list(candidate.provider_options),
-        )
-        names = [str(target["value_name"]) for target in runtime_targets]
-        values = session.run(names, feeds)
-    finally:
-        del model.graph.output[original_output_count:]
+    options = ort.SessionOptions()
+    options.enable_cpu_mem_arena = False
+    options.enable_mem_pattern = False
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    options.inter_op_num_threads = 1
+    options.intra_op_num_threads = 1
+    options.log_severity_level = 3
+    if candidate.device is not TraceDevice.CPU:
+        # An explicit accelerator candidate must either execute without
+        # the generic CPU EP or fail so Auto can try the next candidate.
+        # This keeps the reported device honest.
+        options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        str(capture_model),
+        sess_options=options,
+        providers=list(candidate.providers),
+        provider_options=list(candidate.provider_options),
+    )
+    names = [str(target["value_name"]) for target in runtime_targets]
+    values = session.run(names, feeds)
     whole = {
         str(target["value_id"]): np.asarray(value)
         for target, value in zip(runtime_targets, values, strict=True)
     }
-    return CaptureSource(model, feeds, whole, diagnostics, len(model.graph.node), None)
+    return CaptureSource(model, feeds, whole, [], len(model.graph.node), None)
 
 
 def _failed_runtime_source(
@@ -528,11 +572,15 @@ def _failed_runtime_source(
 
 def _open_onnxruntime(
     model: onnx.ModelProto,
+    model_path: Path,
     feeds: dict[str, np.ndarray[Any, Any]],
     targets: list[dict[str, object]],
     device: TraceDevice,
 ) -> tuple[CaptureSource, str, TraceDevice, str]:
-    import onnxruntime as ort
+    try:
+        import onnxruntime as ort
+    except ImportError as error:
+        raise RuntimeError(_missing_runtime_message(device)) from error
 
     available = list(ort.get_available_providers())
     candidates = _provider_candidates(available, device)
@@ -541,15 +589,49 @@ def _open_onnxruntime(
             f"no {device.value.upper()} execution provider is installed; "
             f"available providers: {', '.join(available) or 'none'}"
         )
+    input_names = set(feeds)
+    runtime_targets = [
+        target for target in targets if str(target["value_name"]) not in input_names
+    ]
+    if not runtime_targets:
+        source = CaptureSource(model, feeds, {}, [], len(model.graph.node), None)
+        first = candidates[0]
+        runtime = f"onnxruntime {ort.__version__} · {first.label}"
+        return source, runtime, first.device, first.provider
+    try:
+        capture_model = _stage_capture_model(
+            model_path,
+            [str(target["value_name"]) for target in runtime_targets],
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "the capture model could not be staged for ONNX Runtime: "
+            f"{type(error).__name__}: {error}"
+        ) from error
     failures: list[str] = []
-    for candidate in candidates:
-        try:
-            source = _onnxruntime_captures(model, feeds, targets, candidate)
-        except Exception as error:
-            failures.append(f"{candidate.label}: {type(error).__name__}: {error}")
-            continue
-        runtime = f"onnxruntime {ort.__version__} · {candidate.label}"
-        return source, runtime, candidate.device, candidate.provider
+    try:
+        for candidate in candidates:
+            try:
+                source = _onnxruntime_captures(
+                    model,
+                    capture_model,
+                    feeds,
+                    runtime_targets,
+                    candidate,
+                )
+            except Exception as error:
+                failures.append(f"{candidate.label}: {type(error).__name__}: {error}")
+                continue
+            runtime = f"onnxruntime {ort.__version__} · {candidate.label}"
+            return source, runtime, candidate.device, candidate.provider
+    finally:
+        # Captures are materialized eagerly, so the staged file is spent by
+        # now. A runtime that still maps it blocks deletion on Windows;
+        # scratch teardown reclaims whatever this best-effort pass cannot.
+        data_path = capture_model.with_name(capture_model.name + ".data")
+        for stale in (capture_model, data_path):
+            with contextlib.suppress(OSError):
+                stale.unlink()
     detail = "; ".join(failures)
     raise RuntimeError(
         f"no usable {device.value.upper()} execution provider accepted the model"
@@ -559,6 +641,7 @@ def _open_onnxruntime(
 
 def _open_backend(
     model: onnx.ModelProto,
+    model_path: Path,
     feeds: dict[str, np.ndarray[Any, Any]],
     targets: list[dict[str, object]],
     backend: TraceBackend,
@@ -566,7 +649,7 @@ def _open_backend(
 ) -> tuple[CaptureSource, str, TraceDevice, str]:
     if backend is TraceBackend.ONNX_RUNTIME:
         try:
-            return _open_onnxruntime(model, feeds, targets, device)
+            return _open_onnxruntime(model, model_path, feeds, targets, device)
         except Exception as error:
             message = (
                 "ONNX Runtime could not execute the trace: "
@@ -616,7 +699,7 @@ def _open_backend(
         )
 
     try:
-        return _open_onnxruntime(model, feeds, targets, device)
+        return _open_onnxruntime(model, model_path, feeds, targets, device)
     except Exception as error:
         if device in {TraceDevice.GPU, TraceDevice.NPU}:
             message = (
@@ -778,6 +861,7 @@ def run(request_path: Path) -> None:
         raise ValueError(f"unknown trace device {raw.get('device')!r}") from error
     source, runtime, execution_device, execution_provider = _open_backend(
         model,
+        Path(str(raw["model"])),
         feeds,
         targets,
         backend,

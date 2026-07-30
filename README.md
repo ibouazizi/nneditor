@@ -172,12 +172,26 @@ Desktop tracing is available for ONNX models:
 The top-right device indicator shows the provider that actually completed the
 latest trace. NNEditor recognizes ONNX Runtime's CUDA, TensorRT, DirectML,
 OpenVINO GPU, MIGraphX, and ROCm GPU providers, plus OpenVINO NPU, Qualcomm QNN
-HTP, and AMD Vitis AI NPU providers. The standard NNEditor installation
-includes CPU ONNX Runtime. Accelerator use requires a compatible
-provider-enabled ONNX Runtime distribution and its vendor drivers in the same
-environment. Provider distributions expose the same `onnxruntime` import and
-should replace, not be installed alongside, the CPU-only distribution; follow
-the provider vendor's compatibility and installation instructions.
+HTP, and AMD Vitis AI NPU providers.
+
+The base NNEditor installation ships no ONNX Runtime: every accelerator family
+publishes its own distribution and all of them own the same `onnxruntime`
+import name, so a fixed dependency on one would block the others. Install
+exactly one runtime extra for the hardware you want to trace on:
+
+| Install | Runtime |
+|:--|:--|
+| `pip install nneditor[runtime]` | CPU |
+| `pip install nneditor[runtime-gpu]` | NVIDIA CUDA / TensorRT |
+| `pip install nneditor[runtime-directml]` | Any Windows GPU via DirectML |
+| `pip install nneditor[runtime-qnn]` | Qualcomm NPU (QNN HTP) |
+| `pip install nneditor[runtime-openvino]` | Intel GPU and NPU via OpenVINO |
+
+Without a runtime, automatic backend selection uses NNEditor's axis-aware ONNX
+reference evaluator on CPU and says so; an explicit ONNX Runtime, GPU, or NPU
+request fails with the extra to install. Accelerators additionally need their
+vendor drivers in the same environment; follow the provider vendor's
+compatibility and installation instructions.
 
 Ready-made image and time-series tensors are available in
 [examples/trace-inputs](examples/trace-inputs).
