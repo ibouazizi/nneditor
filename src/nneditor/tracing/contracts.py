@@ -16,6 +16,7 @@ __all__ = [
     "InputSource",
     "InputSpecification",
     "TraceApproval",
+    "TraceBackend",
     "TraceKey",
     "TraceLimits",
     "TraceRequest",
@@ -44,6 +45,15 @@ class CaptureState(StrEnum):
     TRUNCATED = "truncated"
     DROPPED = "dropped"
     EVICTED = "evicted"
+
+
+class TraceBackend(StrEnum):
+    """Execution engine selected for one explicitly approved trace."""
+
+    AUTO = "auto"
+    ONNX_RUNTIME = "onnxruntime"
+    REFERENCE = "reference"
+    REFERENCE_NORMALIZED = "reference-normalized"
 
 
 Scalar = bool | int | float
@@ -206,6 +216,7 @@ class TraceApproval:
     input_specification_hash: str
     limits_hash: str
     approved: bool
+    backend: TraceBackend = TraceBackend.AUTO
 
     @classmethod
     def approve(
@@ -214,6 +225,7 @@ class TraceApproval:
         artifact_hash: str,
         specification: InputSpecification,
         limits: TraceLimits,
+        backend: TraceBackend = TraceBackend.AUTO,
     ) -> TraceApproval:
         return cls(
             model_title,
@@ -221,6 +233,7 @@ class TraceApproval:
             specification.hash,
             limits.hash,
             True,
+            backend,
         )
 
     def validate(
@@ -230,6 +243,7 @@ class TraceApproval:
         artifact_hash: str,
         specification: InputSpecification,
         limits: TraceLimits,
+        backend: TraceBackend = TraceBackend.AUTO,
     ) -> None:
         if not self.approved:
             raise ValueError("inference tracing requires explicit per-run approval")
@@ -238,12 +252,14 @@ class TraceApproval:
             artifact_hash,
             specification.hash,
             limits.hash,
+            backend,
         )
         actual = (
             self.model_title,
             self.artifact_hash,
             self.input_specification_hash,
             self.limits_hash,
+            self.backend,
         )
         if actual != expected:
             raise ValueError(
@@ -257,19 +273,29 @@ class TraceKey:
     artifact_hash: str
     revision_id: str | None
     input_specification_hash: str
+    backend: TraceBackend = TraceBackend.AUTO
+    identity_version: int = 2
 
     def __post_init__(self) -> None:
         if not self.artifact_hash or not self.input_specification_hash:
             raise ValueError("trace key needs artifact and input-specification hashes")
+        if self.identity_version not in {1, 2}:
+            raise ValueError("trace key identity version is unsupported")
 
     @property
     def id(self) -> str:
+        payload: dict[str, object] = {
+            "artifact_hash": self.artifact_hash,
+            "revision_id": self.revision_id,
+            "input_specification_hash": self.input_specification_hash,
+        }
+        # Version 1 predates selectable execution backends. Keeping its exact
+        # digest lets existing manifests load, while every new v2 trace binds
+        # its requested backend—even auto—into an immutable identity.
+        if self.identity_version >= 2:
+            payload["backend"] = self.backend.value
         return _canonical_hash(
-            {
-                "artifact_hash": self.artifact_hash,
-                "revision_id": self.revision_id,
-                "input_specification_hash": self.input_specification_hash,
-            },
+            payload,
             "trace",
         )
 
@@ -280,6 +306,7 @@ class TraceRequest:
     limits: TraceLimits
     approval: TraceApproval
     value_ids: frozenset[str] = frozenset()
+    backend: TraceBackend = TraceBackend.AUTO
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +443,8 @@ class TraceResult:
                 "artifact_hash": self.key.artifact_hash,
                 "revision_id": self.key.revision_id,
                 "input_specification_hash": self.key.input_specification_hash,
+                "backend": self.key.backend.value,
+                "identity_version": self.key.identity_version,
             },
             "records": [record.to_json() for record in self.records],
             "runtime": self.runtime,
@@ -440,6 +469,8 @@ class TraceResult:
                     None if key.get("revision_id") is None else str(key["revision_id"])
                 ),
                 input_specification_hash=str(key["input_specification_hash"]),
+                backend=TraceBackend(str(key.get("backend", TraceBackend.AUTO.value))),
+                identity_version=int(key.get("identity_version", 1)),
             ),
             records=tuple(ActivationRecord.from_json(item) for item in raw["records"]),
             runtime=str(raw["runtime"]),

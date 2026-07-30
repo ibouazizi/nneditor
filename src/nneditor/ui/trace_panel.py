@@ -28,6 +28,7 @@ from nneditor.tracing.comparison import TraceComparison
 from nneditor.tracing.contracts import (
     InputBinding,
     TraceApproval,
+    TraceBackend,
     TraceLimits,
     TraceRequest,
     TraceResult,
@@ -125,6 +126,29 @@ class TracePanel:
             label="Symbolic shapes (input=2x3; ...)",
             dense=True,
         )
+        self.backend = ft.Dropdown(
+            label="Execution backend",
+            value=TraceBackend.AUTO.value,
+            dense=True,
+            options=[
+                ft.DropdownOption(
+                    key=TraceBackend.AUTO.value,
+                    text="Automatic (ONNX Runtime, then reference)",
+                ),
+                ft.DropdownOption(
+                    key=TraceBackend.ONNX_RUNTIME.value,
+                    text="ONNX Runtime",
+                ),
+                ft.DropdownOption(
+                    key=TraceBackend.REFERENCE.value,
+                    text="Axis-aware reference evaluator",
+                ),
+                ft.DropdownOption(
+                    key=TraceBackend.REFERENCE_NORMALIZED.value,
+                    text="Normalized reference evaluator",
+                ),
+            ],
+        )
         self.wall_seconds = ft.TextField(
             label="Wall limit (seconds)",
             value="30",
@@ -216,6 +240,7 @@ class TracePanel:
                 ),
                 self.seed,
                 self.shapes,
+                self.backend,
                 ft.Row(
                     controls=[self.wall_seconds, self.memory_mib],
                     spacing=6,
@@ -679,7 +704,8 @@ class TracePanel:
             status = session.capability(Capability.TRACING)
             self.approval_notice.value = (
                 f"Selecting Approve & run authorizes one isolated trace of "
-                f"{session.title} using the graph inputs and four limits shown."
+                f"{session.title} using the backend, graph inputs, and four "
+                "limits shown."
             )
             available = status.availability is Availability.AVAILABLE and not web
             reason = (
@@ -752,6 +778,7 @@ class TracePanel:
             self.active_trace_id is None or not alternatives or busy
         )
         self.capture_selected_only.disabled = busy
+        self.backend.disabled = busy
         self.refresh_capture_scope()
 
     def run(self, event: ft.Event[ft.Button]) -> None:
@@ -774,6 +801,7 @@ class TracePanel:
         memory_text = self.memory_mib.value or ""
         capture_text = self.capture_mib.value or ""
         chunk_text = self.chunk_kib.value or ""
+        backend_text = self.backend.value or TraceBackend.AUTO.value
         bindings = dict(self.input_bindings)
         value_ids = self.capture_value_ids()
         self._preparing = True
@@ -799,17 +827,20 @@ class TracePanel:
                     capture_bytes=int(capture_text) * 1024 * 1024,
                     chunk_bytes=int(chunk_text) * 1024,
                 )
+                backend = TraceBackend(backend_text)
                 approval = TraceApproval.approve(
                     session.title,
                     session.document.source.content_hash,
                     specification,
                     limits,
+                    backend,
                 )
                 request = TraceRequest(
                     specification,
                     limits,
                     approval,
                     value_ids=value_ids,
+                    backend=backend,
                 )
                 job = session.trace_async(request)
             except (OSError, TypeError, ValueError) as error:
@@ -830,7 +861,8 @@ class TracePanel:
                 f"Loading trace for {session.title} • inputs "
                 f"{specification.hash[:19]} • {limits.wall_seconds:g}s / "
                 f"{limits.memory_bytes // (1024 * 1024)} MiB / "
-                f"{limits.capture_bytes // (1024 * 1024)} MiB capture"
+                f"{limits.capture_bytes // (1024 * 1024)} MiB capture • "
+                f"{backend.value}"
             )
             self._on_status("Running approved inference trace in an isolated worker…")
             self.page.update()

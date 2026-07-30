@@ -47,6 +47,7 @@ dependencies = [
     # used only after import for Phase 4 schema validation, checking, shape
     # inference, and export.
     "onnx>=1.22,<2",
+    "onnxruntime>=1.22,<2",
 ]
 
 [project.scripts]

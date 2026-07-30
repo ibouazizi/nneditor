@@ -28,6 +28,7 @@ from nneditor.tracing import (
     InputSpecificationStore,
     PlotKind,
     TraceApproval,
+    TraceBackend,
     TraceKey,
     TraceLimits,
     TraceResult,
@@ -692,11 +693,62 @@ def test_trace_contract_json_round_trips_and_consent_identity() -> None:
             specification=specification,
             limits=limits,
         )
+    runtime_approval = TraceApproval.approve(
+        "model",
+        "artifact",
+        specification,
+        limits,
+        TraceBackend.ONNX_RUNTIME,
+    )
+    runtime_approval.validate(
+        model_title="model",
+        artifact_hash="artifact",
+        specification=specification,
+        limits=limits,
+        backend=TraceBackend.ONNX_RUNTIME,
+    )
+    with pytest.raises(ValueError, match="does not name"):
+        runtime_approval.validate(
+            model_title="model",
+            artifact_hash="artifact",
+            specification=specification,
+            limits=limits,
+        )
+    assert (
+        TraceKey("artifact", None, "inputs").id
+        != TraceKey(
+            "artifact",
+            None,
+            "inputs",
+            TraceBackend.ONNX_RUNTIME,
+        ).id
+    )
 
     record = _record("value", np.zeros(2, dtype=np.float32).tobytes())
     assert ActivationRecord.from_json(record.to_json()) == record
     result = TraceResult(TraceKey("artifact", None, specification.hash), (record,), "x")
     assert TraceResult.from_json(result.to_json()) == result
+    runtime_result = replace(
+        result,
+        key=replace(result.key, backend=TraceBackend.ONNX_RUNTIME),
+    )
+    assert TraceResult.from_json(runtime_result.to_json()) == runtime_result
+    legacy_json = result.to_json()
+    legacy_key = legacy_json["key"]
+    assert isinstance(legacy_key, dict)
+    legacy_key.pop("backend")
+    legacy_key.pop("identity_version")
+    legacy_result = TraceResult.from_json(legacy_json)
+    assert legacy_result.key.identity_version == 1
+    assert (
+        legacy_result.id
+        == TraceKey(
+            "artifact",
+            None,
+            specification.hash,
+            identity_version=1,
+        ).id
+    )
     with pytest.raises(KeyError):
         result.record("missing")
 

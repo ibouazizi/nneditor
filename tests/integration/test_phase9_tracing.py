@@ -55,7 +55,7 @@ def test_approved_trace_captures_inputs_and_intermediates_out_of_process(
             "output",
         }
         assert all(record.readable for record in result.records)
-        assert result.runtime.startswith("onnx.reference")
+        assert result.runtime.startswith("onnxruntime")
         assert os.environ.get("NNEDITOR_TRACE_WORKER") is None
         assert session.trace_input_specifications() == (
             _request(session).specification,

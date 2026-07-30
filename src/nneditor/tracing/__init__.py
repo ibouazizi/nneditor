@@ -37,6 +37,9 @@ from nneditor.tracing.contracts import (
     TraceApproval as TraceApproval,
 )
 from nneditor.tracing.contracts import (
+    TraceBackend as TraceBackend,
+)
+from nneditor.tracing.contracts import (
     TraceKey as TraceKey,
 )
 from nneditor.tracing.contracts import (
@@ -72,6 +75,18 @@ from nneditor.tracing.runner import (
 from nneditor.tracing.runner import (
     run_onnx_trace as run_onnx_trace,
 )
+from nneditor.tracing.scan import (
+    AxisAwareScan as AxisAwareScan,
+)
+from nneditor.tracing.scan import (
+    ScanNormalizationError as ScanNormalizationError,
+)
+from nneditor.tracing.scan import (
+    ScanNormalizationReport as ScanNormalizationReport,
+)
+from nneditor.tracing.scan import (
+    normalize_scan_axes as normalize_scan_axes,
+)
 from nneditor.tracing.store import (
     ActivationStore as ActivationStore,
 )
@@ -94,6 +109,7 @@ __all__ = [
     "ActivationStore",
     "ActivationView",
     "ActivationVisualization",
+    "AxisAwareScan",
     "CaptureState",
     "InputBinding",
     "InputSource",
@@ -101,7 +117,10 @@ __all__ = [
     "InputSpecificationStore",
     "NodeError",
     "PlotKind",
+    "ScanNormalizationError",
+    "ScanNormalizationReport",
     "TraceApproval",
+    "TraceBackend",
     "TraceComparison",
     "TraceError",
     "TraceKey",
@@ -113,6 +132,7 @@ __all__ = [
     "compare_traces",
     "comparison_scene_patch",
     "default_input_specification",
+    "normalize_scan_axes",
     "recommended_trace_limits",
     "run_onnx_trace",
     "tensor_file_binding",
