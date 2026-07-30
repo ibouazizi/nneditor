@@ -20,6 +20,7 @@ from nneditor.storage.store import TensorStore, TensorUnavailableError
 from nneditor.tracing.contracts import (
     ActivationRecord,
     CaptureState,
+    TraceDevice,
     TraceKey,
     TraceResult,
 )
@@ -185,6 +186,9 @@ class ActivationStore:
         runtime: str,
         diagnostics: tuple[str, ...],
         staging: Path,
+        *,
+        execution_device: TraceDevice = TraceDevice.CPU,
+        execution_provider: str = "CPU",
     ) -> TraceResult:
         target_staging = staging.resolve()
         if target_staging.parent != self.root or not target_staging.name.startswith(
@@ -254,6 +258,8 @@ class ActivationStore:
                 tuple(sorted(merged.values(), key=lambda item: item.value_id)),
                 runtime,
                 merged_diagnostics,
+                execution_device,
+                execution_provider,
             )
             self._write_manifest(target_staging, result)
             replaced = target.exists()
@@ -322,6 +328,8 @@ class ActivationStore:
                 ),
                 result.runtime,
                 (*result.diagnostics, "capture payloads were evicted by budget"),
+                result.execution_device,
+                result.execution_provider,
             )
             directory = self._trace_directory(trace_id)
             captures = directory / "captures"

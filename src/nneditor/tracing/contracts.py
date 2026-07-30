@@ -17,6 +17,7 @@ __all__ = [
     "InputSpecification",
     "TraceApproval",
     "TraceBackend",
+    "TraceDevice",
     "TraceKey",
     "TraceLimits",
     "TraceRequest",
@@ -54,6 +55,15 @@ class TraceBackend(StrEnum):
     ONNX_RUNTIME = "onnxruntime"
     REFERENCE = "reference"
     REFERENCE_NORMALIZED = "reference-normalized"
+
+
+class TraceDevice(StrEnum):
+    """Hardware class requested for one explicitly approved trace."""
+
+    AUTO = "auto"
+    CPU = "cpu"
+    GPU = "gpu"
+    NPU = "npu"
 
 
 Scalar = bool | int | float
@@ -217,6 +227,7 @@ class TraceApproval:
     limits_hash: str
     approved: bool
     backend: TraceBackend = TraceBackend.AUTO
+    device: TraceDevice = TraceDevice.AUTO
 
     @classmethod
     def approve(
@@ -226,6 +237,7 @@ class TraceApproval:
         specification: InputSpecification,
         limits: TraceLimits,
         backend: TraceBackend = TraceBackend.AUTO,
+        device: TraceDevice = TraceDevice.AUTO,
     ) -> TraceApproval:
         return cls(
             model_title,
@@ -234,6 +246,7 @@ class TraceApproval:
             limits.hash,
             True,
             backend,
+            device,
         )
 
     def validate(
@@ -244,6 +257,7 @@ class TraceApproval:
         specification: InputSpecification,
         limits: TraceLimits,
         backend: TraceBackend = TraceBackend.AUTO,
+        device: TraceDevice = TraceDevice.AUTO,
     ) -> None:
         if not self.approved:
             raise ValueError("inference tracing requires explicit per-run approval")
@@ -253,6 +267,7 @@ class TraceApproval:
             specification.hash,
             limits.hash,
             backend,
+            device,
         )
         actual = (
             self.model_title,
@@ -260,6 +275,7 @@ class TraceApproval:
             self.input_specification_hash,
             self.limits_hash,
             self.backend,
+            self.device,
         )
         if actual != expected:
             raise ValueError(
@@ -274,12 +290,13 @@ class TraceKey:
     revision_id: str | None
     input_specification_hash: str
     backend: TraceBackend = TraceBackend.AUTO
-    identity_version: int = 2
+    device: TraceDevice = TraceDevice.AUTO
+    identity_version: int = 3
 
     def __post_init__(self) -> None:
         if not self.artifact_hash or not self.input_specification_hash:
             raise ValueError("trace key needs artifact and input-specification hashes")
-        if self.identity_version not in {1, 2}:
+        if self.identity_version not in {1, 2, 3}:
             raise ValueError("trace key identity version is unsupported")
 
     @property
@@ -289,11 +306,14 @@ class TraceKey:
             "revision_id": self.revision_id,
             "input_specification_hash": self.input_specification_hash,
         }
-        # Version 1 predates selectable execution backends. Keeping its exact
-        # digest lets existing manifests load, while every new v2 trace binds
-        # its requested backend—even auto—into an immutable identity.
+        # Version 1 predates selectable execution backends and version 2
+        # predates selectable devices. Keeping their exact digests lets old
+        # manifests load, while every new trace binds both choices into its
+        # immutable identity.
         if self.identity_version >= 2:
             payload["backend"] = self.backend.value
+        if self.identity_version >= 3:
+            payload["device"] = self.device.value
         return _canonical_hash(
             payload,
             "trace",
@@ -307,6 +327,14 @@ class TraceRequest:
     approval: TraceApproval
     value_ids: frozenset[str] = frozenset()
     backend: TraceBackend = TraceBackend.AUTO
+    device: TraceDevice = TraceDevice.AUTO
+
+    def __post_init__(self) -> None:
+        if self.backend in {
+            TraceBackend.REFERENCE,
+            TraceBackend.REFERENCE_NORMALIZED,
+        } and self.device not in {TraceDevice.AUTO, TraceDevice.CPU}:
+            raise ValueError("reference tracing only supports CPU execution")
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,11 +439,15 @@ class TraceResult:
     records: tuple[ActivationRecord, ...]
     runtime: str
     diagnostics: tuple[str, ...] = ()
+    execution_device: TraceDevice = TraceDevice.CPU
+    execution_provider: str = "CPU"
 
     def __post_init__(self) -> None:
         value_ids = [record.value_id for record in self.records]
         if len(value_ids) != len(set(value_ids)):
             raise ValueError("trace result contains duplicate activation values")
+        if not self.execution_provider:
+            raise ValueError("trace result needs an execution provider")
 
     @property
     def id(self) -> str:
@@ -444,11 +476,14 @@ class TraceResult:
                 "revision_id": self.key.revision_id,
                 "input_specification_hash": self.key.input_specification_hash,
                 "backend": self.key.backend.value,
+                "device": self.key.device.value,
                 "identity_version": self.key.identity_version,
             },
             "records": [record.to_json() for record in self.records],
             "runtime": self.runtime,
             "diagnostics": list(self.diagnostics),
+            "execution_device": self.execution_device.value,
+            "execution_provider": self.execution_provider,
         }
 
     @classmethod
@@ -470,11 +505,16 @@ class TraceResult:
                 ),
                 input_specification_hash=str(key["input_specification_hash"]),
                 backend=TraceBackend(str(key.get("backend", TraceBackend.AUTO.value))),
+                device=TraceDevice(str(key.get("device", TraceDevice.AUTO.value))),
                 identity_version=int(key.get("identity_version", 1)),
             ),
             records=tuple(ActivationRecord.from_json(item) for item in raw["records"]),
             runtime=str(raw["runtime"]),
             diagnostics=tuple(str(item) for item in raw["diagnostics"]),
+            execution_device=TraceDevice(
+                str(raw.get("execution_device", TraceDevice.CPU.value))
+            ),
+            execution_provider=str(raw.get("execution_provider", "CPU")),
         )
 
 

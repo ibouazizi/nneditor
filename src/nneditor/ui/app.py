@@ -59,6 +59,7 @@ from nneditor.ir.core import AttrKind
 from nneditor.rendering import create_flet_renderer
 from nneditor.rendering.contract import InteractiveGraphRenderer, RendererFactory
 from nneditor.rendering.scene import Scene, Viewport
+from nneditor.tracing.contracts import TraceDevice
 from nneditor.tracing.runner import recommended_trace_limits
 from nneditor.transformations.engine import (
     TransformationProposal,
@@ -217,6 +218,30 @@ class Shell:
         )
         self.status_text = ft.Text(
             "Open a supported model artifact to begin.", size=11, color=_MUTED
+        )
+        self.device_icon = ft.Icon(
+            ft.Icons.MEMORY_ROUNDED,
+            size=15,
+            color=_MUTED,
+        )
+        self.device_text = ft.Text(
+            "Device: idle",
+            size=10,
+            color=_MUTED,
+            weight=ft.FontWeight.W_600,
+        )
+        self.device_indicator = ft.Container(
+            content=ft.Row(
+                controls=[self.device_icon, self.device_text],
+                spacing=5,
+                tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=ft.Padding.symmetric(horizontal=9, vertical=6),
+            bgcolor=_CANVAS,
+            border=ft.Border.all(1, _BORDER),
+            border_radius=14,
+            tooltip="No inference trace is running.",
         )
         self.error_banner = ft.Container(
             content=ft.Text("", color="#FFFFFF"),
@@ -537,6 +562,7 @@ class Shell:
             rebuild_minimap=self._rebuild_minimap,
             on_error=self._show_error,
             on_status=self._set_status,
+            on_device=self._set_trace_device,
             clear_error=self._clear_error,
             watch_text_focus=self._watch_text_focus,
         )
@@ -705,6 +731,7 @@ class Shell:
                 self.save_model_button,
                 self.close_model_button,
                 ft.Container(expand=True),
+                self.device_indicator,
                 self.job_text,
                 self.file_types_button,
                 self.left_toggle,
@@ -2865,6 +2892,67 @@ class Shell:
 
     def _set_status(self, text: str) -> None:
         self.status_text.value = text
+
+    def _set_trace_device(
+        self,
+        device: TraceDevice | None,
+        provider: str,
+    ) -> None:
+        if device is None:
+            unavailable = provider == "Unavailable"
+            self.device_text.value = (
+                "Device: unavailable" if unavailable else "Device: idle"
+            )
+            color = "#B42318" if unavailable else _MUTED
+            self.device_indicator.tooltip = (
+                "The requested inference device was unavailable."
+                if unavailable
+                else "No inference trace is running."
+            )
+        elif provider == "Unavailable":
+            self.device_text.value = f"{device.value.upper()} / unavailable"
+            color = "#B42318"
+            self.device_indicator.tooltip = (
+                f"No installed execution provider could run this trace on "
+                f"{device.value.upper()}."
+            )
+        elif provider == "Selecting provider":
+            self.device_text.value = f"{device.value.upper()} / selecting"
+            color = _ACCENT
+            self.device_indicator.tooltip = (
+                f"Selecting an installed provider for the requested "
+                f"{device.value.upper()} trace."
+            )
+        else:
+            labels = (
+                ("Tensorrt", "TensorRT / CUDA"),
+                ("CUDA", "CUDA"),
+                ("OpenVINO", "OpenVINO"),
+                ("QNN", "QNN HTP"),
+                ("VitisAI", "Vitis AI"),
+                ("Dml", "DirectML"),
+                ("MIGraphX", "MIGraphX"),
+                ("ROCM", "ROCm"),
+                ("CPUExecution", "ONNX Runtime"),
+                ("ReferenceEvaluator", "Reference"),
+            )
+            provider_label = next(
+                (label for marker, label in labels if marker in provider),
+                provider,
+            )
+            self.device_text.value = f"{device.value.upper()} / {provider_label}"
+            color = {
+                TraceDevice.CPU: "#027A48",
+                TraceDevice.GPU: "#175CD3",
+                TraceDevice.NPU: "#6941C6",
+            }.get(device, _ACCENT)
+            self.device_indicator.tooltip = (
+                f"Last completed trace: {device.value.upper()} via {provider}. "
+                "Captured outputs are copied to host memory."
+            )
+        self.device_icon.color = color
+        self.device_text.color = color
+        self.device_indicator.border = ft.Border.all(1, color)
 
     def _clear_error(self) -> None:
         self.error_banner.visible = False

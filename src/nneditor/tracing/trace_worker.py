@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,10 +15,92 @@ import numpy as np
 import onnx
 from onnx.reference import ReferenceEvaluator
 
-from nneditor.tracing.contracts import TraceBackend
+from nneditor.tracing.contracts import TraceBackend, TraceDevice
 from nneditor.tracing.scan import AxisAwareScan, normalize_scan_axes
 
 EvaluatorFactory = Callable[[onnx.ModelProto], Any]
+
+
+@dataclass(frozen=True, slots=True)
+class OrtProviderCandidate:
+    """One strict ONNX Runtime provider configuration to try."""
+
+    device: TraceDevice
+    label: str
+    providers: tuple[str, ...]
+    provider_options: tuple[dict[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not self.providers
+            or len(self.providers) != len(self.provider_options)
+            or self.device is TraceDevice.AUTO
+        ):
+            raise ValueError("invalid ONNX Runtime provider candidate")
+
+    @property
+    def provider(self) -> str:
+        return ", ".join(self.providers)
+
+
+def _provider_candidates(
+    available: list[str] | tuple[str, ...],
+    requested: TraceDevice,
+) -> tuple[OrtProviderCandidate, ...]:
+    """Return installed provider configurations in deterministic priority order."""
+    installed = set(available)
+    candidates: list[OrtProviderCandidate] = []
+
+    def add(
+        device: TraceDevice,
+        label: str,
+        providers: tuple[str, ...],
+        options: tuple[dict[str, str], ...] | None = None,
+    ) -> None:
+        if all(provider in installed for provider in providers):
+            candidates.append(
+                OrtProviderCandidate(
+                    device,
+                    label,
+                    providers,
+                    options or tuple({} for _ in providers),
+                )
+            )
+
+    if requested in {TraceDevice.AUTO, TraceDevice.GPU}:
+        add(
+            TraceDevice.GPU,
+            "TensorRT / CUDA",
+            ("TensorrtExecutionProvider", "CUDAExecutionProvider"),
+        )
+        add(TraceDevice.GPU, "CUDA", ("CUDAExecutionProvider",))
+    if requested in {TraceDevice.AUTO, TraceDevice.NPU}:
+        add(
+            TraceDevice.NPU,
+            "OpenVINO NPU",
+            ("OpenVINOExecutionProvider",),
+            ({"device_type": "NPU"},),
+        )
+        add(
+            TraceDevice.NPU,
+            "Qualcomm QNN HTP",
+            ("QNNExecutionProvider",),
+            ({"backend_type": "htp"},),
+        )
+        add(TraceDevice.NPU, "AMD Vitis AI", ("VitisAIExecutionProvider",))
+    if requested in {TraceDevice.AUTO, TraceDevice.GPU}:
+        add(TraceDevice.GPU, "DirectML", ("DmlExecutionProvider",))
+        add(
+            TraceDevice.GPU,
+            "OpenVINO GPU",
+            ("OpenVINOExecutionProvider",),
+            ({"device_type": "GPU"},),
+        )
+        add(TraceDevice.GPU, "AMD MIGraphX", ("MIGraphXExecutionProvider",))
+        add(TraceDevice.GPU, "AMD ROCm", ("ROCMExecutionProvider",))
+    if requested in {TraceDevice.AUTO, TraceDevice.CPU}:
+        add(TraceDevice.CPU, "CPU", ("CPUExecutionProvider",))
+    return tuple(candidates)
 
 
 def _axis_reference_evaluator(model: onnx.ModelProto) -> Any:
@@ -381,6 +464,7 @@ def _onnxruntime_captures(
     model: onnx.ModelProto,
     feeds: dict[str, np.ndarray[Any, Any]],
     targets: list[dict[str, object]],
+    candidate: OrtProviderCandidate,
 ) -> CaptureSource:
     """Capture requested values through an augmented ONNX Runtime session."""
     import onnxruntime as ort  # type: ignore[import-untyped]
@@ -406,15 +490,22 @@ def _onnxruntime_captures(
             existing_outputs.add(name)
         options = ort.SessionOptions()
         options.enable_cpu_mem_arena = False
+        options.enable_mem_pattern = False
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
         options.inter_op_num_threads = 1
         options.intra_op_num_threads = 1
         options.log_severity_level = 3
+        if candidate.device is not TraceDevice.CPU:
+            # An explicit accelerator candidate must either execute without
+            # the generic CPU EP or fail so Auto can try the next candidate.
+            # This keeps the reported device honest.
+            options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
         session = ort.InferenceSession(
             model.SerializeToString(),
             sess_options=options,
-            providers=["CPUExecutionProvider"],
+            providers=list(candidate.providers),
+            provider_options=list(candidate.provider_options),
         )
         names = [str(target["value_name"]) for target in runtime_targets]
         values = session.run(names, feeds)
@@ -435,34 +526,76 @@ def _failed_runtime_source(
     return CaptureSource(model, feeds, None, [message], 0, message)
 
 
+def _open_onnxruntime(
+    model: onnx.ModelProto,
+    feeds: dict[str, np.ndarray[Any, Any]],
+    targets: list[dict[str, object]],
+    device: TraceDevice,
+) -> tuple[CaptureSource, str, TraceDevice, str]:
+    import onnxruntime as ort
+
+    available = list(ort.get_available_providers())
+    candidates = _provider_candidates(available, device)
+    if not candidates:
+        raise RuntimeError(
+            f"no {device.value.upper()} execution provider is installed; "
+            f"available providers: {', '.join(available) or 'none'}"
+        )
+    failures: list[str] = []
+    for candidate in candidates:
+        try:
+            source = _onnxruntime_captures(model, feeds, targets, candidate)
+        except Exception as error:
+            failures.append(f"{candidate.label}: {type(error).__name__}: {error}")
+            continue
+        runtime = f"onnxruntime {ort.__version__} · {candidate.label}"
+        return source, runtime, candidate.device, candidate.provider
+    detail = "; ".join(failures)
+    raise RuntimeError(
+        f"no usable {device.value.upper()} execution provider accepted the model"
+        + (f": {detail}" if detail else "")
+    )
+
+
 def _open_backend(
     model: onnx.ModelProto,
     feeds: dict[str, np.ndarray[Any, Any]],
     targets: list[dict[str, object]],
     backend: TraceBackend,
-) -> tuple[CaptureSource, str]:
+    device: TraceDevice = TraceDevice.AUTO,
+) -> tuple[CaptureSource, str, TraceDevice, str]:
     if backend is TraceBackend.ONNX_RUNTIME:
         try:
-            return _onnxruntime_captures(model, feeds, targets), (
-                f"onnxruntime {__import__('onnxruntime').__version__}"
-            )
+            return _open_onnxruntime(model, feeds, targets, device)
         except Exception as error:
             message = (
                 "ONNX Runtime could not execute the trace: "
                 f"{type(error).__name__}: {error}"
             )
-            return _failed_runtime_source(model, feeds, message), "onnxruntime failed"
+            failed_device = TraceDevice.CPU if device is TraceDevice.AUTO else device
+            return (
+                _failed_runtime_source(model, feeds, message),
+                "onnxruntime failed",
+                failed_device,
+                "Unavailable",
+            )
     if backend is TraceBackend.REFERENCE:
-        return open_captures(model, feeds, targets), (
-            f"onnx.reference axis-aware {onnx.__version__}"
+        return (
+            open_captures(model, feeds, targets),
+            f"onnx.reference axis-aware {onnx.__version__}",
+            TraceDevice.CPU,
+            "ReferenceEvaluator",
         )
     if backend is TraceBackend.REFERENCE_NORMALIZED:
         try:
             normalized, report = normalize_scan_axes(model, in_place=True)
         except Exception as error:
             message = f"Scan axis normalization failed: {type(error).__name__}: {error}"
-            return _failed_runtime_source(model, feeds, message), (
-                "onnx.reference normalized failed"
+            return (
+                _failed_runtime_source(model, feeds, message),
+                "onnx.reference normalized failed",
+                TraceDevice.CPU,
+                "ReferenceEvaluator",
             )
         source = open_captures(
             normalized,
@@ -475,20 +608,39 @@ def _open_backend(
             if report.rewritten_scans
             else ""
         )
-        return source, f"onnx.reference normalized {onnx.__version__}{detail}"
+        return (
+            source,
+            f"onnx.reference normalized {onnx.__version__}{detail}",
+            TraceDevice.CPU,
+            "ReferenceEvaluator",
+        )
 
     try:
-        return _onnxruntime_captures(model, feeds, targets), (
-            f"onnxruntime {__import__('onnxruntime').__version__}"
-        )
+        return _open_onnxruntime(model, feeds, targets, device)
     except Exception as error:
+        if device in {TraceDevice.GPU, TraceDevice.NPU}:
+            message = (
+                f"automatic backend selection could not use the requested "
+                f"{device.value.upper()} device: {type(error).__name__}: {error}"
+            )
+            return (
+                _failed_runtime_source(model, feeds, message),
+                "onnxruntime accelerator unavailable",
+                device,
+                "Unavailable",
+            )
         source = open_captures(model, feeds, targets)
         source.diagnostics.insert(
             0,
             "automatic backend selection fell back from ONNX Runtime to the "
             f"axis-aware reference evaluator: {type(error).__name__}: {error}",
         )
-        return source, f"onnx.reference axis-aware {onnx.__version__}"
+        return (
+            source,
+            f"onnx.reference axis-aware {onnx.__version__}",
+            TraceDevice.CPU,
+            "ReferenceEvaluator",
+        )
 
 
 def _write_capture(
@@ -620,7 +772,17 @@ def run(request_path: Path) -> None:
         backend = TraceBackend(str(raw.get("backend", TraceBackend.AUTO.value)))
     except ValueError as error:
         raise ValueError(f"unknown trace backend {raw.get('backend')!r}") from error
-    source, runtime = _open_backend(model, feeds, targets, backend)
+    try:
+        device = TraceDevice(str(raw.get("device", TraceDevice.AUTO.value)))
+    except ValueError as error:
+        raise ValueError(f"unknown trace device {raw.get('device')!r}") from error
+    source, runtime, execution_device, execution_provider = _open_backend(
+        model,
+        feeds,
+        targets,
+        backend,
+        device,
+    )
     diagnostics = source.diagnostics
     output = Path(str(raw["output"]))
     remaining = int(raw["capture_bytes"])
@@ -676,6 +838,8 @@ def run(request_path: Path) -> None:
     records = [records_by_index[index] for index in range(len(targets))]
     response = {
         "runtime": runtime,
+        "execution_device": execution_device.value,
+        "execution_provider": execution_provider,
         "records": records,
         "diagnostics": diagnostics,
     }

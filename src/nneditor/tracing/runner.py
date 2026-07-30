@@ -23,6 +23,7 @@ from nneditor.cancellation import CancellationToken, OperationCancelled
 from nneditor.ir.core import Document
 from nneditor.tracing.contracts import (
     ActivationRecord,
+    TraceDevice,
     TraceKey,
     TraceLimits,
     TraceRequest,
@@ -149,6 +150,7 @@ def run_onnx_trace(
         specification=request.specification,
         limits=request.limits,
         backend=request.backend,
+        device=request.device,
     )
     token.raise_if_cancelled()
     try:
@@ -195,6 +197,7 @@ def run_onnx_trace(
             "response": str(response_path),
             "targets": _targets(document, request.value_ids),
             "backend": request.backend.value,
+            "device": request.device.value,
             **request.limits.to_json(),
         }
         request_path.write_text(
@@ -259,6 +262,8 @@ def run_onnx_trace(
             records = tuple(ActivationRecord.from_json(item) for item in raw["records"])
             runtime = str(raw["runtime"])
             diagnostics = tuple(str(item) for item in raw["diagnostics"])
+            execution_device = TraceDevice(str(raw["execution_device"]))
+            execution_provider = str(raw["execution_provider"])
         except (
             OSError,
             KeyError,
@@ -271,7 +276,15 @@ def run_onnx_trace(
             ) from error
         token.raise_if_cancelled()
         shutil.rmtree(scratch)
-        return store.commit(key, records, runtime, diagnostics, staging)
+        return store.commit(
+            key,
+            records,
+            runtime,
+            diagnostics,
+            staging,
+            execution_device=execution_device,
+            execution_provider=execution_provider,
+        )
     except BaseException:
         if staging.exists():
             store.discard_staging(staging)

@@ -29,6 +29,7 @@ from nneditor.tracing.contracts import (
     InputBinding,
     TraceApproval,
     TraceBackend,
+    TraceDevice,
     TraceLimits,
     TraceRequest,
     TraceResult,
@@ -87,6 +88,7 @@ class TracePanel:
         rebuild_minimap: Callable[[], None],
         on_error: Callable[[str], None],
         on_status: Callable[[str], None],
+        on_device: Callable[[TraceDevice | None, str], None],
         clear_error: Callable[[], None],
         watch_text_focus: Callable[[ft.TextField], ft.TextField],
     ) -> None:
@@ -108,6 +110,7 @@ class TracePanel:
         self._rebuild_minimap = rebuild_minimap
         self._on_error = on_error
         self._on_status = on_status
+        self._on_device = on_device
         self._clear_error = clear_error
 
         self.job: Job[TraceResult] | None = None
@@ -130,6 +133,8 @@ class TracePanel:
             label="Execution backend",
             value=TraceBackend.AUTO.value,
             dense=True,
+            expand=True,
+            on_select=self._on_backend_changed,
             options=[
                 ft.DropdownOption(
                     key=TraceBackend.AUTO.value,
@@ -146,6 +151,27 @@ class TracePanel:
                 ft.DropdownOption(
                     key=TraceBackend.REFERENCE_NORMALIZED.value,
                     text="Normalized reference evaluator",
+                ),
+            ],
+        )
+        self.device = ft.Dropdown(
+            label="Execution device",
+            value=TraceDevice.AUTO.value,
+            dense=True,
+            expand=True,
+            options=[
+                ft.DropdownOption(
+                    key=TraceDevice.AUTO.value,
+                    text="Automatic (accelerator, then CPU)",
+                ),
+                ft.DropdownOption(key=TraceDevice.CPU.value, text="CPU"),
+                ft.DropdownOption(
+                    key=TraceDevice.GPU.value,
+                    text="GPU (CUDA, DirectML, OpenVINO)",
+                ),
+                ft.DropdownOption(
+                    key=TraceDevice.NPU.value,
+                    text="NPU (OpenVINO, QNN, Vitis AI)",
                 ),
             ],
         )
@@ -240,7 +266,10 @@ class TracePanel:
                 ),
                 self.seed,
                 self.shapes,
-                self.backend,
+                ft.Row(
+                    controls=[self.backend, self.device],
+                    spacing=6,
+                ),
                 ft.Row(
                     controls=[self.wall_seconds, self.memory_mib],
                     spacing=6,
@@ -278,6 +307,7 @@ class TracePanel:
         self.active_comparison = None
         self.input_bindings.clear()
         self.presentation = None
+        self._on_device(None, "Idle")
 
     # -- traced glyph inspector -------------------------------------------
 
@@ -690,6 +720,15 @@ class TracePanel:
         self.refresh_capture_scope()
         self.page.update()
 
+    def _on_backend_changed(self, event: ft.Event[ft.Dropdown]) -> None:
+        if self.backend.value in {
+            TraceBackend.REFERENCE.value,
+            TraceBackend.REFERENCE_NORMALIZED.value,
+        }:
+            self.device.value = TraceDevice.CPU.value
+        self.refresh_actions()
+        self.page.update()
+
     # -- run lifecycle -----------------------------------------------------
 
     def refresh_actions(self) -> None:
@@ -704,8 +743,9 @@ class TracePanel:
             status = session.capability(Capability.TRACING)
             self.approval_notice.value = (
                 f"Selecting Approve & run authorizes one isolated trace of "
-                f"{session.title} using the backend, graph inputs, and four "
-                "limits shown."
+                f"{session.title} using the backend, device, graph inputs, and "
+                "four limits shown. The memory limit covers host RAM; "
+                "accelerator memory is controlled by its driver."
             )
             available = status.availability is Availability.AVAILABLE and not web
             reason = (
@@ -779,6 +819,11 @@ class TracePanel:
         )
         self.capture_selected_only.disabled = busy
         self.backend.disabled = busy
+        reference_backend = self.backend.value in {
+            TraceBackend.REFERENCE.value,
+            TraceBackend.REFERENCE_NORMALIZED.value,
+        }
+        self.device.disabled = busy or reference_backend
         self.refresh_capture_scope()
 
     def run(self, event: ft.Event[ft.Button]) -> None:
@@ -802,11 +847,19 @@ class TracePanel:
         capture_text = self.capture_mib.value or ""
         chunk_text = self.chunk_kib.value or ""
         backend_text = self.backend.value or TraceBackend.AUTO.value
+        device_text = self.device.value or TraceDevice.AUTO.value
+        if backend_text in {
+            TraceBackend.REFERENCE.value,
+            TraceBackend.REFERENCE_NORMALIZED.value,
+        }:
+            device_text = TraceDevice.CPU.value
         bindings = dict(self.input_bindings)
         value_ids = self.capture_value_ids()
         self._preparing = True
         self._clear_error()
         self.active_comparison = None
+        requested_device = TraceDevice(device_text)
+        self._on_device(requested_device, "Selecting provider")
         self.refresh_actions()
         self.status.value = f"Preparing approved trace for {session.title}…"
         self._on_status("Preparing inputs and isolated trace worker…")
@@ -828,12 +881,14 @@ class TracePanel:
                     chunk_bytes=int(chunk_text) * 1024,
                 )
                 backend = TraceBackend(backend_text)
+                device = TraceDevice(device_text)
                 approval = TraceApproval.approve(
                     session.title,
                     session.document.source.content_hash,
                     specification,
                     limits,
                     backend,
+                    device,
                 )
                 request = TraceRequest(
                     specification,
@@ -841,12 +896,14 @@ class TracePanel:
                     approval,
                     value_ids=value_ids,
                     backend=backend,
+                    device=device,
                 )
                 job = session.trace_async(request)
             except (OSError, TypeError, ValueError) as error:
                 if self._session() is session:
                     self._preparing = False
                     self.refresh_actions()
+                    self._on_device(None, "Idle")
                     self._on_error(f"Trace configuration is invalid: {error}")
                     self.page.update()
                 return
@@ -862,7 +919,7 @@ class TracePanel:
                 f"{specification.hash[:19]} • {limits.wall_seconds:g}s / "
                 f"{limits.memory_bytes // (1024 * 1024)} MiB / "
                 f"{limits.capture_bytes // (1024 * 1024)} MiB capture • "
-                f"{backend.value}"
+                f"{backend.value} / {device.value}"
             )
             self._on_status("Running approved inference trace in an isolated worker…")
             self.page.update()
@@ -878,6 +935,10 @@ class TracePanel:
                     result = job.result()
                     self.active_trace_id = result.id
                     self.active_comparison = None
+                    self._on_device(
+                        result.execution_device,
+                        result.execution_provider,
+                    )
                     self._clear_error()
                     state = "partial" if result.partial else "complete"
                     self._on_status(
@@ -891,10 +952,13 @@ class TracePanel:
                     self._autoload_activation_views(self._inspected_ids())
                     self._refresh_inspector(self._inspected_ids())
                 elif job.state.value == "cancelled":
+                    self._on_device(None, "Idle")
                     self._on_status("Trace cancelled; no partial trace was saved")
                 else:
+                    self._on_device(None, "Unavailable")
                     self._on_error(f"Trace failed with no saved state: {job.error}")
             except Exception as error:
+                self._on_device(None, "Unavailable")
                 self._on_error(f"Could not present the trace: {error}")
             finally:
                 if self.job is job:

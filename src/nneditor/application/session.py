@@ -489,6 +489,7 @@ class ModelSession:
             revision_id,
             request.specification.hash,
             request.backend,
+            request.device,
         )
 
         def work(token: CancellationToken) -> TraceResult:

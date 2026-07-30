@@ -12,6 +12,7 @@ import onnx
 import pytest
 
 from nneditor.tracing import trace_worker
+from nneditor.tracing.contracts import TraceDevice
 from tests.fixtures.onnx_models import (
     build_custom_domain_model,
     build_embedded_model,
@@ -103,6 +104,8 @@ def test_worker_run_captures_augmented_outputs_in_bounded_files(
 
     payload = json.loads(response.read_text(encoding="utf-8"))
     assert payload["runtime"].startswith("onnxruntime")
+    assert payload["execution_device"] == "cpu"
+    assert payload["execution_provider"] == "CPUExecutionProvider"
     assert [record["state"] for record in payload["records"]] == [
         "complete",
         "complete",
@@ -112,6 +115,63 @@ def test_worker_run_captures_augmented_outputs_in_bounded_files(
         (output / record["file_name"]).stat().st_size == record["stored_byte_length"]
         for record in payload["records"]
     )
+
+
+def test_gpu_provider_candidates_are_strict_and_prioritized() -> None:
+    candidates = trace_worker._provider_candidates(
+        [
+            "CPUExecutionProvider",
+            "DmlExecutionProvider",
+            "CUDAExecutionProvider",
+            "TensorrtExecutionProvider",
+            "OpenVINOExecutionProvider",
+        ],
+        TraceDevice.GPU,
+    )
+
+    assert [candidate.label for candidate in candidates] == [
+        "TensorRT / CUDA",
+        "CUDA",
+        "DirectML",
+        "OpenVINO GPU",
+    ]
+    assert all(candidate.device is TraceDevice.GPU for candidate in candidates)
+    assert all(
+        "CPUExecutionProvider" not in candidate.providers for candidate in candidates
+    )
+    assert candidates[-1].provider_options == ({"device_type": "GPU"},)
+
+
+def test_npu_provider_candidates_apply_provider_specific_options() -> None:
+    candidates = trace_worker._provider_candidates(
+        [
+            "CPUExecutionProvider",
+            "OpenVINOExecutionProvider",
+            "QNNExecutionProvider",
+            "VitisAIExecutionProvider",
+        ],
+        TraceDevice.NPU,
+    )
+
+    assert [candidate.label for candidate in candidates] == [
+        "OpenVINO NPU",
+        "Qualcomm QNN HTP",
+        "AMD Vitis AI",
+    ]
+    assert candidates[0].provider_options == ({"device_type": "NPU"},)
+    assert candidates[1].provider_options == ({"backend_type": "htp"},)
+    assert all(candidate.device is TraceDevice.NPU for candidate in candidates)
+
+
+def test_auto_device_falls_back_to_cpu_only_when_it_is_installed() -> None:
+    candidates = trace_worker._provider_candidates(
+        ["AzureExecutionProvider", "CPUExecutionProvider"],
+        TraceDevice.AUTO,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].device is TraceDevice.CPU
+    assert candidates[0].provider == "CPUExecutionProvider"
 
 
 def test_worker_prioritizes_boundaries_and_shares_remaining_capture_budget(

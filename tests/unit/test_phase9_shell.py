@@ -22,6 +22,7 @@ from nneditor.tracing import (
     CaptureState,
     TraceApproval,
     TraceBackend,
+    TraceDevice,
     TraceLimits,
     TraceRequest,
     build_activation_visualizations,
@@ -47,6 +48,7 @@ def test_trace_shell_empty_consent_loading_and_activation_states(
         shell, page = make_shell(service)
         assert shell.trace.run_button.disabled
         assert "Open an artifact" in str(shell.trace.status.value)
+        assert shell.device_text.value == "Device: idle"
 
         session = service.open_model(path)
         shell.show_session(session)
@@ -70,6 +72,8 @@ def test_trace_shell_empty_consent_loading_and_activation_states(
         assert shell.trace.active_trace_id is not None
         assert "Complete trace" in str(shell.trace.status.value)
         assert not shell.trace.progress.visible
+        assert shell.device_text.value == "CPU / ONNX Runtime"
+        assert "CPUExecutionProvider" in str(shell.device_indicator.tooltip)
 
         node_id = session.document.main_graph.nodes[0].id
         shell.current_detail = shell.current_detail.OPERATOR
@@ -881,6 +885,28 @@ def test_trace_backend_is_visible_and_bound_into_approval(
 
         assert request.backend is TraceBackend.REFERENCE_NORMALIZED
         assert request.approval.backend is TraceBackend.REFERENCE_NORMALIZED
+        assert request.device is TraceDevice.CPU
+        assert request.approval.device is TraceDevice.CPU
+
+
+def test_trace_gpu_selection_is_bound_into_per_run_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        shell.trace.backend.value = TraceBackend.ONNX_RUNTIME.value
+        shell.trace.device.value = TraceDevice.GPU.value
+
+        request = _approved_request(shell, page, monkeypatch)
+
+        assert request.device is TraceDevice.GPU
+        assert request.approval.device is TraceDevice.GPU
+        assert shell.device_text.value == "GPU / selecting"
 
 
 def test_ticked_capture_scope_narrows_the_request_to_selected_nodes(

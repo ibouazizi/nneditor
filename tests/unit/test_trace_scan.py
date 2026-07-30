@@ -10,7 +10,7 @@ import pytest
 from onnx import TensorProto, helper
 from onnx.reference import ReferenceEvaluator
 
-from nneditor.tracing.contracts import TraceBackend
+from nneditor.tracing.contracts import TraceBackend, TraceDevice
 from nneditor.tracing.scan import (
     AxisAwareScan,
     ScanNormalizationError,
@@ -146,7 +146,13 @@ def test_every_trace_backend_executes_nonzero_scan_axes(
         {"value_id": "final-id", "value_name": "final"},
         {"value_id": "ys-id", "value_name": "ys"},
     ]
-    source, runtime = _open_backend(_scan_model(), _feeds(), targets, backend)
+    source, runtime, execution_device, provider = _open_backend(
+        _scan_model(),
+        _feeds(),
+        targets,
+        backend,
+        TraceDevice.CPU,
+    )
     final, final_error = source.take(targets[0])
     values, values_error = source.take(targets[1])
 
@@ -161,6 +167,8 @@ def test_every_trace_backend_executes_nonzero_scan_axes(
         np.array([[1.0, 3.0, 6.0], [10.0, 30.0, 60.0]], dtype=np.float32),
     )
     assert "failed" not in runtime
+    assert execution_device is TraceDevice.CPU
+    assert provider in {"CPUExecutionProvider", "ReferenceEvaluator"}
 
 
 def test_axis_aware_scan_supports_negative_axes_and_reverse_directions() -> None:

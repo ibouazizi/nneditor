@@ -40,6 +40,9 @@ from nneditor.tracing.contracts import (
     TraceBackend as TraceBackend,
 )
 from nneditor.tracing.contracts import (
+    TraceDevice as TraceDevice,
+)
+from nneditor.tracing.contracts import (
     TraceKey as TraceKey,
 )
 from nneditor.tracing.contracts import (
@@ -122,6 +125,7 @@ __all__ = [
     "TraceApproval",
     "TraceBackend",
     "TraceComparison",
+    "TraceDevice",
     "TraceError",
     "TraceKey",
     "TraceLimits",

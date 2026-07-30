@@ -11,7 +11,7 @@ import pytest
 
 from nneditor.application.session import ApplicationService, ModelSession
 from nneditor.cancellation import OperationCancelled
-from nneditor.tracing import TraceApproval, TraceLimits, TraceRequest
+from nneditor.tracing import TraceApproval, TraceDevice, TraceLimits, TraceRequest
 from nneditor.tracing.runner import TraceError, recommended_trace_limits
 from tests.fixtures.onnx_models import (
     build_custom_domain_model,
@@ -56,6 +56,8 @@ def test_approved_trace_captures_inputs_and_intermediates_out_of_process(
         }
         assert all(record.readable for record in result.records)
         assert result.runtime.startswith("onnxruntime")
+        assert result.execution_device is TraceDevice.CPU
+        assert result.execution_provider == "CPUExecutionProvider"
         assert os.environ.get("NNEDITOR_TRACE_WORKER") is None
         assert session.trace_input_specifications() == (
             _request(session).specification,

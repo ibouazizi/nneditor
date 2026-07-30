@@ -29,8 +29,10 @@ from nneditor.tracing import (
     PlotKind,
     TraceApproval,
     TraceBackend,
+    TraceDevice,
     TraceKey,
     TraceLimits,
+    TraceRequest,
     TraceResult,
     bind_inputs,
     build_activation_visualizations,
@@ -699,6 +701,7 @@ def test_trace_contract_json_round_trips_and_consent_identity() -> None:
         specification,
         limits,
         TraceBackend.ONNX_RUNTIME,
+        TraceDevice.GPU,
     )
     runtime_approval.validate(
         model_title="model",
@@ -706,6 +709,7 @@ def test_trace_contract_json_round_trips_and_consent_identity() -> None:
         specification=specification,
         limits=limits,
         backend=TraceBackend.ONNX_RUNTIME,
+        device=TraceDevice.GPU,
     )
     with pytest.raises(ValueError, match="does not name"):
         runtime_approval.validate(
@@ -713,6 +717,15 @@ def test_trace_contract_json_round_trips_and_consent_identity() -> None:
             artifact_hash="artifact",
             specification=specification,
             limits=limits,
+        )
+    with pytest.raises(ValueError, match="does not name"):
+        runtime_approval.validate(
+            model_title="model",
+            artifact_hash="artifact",
+            specification=specification,
+            limits=limits,
+            backend=TraceBackend.ONNX_RUNTIME,
+            device=TraceDevice.NPU,
         )
     assert (
         TraceKey("artifact", None, "inputs").id
@@ -723,10 +736,20 @@ def test_trace_contract_json_round_trips_and_consent_identity() -> None:
             TraceBackend.ONNX_RUNTIME,
         ).id
     )
+    assert (
+        TraceKey("artifact", None, "inputs", device=TraceDevice.CPU).id
+        != TraceKey("artifact", None, "inputs", device=TraceDevice.GPU).id
+    )
 
     record = _record("value", np.zeros(2, dtype=np.float32).tobytes())
     assert ActivationRecord.from_json(record.to_json()) == record
-    result = TraceResult(TraceKey("artifact", None, specification.hash), (record,), "x")
+    result = TraceResult(
+        TraceKey("artifact", None, specification.hash),
+        (record,),
+        "x",
+        execution_device=TraceDevice.GPU,
+        execution_provider="CUDAExecutionProvider",
+    )
     assert TraceResult.from_json(result.to_json()) == result
     runtime_result = replace(
         result,
@@ -737,9 +760,15 @@ def test_trace_contract_json_round_trips_and_consent_identity() -> None:
     legacy_key = legacy_json["key"]
     assert isinstance(legacy_key, dict)
     legacy_key.pop("backend")
+    legacy_key.pop("device")
     legacy_key.pop("identity_version")
+    legacy_json.pop("execution_device")
+    legacy_json.pop("execution_provider")
     legacy_result = TraceResult.from_json(legacy_json)
     assert legacy_result.key.identity_version == 1
+    assert legacy_result.key.device is TraceDevice.AUTO
+    assert legacy_result.execution_device is TraceDevice.CPU
+    assert legacy_result.execution_provider == "CPU"
     assert (
         legacy_result.id
         == TraceKey(
@@ -747,6 +776,24 @@ def test_trace_contract_json_round_trips_and_consent_identity() -> None:
             None,
             specification.hash,
             identity_version=1,
+        ).id
+    )
+    version_two_json = result.to_json()
+    version_two_key = version_two_json["key"]
+    assert isinstance(version_two_key, dict)
+    version_two_key["identity_version"] = 2
+    version_two_key.pop("device")
+    version_two_result = TraceResult.from_json(version_two_json)
+    assert version_two_result.key.identity_version == 2
+    assert version_two_result.key.device is TraceDevice.AUTO
+    assert (
+        version_two_result.id
+        == TraceKey(
+            "artifact",
+            None,
+            specification.hash,
+            backend=result.key.backend,
+            identity_version=2,
         ).id
     )
     with pytest.raises(KeyError):
@@ -782,6 +829,25 @@ def test_trace_contracts_reject_malformed_and_incomplete_values() -> None:
 
     with pytest.raises(ValueError, match="trace key"):
         TraceKey("", None, "inputs")
+    with pytest.raises(ValueError, match="only supports CPU"):
+        TraceRequest(
+            InputSpecification(
+                "artifact",
+                (
+                    InputBinding(
+                        "x",
+                        "float32",
+                        (1,),
+                        InputSource.CONSTANT,
+                        constant=(1.0,),
+                    ),
+                ),
+            ),
+            TraceLimits(),
+            TraceApproval("", "", "", "", False),
+            backend=TraceBackend.REFERENCE,
+            device=TraceDevice.GPU,
+        )
     valid_record = _record("value", np.zeros(2, dtype=np.float32).tobytes())
     invalid_factories: tuple[Callable[[], ActivationRecord], ...] = (
         lambda: replace(valid_record, value_name=""),

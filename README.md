@@ -152,12 +152,14 @@ Desktop tracing is available for ONNX models:
    the model-compatible flattened-patch profile.
    Required `*_mask` inputs left unchanged use an automatically generated
    all-valid mask; other inputs use deterministic random data.
-2. Open **Trace activations**, review the execution backend, input
-   specification, and wall-clock, memory, capture, and chunk limits. Automatic
-   mode uses ONNX Runtime first and falls back to NNEditor's axis-aware ONNX
-   reference evaluator. The normalized reference option rewrites nonzero
-   `Scan` axes with semantics-preserving transposes inside the private worker
-   model.
+2. Open **Trace activations**, review the execution backend, execution device,
+   input specification, and wall-clock, memory, capture, and chunk limits.
+   **Automatic** tries installed GPU and NPU execution providers before CPU;
+   an explicit GPU or NPU choice is strict and never silently runs on CPU.
+   Automatic backend mode falls back from ONNX Runtime to NNEditor's
+   axis-aware ONNX reference evaluator when no compatible runtime provider is
+   available. The normalized reference option rewrites nonzero `Scan` axes
+   with semantics-preserving transposes inside the private worker model.
 3. Select **Approve & run trace**. This click creates an approval bound to the
    current model, inputs, and limits for that run only.
 4. Click any operator, semantic block, visible connection, model input, or model
@@ -166,6 +168,16 @@ Desktop tracing is available for ONNX models:
 5. Select **Open large view** on an activation card for a scrollable overlay
    containing its histogram, line view, heatmap, feature-map grid, or attention
    view, as applicable.
+
+The top-right device indicator shows the provider that actually completed the
+latest trace. NNEditor recognizes ONNX Runtime's CUDA, TensorRT, DirectML,
+OpenVINO GPU, MIGraphX, and ROCm GPU providers, plus OpenVINO NPU, Qualcomm QNN
+HTP, and AMD Vitis AI NPU providers. The standard NNEditor installation
+includes CPU ONNX Runtime. Accelerator use requires a compatible
+provider-enabled ONNX Runtime distribution and its vendor drivers in the same
+environment. Provider distributions expose the same `onnxruntime` import and
+should replace, not be installed alongside, the CPU-only distribution; follow
+the provider vendor's compatibility and installation instructions.
 
 Ready-made image and time-series tensors are available in
 [examples/trace-inputs](examples/trace-inputs).
@@ -177,7 +189,9 @@ operator outputs by default so inspection does not depend on the selection that
 was active when the trace began.
 
 Tracing uses ONNX Runtime or an ONNX reference-evaluator mode in a separate,
-resource-limited process. A failed or cancelled run publishes no trace.
+resource-limited process. The approved memory ceiling limits host RAM; device
+memory remains under the accelerator provider and driver. A failed or cancelled
+run publishes no trace.
 Desktop subprocess isolation is not a multi-tenant security boundary, so
 tracing is disabled in the browser application until a dedicated worker
 service is available.
