@@ -308,7 +308,7 @@ class TestInputWorkspace:
         self.series_layout = self._dropdown(
             "Layout",
             "NTC",
-            ("NTC", "NCT", "TC", "CT"),
+            ("NTC", "NCT", "TC", "CT", "NC"),
         )
         self.series_dtype = self._dtype_dropdown("float32")
         self.series_seed = self._field(label="Seed", value="0")

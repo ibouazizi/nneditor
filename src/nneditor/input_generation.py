@@ -33,7 +33,7 @@ ImageColorMode = Literal["rgb", "grayscale"]
 ImageNormalization = Literal["none", "zero-one", "minus-one-one", "imagenet"]
 MaskFill = Literal["ones", "zeros", "checkerboard", "random-binary"]
 TimeSeriesWaveform = Literal["sine", "cosine", "sawtooth", "random-walk"]
-TimeSeriesLayout = Literal["NTC", "NCT", "TC", "CT"]
+TimeSeriesLayout = Literal["NTC", "NCT", "TC", "CT", "NC"]
 TokenLayout = Literal["NT", "T"]
 SyntheticDistribution = Literal[
     "zeros",
@@ -475,6 +475,20 @@ def generate_time_series_tensor(
         array = values[np.newaxis, ...]
     elif layout == "NCT":
         array = values.T[np.newaxis, ...]
+    elif layout == "NC":
+        # Univariate forecasters — TiRex and friends — declare a rank-2
+        # context tensor with no separate time axis: the whole series sits in
+        # the second dimension. `samples` therefore becomes the C extent.
+        # Multiple channels have nowhere to go in a rank-2 tensor without
+        # silently dropping or flattening data, so require a single series
+        # and name the layouts that do carry channels.
+        if channels != 1:
+            raise InputGenerationError(
+                "the NC layout carries one series with no time axis, so it "
+                f"needs channels=1 (got {channels}); use NTC or NCT for "
+                "multi-channel data"
+            )
+        array = values[:, 0][np.newaxis, ...]
     else:
         raise InputGenerationError(f"unsupported time-series layout: {layout}")
     return _publish_array(
