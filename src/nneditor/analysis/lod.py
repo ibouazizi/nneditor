@@ -457,6 +457,17 @@ def semantic_scene(
 ) -> SemanticScene:
     """Build one architecture/block/layer/operator representation."""
     root = hierarchy.group(root_group) if root_group is not None else None
+    if detail_level is DetailLevel.OPERATOR and root is None:
+        # The unscoped operator representation is already the source scene.
+        # Rebuilding it through the generic collapse path validates and
+        # reallocates every glyph and aggregates every edge even though no
+        # node is collapsed. Reuse the immutable scene and construct only the
+        # identity mapping required for semantic selection.
+        return SemanticScene(
+            scene,
+            detail_level,
+            {node.id: frozenset((node.id,)) for node in scene.nodes},
+        )
     allowed = (
         root.members if root is not None else frozenset(node.id for node in scene.nodes)
     )

@@ -66,6 +66,7 @@ class TestSemanticLod:
         architecture = semantic_scene(scene, hierarchy, DetailLevel.ARCHITECTURE)
 
         assert operator.scene.node_count == 5
+        assert operator.scene is scene
         assert operator.members_by_glyph["n0"] == {"n0"}
         assert layer.scene.has_node("grp:inner")
         assert layer.scene.node_count == 4
