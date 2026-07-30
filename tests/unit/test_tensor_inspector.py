@@ -259,7 +259,7 @@ class TestShellIntegration:
             assert shell.session is not None
             before = shell.session.editing.read(tensor_id, offset=0, length=1)
             replacement = b"\xff" if before != b"\xff" else b"\x00"
-            shell._hex_drafts[(tensor_id, 0)] = replacement.hex()
+            shell.activations.hex_drafts[(tensor_id, 0)] = replacement.hex()
             apply = self.find_data(shell, f"tensor-hex-apply:{tensor_id}")
             assert isinstance(apply, ft.FilledButton)
             assert apply.on_click is not None
@@ -286,7 +286,9 @@ class TestShellIntegration:
 
             cast(Any, next_button.on_click)(None)
 
-            assert shell._hex_offsets[tensor_id] == tensor_tools.HEX_PAGE_BYTES
+            assert (
+                shell.activations.hex_offsets[tensor_id] == tensor_tools.HEX_PAGE_BYTES
+            )
             offset_field = self.find_data(shell, f"tensor-hex-offset:{tensor_id}")
             assert isinstance(offset_field, ft.TextField)
             assert offset_field.value == "0x80"

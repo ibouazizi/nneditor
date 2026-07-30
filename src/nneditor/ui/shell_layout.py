@@ -35,6 +35,19 @@ class ShellPalette:
     muted: str
     canvas: str
     sidebar_width: int
+    # Semantic states shared by the panels that report capture, consent, and
+    # validation outcomes; they belong to the palette so no panel has to
+    # redeclare a hex value the rest of the shell already uses.
+    subtle: str = "#F8FAFC"
+    info: str = "#175CD3"
+    info_soft: str = "#EFF8FF"
+    success: str = "#027A48"
+    success_soft: str = "#ECFDF3"
+    warning: str = "#B54708"
+    warning_soft: str = "#FFFAEB"
+    warning_border: str = "#FEDF89"
+    danger: str = "#B42318"
+    danger_soft: str = "#FEF3F2"
 
 
 def build_left_panel(

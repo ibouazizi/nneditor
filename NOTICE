@@ -3,3 +3,17 @@ Copyright 2026 Imed Bouazizi
 
 NNEditor was originally created by Imed Bouazizi.
 https://github.com/ibouazizi/nneditor
+
+--------------------------------------------------------------------------------
+Third-party example data
+
+examples/trace-inputs/gpt2/vocab.json
+examples/trace-inputs/gpt2/merges.txt
+
+    GPT-2 byte-level BPE vocabulary and merge table.
+    Copyright (c) 2019 OpenAI
+    Licensed under the MIT License.
+    Retrieved from https://huggingface.co/openai-community/gpt2
+
+    Included only as example tokenizer data for generating test inputs.
+    NNEditor does not embed, redistribute, or depend on GPT-2 model weights.

@@ -386,7 +386,7 @@ def test_stats_completion_skips_a_changed_inspector_target(
     deferred: list[Any] = []
     # Defer the completion callback the way a real thread would.
     cast(Any, page).run_thread = deferred.append
-    shell._stats_handler(tensor_id, node_id)(cast(Any, None))
+    shell.activations.statistics_handler(tensor_id, node_id)(cast(Any, None))
     shell._refresh_inspector(frozenset())  # the user moved to the overview
     (wait,) = deferred
     wait()
@@ -413,7 +413,7 @@ def test_stats_completion_survives_a_model_reopen(
 
     deferred: list[Any] = []
     cast(Any, page).run_thread = deferred.append
-    shell._stats_handler(tensor_id, node_id)(cast(Any, None))
+    shell.activations.statistics_handler(tensor_id, node_id)(cast(Any, None))
     shell.show_session(service.open_model(path_b))
     (wait,) = deferred
     wait()  # must neither raise nor touch the new session's inspector
@@ -544,7 +544,7 @@ def test_tensor_card_expansion_survives_inspector_rebuilds(
     cast(Any, first.on_change)(SimpleNamespace(data=False))  # user collapses
 
     # A hex-pager interaction rebuilds the inspector.
-    shell._hex_page_handler(tensor_id, node_id, tensor_tools.HEX_PAGE_BYTES)(
+    shell.activations.hex_page_handler(tensor_id, node_id, tensor_tools.HEX_PAGE_BYTES)(
         cast(Any, None)
     )
 

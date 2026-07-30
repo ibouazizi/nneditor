@@ -32,6 +32,7 @@ __all__ = [
     "build_optional_input_model",
     "build_symbolic_shape_model",
     "build_tensor_only_model",
+    "build_token_ids_model",
     "external_tensor_model",
 ]
 
@@ -316,6 +317,24 @@ def build_masked_image_model(path: Path) -> None:
                 TensorProto.FLOAT,
                 ["batch_size", 3, 224, 224],
             )
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", _OPSET)])
+    onnx.save_model(model, path)
+
+
+def build_token_ids_model(path: Path, *, length: int = 8) -> None:
+    """A language-model style batch of integer token ids as the only input."""
+    graph = helper.make_graph(
+        nodes=[
+            helper.make_node("Identity", ["input_ids"], ["output"], name="passthru")
+        ],
+        name="token-ids",
+        inputs=[
+            helper.make_tensor_value_info("input_ids", TensorProto.INT64, [1, length])
+        ],
+        outputs=[
+            helper.make_tensor_value_info("output", TensorProto.INT64, [1, length])
         ],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", _OPSET)])

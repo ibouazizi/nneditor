@@ -18,10 +18,19 @@ from nneditor.input_generation import (
     generate_mask_tensor,
     generate_synthetic_tensor,
     generate_time_series_tensor,
+    generate_token_ids_tensor,
     parse_columns,
     parse_shape,
 )
 from nneditor.ir.core import Dim
+from nneditor.tokenization import (
+    TOKENIZER_CHOICES,
+    Codebook,
+    TokenizationError,
+    TokenizerChoice,
+    choice_for,
+    load_codebook,
+)
 from nneditor.ui.shell_layout import ShellPalette
 
 __all__ = ["InputTarget", "TestInputWorkspace", "build_input_workspace"]
@@ -70,6 +79,7 @@ class TestInputWorkspace:
             options=[
                 ft.DropdownOption(key="image", text="Image file"),
                 ft.DropdownOption(key="mask", text="Mask"),
+                ft.DropdownOption(key="text-tokens", text="Text tokens"),
                 ft.DropdownOption(key="csv", text="CSV / tabular data"),
                 ft.DropdownOption(key="time-series", text="Synthetic time series"),
                 ft.DropdownOption(key="tensor", text="Generic tensor"),
@@ -214,6 +224,8 @@ class TestInputWorkspace:
             ),
             visible=False,
         )
+
+        self.token_section = self._build_token_section(palette)
 
         self.csv_path = self._field(
             label="CSV / text file",
@@ -371,6 +383,7 @@ class TestInputWorkspace:
         self.sections = (
             self.image_section,
             self.mask_section,
+            self.token_section,
             self.csv_section,
             self.series_section,
             self.tensor_section,
@@ -439,6 +452,130 @@ class TestInputWorkspace:
         self._apply_target_defaults()
         self._refresh_assign_button()
 
+    def _build_token_section(self, palette: ShellPalette) -> ft.Container:
+        """Build the language-model token-id form and its codebook slots.
+
+        Kept out of ``__init__`` because the codebook selection owns two file
+        slots whose visibility follows the selected tokenizer, which is more
+        wiring than the other sources need.
+        """
+        self.token_text = self._field(
+            label="Text",
+            hint_text="The prompt to encode into token ids",
+            value="The quick brown fox jumps over the lazy dog.",
+            multiline=True,
+            min_lines=2,
+            max_lines=6,
+        )
+        self.token_codebook = ft.Dropdown(
+            value=TOKENIZER_CHOICES[0].id,
+            label="Tokenizer",
+            dense=True,
+            options=[
+                ft.DropdownOption(key=choice.id, text=choice.label)
+                for choice in TOKENIZER_CHOICES
+            ],
+            on_select=self._on_codebook_changed,
+        )
+        self.token_note = ft.Text(size=10, color=palette.muted)
+        self.token_sequence_length = self._field(
+            label="Sequence length",
+            hint_text="Blank keeps the natural length",
+        )
+        self.token_layout = self._dropdown("Layout", "NT", ("NT", "T"))
+        # Token ids are indexes, so the generator only accepts integer dtypes.
+        self.token_dtype = self._dropdown(
+            "Dtype",
+            "int64",
+            ("int32", "int64", "uint32", "uint64"),
+        )
+        self.token_vocab_size = self._field(
+            label="Vocabulary size",
+            hint_text="Blank uses the codebook default",
+        )
+        self.token_pad_id = self._field(label="Pad id", value="0")
+        self.token_bos_id = self._field(label="BOS id (optional)")
+        self.token_eos_id = self._field(label="EOS id (optional)")
+        self.token_truncate = ft.Checkbox(
+            label="Truncate text longer than the sequence length",
+            value=True,
+        )
+        self.token_vocabulary_path = self._field(
+            label="Vocabulary",
+            read_only=True,
+            expand=True,
+        )
+        self.token_merges_path = self._field(
+            label="Merges (merges.txt)",
+            read_only=True,
+            expand=True,
+        )
+        self.token_vocabulary_row = ft.Row(
+            controls=[
+                self.token_vocabulary_path,
+                ft.TextButton(
+                    content="Choose vocabulary",
+                    icon=ft.Icons.MENU_BOOK_ROUNDED,
+                    on_click=self._on_choose_vocabulary,
+                ),
+            ],
+            visible=False,
+        )
+        self.token_merges_row = ft.Row(
+            controls=[
+                self.token_merges_path,
+                ft.TextButton(
+                    content="Choose merges",
+                    icon=ft.Icons.CALL_MERGE_ROUNDED,
+                    on_click=self._on_choose_merges,
+                ),
+            ],
+            visible=False,
+        )
+        self._set_columns(
+            (
+                self.token_sequence_length,
+                self.token_layout,
+                self.token_dtype,
+                self.token_vocab_size,
+            ),
+            {"xs": 12, "sm": 6, "md": 3},
+        )
+        self._set_columns(
+            (
+                self.token_pad_id,
+                self.token_bos_id,
+                self.token_eos_id,
+            ),
+            {"xs": 12, "sm": 4},
+        )
+        self._refresh_token_choice()
+        return ft.Container(
+            content=ft.Column(
+                controls=[
+                    self.token_text,
+                    self.token_codebook,
+                    self.token_note,
+                    self.token_vocabulary_row,
+                    self.token_merges_row,
+                    self._responsive_row(
+                        self.token_sequence_length,
+                        self.token_layout,
+                        self.token_dtype,
+                        self.token_vocab_size,
+                    ),
+                    self._responsive_row(
+                        self.token_pad_id,
+                        self.token_bos_id,
+                        self.token_eos_id,
+                    ),
+                    ft.Row(controls=[self.token_truncate]),
+                ],
+                spacing=10,
+            ),
+            visible=False,
+        )
+
     def _field(self, **kwargs: Any) -> ft.TextField:
         return self._watch_text_focus(ft.TextField(dense=True, **kwargs))
 
@@ -495,13 +632,42 @@ class TestInputWorkspace:
     def _on_kind_changed(self, event: ft.Event[ft.Dropdown] | None) -> None:
         selected = self.kind.value or "image"
         for key, section in zip(
-            ("image", "mask", "csv", "time-series", "tensor"),
+            ("image", "mask", "text-tokens", "csv", "time-series", "tensor"),
             self.sections,
             strict=True,
         ):
             section.visible = key == selected
         if event is not None:
             self.page.update()
+
+    def _on_codebook_changed(self, event: ft.Event[ft.Dropdown] | None) -> None:
+        self._refresh_token_choice()
+        if event is not None:
+            self.page.update()
+
+    def _token_choice(self) -> TokenizerChoice:
+        """The selected codebook entry, defaulting to the first choice."""
+        return choice_for(self.token_codebook.value or TOKENIZER_CHOICES[0].id)
+
+    def _refresh_token_choice(self) -> None:
+        """Show the selected codebook's note and only the files it needs."""
+        choice = self._token_choice()
+        self.token_note.value = choice.note
+        self.token_vocabulary_row.visible = choice.needs_vocabulary
+        self.token_merges_row.visible = choice.needs_merges
+        self.token_vocabulary_path.label = (
+            "Vocabulary (tokenizer.json)"
+            if choice.id == "tokenizer-json"
+            else "Vocabulary (vocab.json)"
+        )
+        # A file-backed codebook takes its size from the vocabulary, so the
+        # field would be a lie rather than a setting.
+        self.token_vocab_size.disabled = choice.needs_files
+        self.token_vocab_size.hint_text = (
+            "Set by the vocabulary file"
+            if choice.needs_files
+            else "Blank uses the codebook default"
+        )
 
     async def _on_choose_image(
         self,
@@ -549,6 +715,44 @@ class TestInputWorkspace:
             self._on_error("CSV conversion is available in the desktop app.")
             self.page.update()
 
+    async def _on_choose_vocabulary(
+        self,
+        event: ft.Event[ft.TextButton],
+    ) -> None:
+        files = await self.picker.pick_files(
+            dialog_title="Choose a vocab.json or tokenizer.json vocabulary",
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allowed_extensions=["json"],
+            allow_multiple=False,
+            with_data=False,
+        )
+        if files and files[0].path is not None:
+            self.token_vocabulary_path.value = files[0].path
+            self.status.value = f"Selected {files[0].name}"
+            self.page.update()
+        elif files:
+            self._on_error("Vocabulary files are read in the desktop app.")
+            self.page.update()
+
+    async def _on_choose_merges(
+        self,
+        event: ft.Event[ft.TextButton],
+    ) -> None:
+        files = await self.picker.pick_files(
+            dialog_title="Choose a merges.txt merge table",
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allowed_extensions=["txt"],
+            allow_multiple=False,
+            with_data=False,
+        )
+        if files and files[0].path is not None:
+            self.token_merges_path.value = files[0].path
+            self.status.value = f"Selected {files[0].name}"
+            self.page.update()
+        elif files:
+            self._on_error("Merge files are read in the desktop app.")
+            self.page.update()
+
     async def _on_generate(self, event: ft.Event[ft.Button]) -> None:
         await self.generate(assign=False)
 
@@ -583,7 +787,13 @@ class TestInputWorkspace:
                 input_name = self.target_input.value
                 assert input_name is not None
                 self._assign(input_name, generated)
-        except (InputGenerationError, OSError, TypeError, ValueError) as error:
+        except (
+            InputGenerationError,
+            TokenizationError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as error:
             if generated is None:
                 self._on_error(f"Could not generate test input: {error}")
                 self.status.value = "Generation failed; no partial file remains."
@@ -634,6 +844,25 @@ class TestInputWorkspace:
                 fill=self.mask_fill.value or "ones",  # type: ignore[arg-type]
                 dtype=self.mask_dtype.value or "int64",
                 seed=self._integer_field(self.mask_seed, "mask seed"),
+            )
+        if kind == "text-tokens":
+            return generate_token_ids_tensor(
+                destination,
+                # Empty text is the generator's business: a bos/eos id alone is
+                # a valid one-token sequence, and it explains the refusal when
+                # neither is set.
+                text=self.token_text.value or "",
+                codebook=self._token_codebook(),
+                sequence_length=self._optional_integer_field(
+                    self.token_sequence_length,
+                    "sequence length",
+                ),
+                layout=self.token_layout.value or "NT",  # type: ignore[arg-type]
+                dtype=self.token_dtype.value or "int64",
+                pad_id=self._integer_field(self.token_pad_id, "pad id"),
+                bos_id=self._optional_integer_field(self.token_bos_id, "BOS id"),
+                eos_id=self._optional_integer_field(self.token_eos_id, "EOS id"),
+                truncate=bool(self.token_truncate.value),
             )
         if kind == "csv":
             return generate_csv_tensor(
@@ -692,6 +921,39 @@ class TestInputWorkspace:
             seed=self._integer_field(self.tensor_seed, "tensor seed"),
         )
 
+    def _token_codebook(self) -> Codebook:
+        """Build the selected codebook, refusing before a needed file is read."""
+        choice = self._token_choice()
+        vocabulary_path = (
+            self._required_text(
+                self.token_vocabulary_path,
+                f"choose a vocabulary file for {choice.label}",
+            )
+            if choice.needs_vocabulary
+            else None
+        )
+        merges_path = (
+            self._required_text(
+                self.token_merges_path,
+                f"choose a merges file for {choice.label}",
+            )
+            if choice.needs_merges
+            else None
+        )
+        return load_codebook(
+            choice.id,
+            vocabulary_path=vocabulary_path,
+            merges_path=merges_path,
+            vocab_size=(
+                None
+                if choice.needs_files
+                else self._optional_integer_field(
+                    self.token_vocab_size,
+                    "vocabulary size",
+                )
+            ),
+        )
+
     def _on_target_changed(self, event: ft.Event[ft.Dropdown] | None) -> None:
         self._apply_target_defaults()
         self._refresh_assign_button()
@@ -713,6 +975,11 @@ class TestInputWorkspace:
                 self.tensor_dtype,
             ):
                 dtype_field.value = target.element_type
+        # Token ids only take the integer dtypes the token generator accepts,
+        # so a float target must leave the token dtype alone.
+        token_dtypes = {str(option.key) for option in self.token_dtype.options}
+        if target.element_type in token_dtypes:
+            self.token_dtype.value = target.element_type
         if target.shape is not None and all(
             isinstance(extent, int) for extent in target.shape
         ):
@@ -758,6 +1025,11 @@ class TestInputWorkspace:
                 self.image_height.value = str(grid_height * 16)
                 self.image_width.value = str(grid_width * 16)
                 self._on_kind_changed(None)
+            elif len(shape) == 2 and target.element_type in token_dtypes:
+                # A rank-2 integer input is a batch of token ids, not a picture.
+                self.kind.value = "text-tokens"
+                self.token_sequence_length.value = str(shape[1])
+                self._on_kind_changed(None)
             elif len(shape) == 2:
                 self.kind.value = "image"
                 self.image_layout.value = "HW"
@@ -797,6 +1069,7 @@ class TestInputWorkspace:
             return f"{Path(self.csv_path.value).stem}.npy"
         return {
             "mask": "mask.npy",
+            "text-tokens": "tokens.npy",
             "time-series": "time-series.npy",
             "tensor": "tensor.npy",
         }.get(kind, "input.npy")
@@ -814,6 +1087,13 @@ class TestInputWorkspace:
             return int((field.value or "").strip(), 10)
         except ValueError as error:
             raise InputGenerationError(f"{label} must be an integer") from error
+
+    @staticmethod
+    def _optional_integer_field(field: ft.TextField, label: str) -> int | None:
+        """An integer field whose blank value means "let the generator decide"."""
+        if not (field.value or "").strip():
+            return None
+        return TestInputWorkspace._integer_field(field, label)
 
     @staticmethod
     def _float_field(field: ft.TextField, label: str) -> float:
@@ -929,6 +1209,14 @@ def build_input_workspace(
                     "Masks",
                     "Generate all-valid, zero, checkerboard, or deterministic "
                     "random binary masks with an explicit dtype and shape.",
+                ),
+                _tip(
+                    palette,
+                    ft.Icons.TEXT_FIELDS_ROUNDED,
+                    "Text tokens",
+                    "Encode a prompt into language-model token ids from a "
+                    "self-contained codebook or a HuggingFace vocabulary; the "
+                    "summary records how faithful the ids are.",
                 ),
                 _tip(
                     palette,

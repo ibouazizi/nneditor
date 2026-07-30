@@ -1,0 +1,6 @@
+# Third-party tokenizer data is byte-exact reference material: its SHA-256
+# hashes are recorded in examples/trace-inputs/manifest.json and verified
+# against the upstream files. Line-ending conversion would change those bytes
+# on checkout and invalidate the recorded hashes, so keep them verbatim.
+examples/trace-inputs/gpt2/vocab.json -text
+examples/trace-inputs/gpt2/merges.txt -text
