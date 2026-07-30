@@ -366,6 +366,46 @@ def test_additional_time_series_modes(
     assert generated.shape == shape
 
 
+def test_nc_layout_carries_one_series_without_a_time_axis(tmp_path: Path) -> None:
+    """Univariate forecasters such as TiRex declare a rank-2 context tensor."""
+    generated = generate_time_series_tensor(
+        tmp_path / "context.npy",
+        samples=8,
+        channels=1,
+        waveform="sine",
+        sample_rate=8,
+        frequency=1,
+        layout="NC",
+    )
+    assert generated.shape == (1, 8)
+    array = np.load(generated.path, allow_pickle=False)
+    # The series occupies the second axis; the values match the TC column.
+    reference = np.load(
+        generate_time_series_tensor(
+            tmp_path / "reference.npy",
+            samples=8,
+            channels=1,
+            waveform="sine",
+            sample_rate=8,
+            frequency=1,
+            layout="TC",
+        ).path,
+        allow_pickle=False,
+    )
+    assert array[0] == pytest.approx(reference[:, 0])
+
+
+def test_nc_layout_refuses_multiple_channels(tmp_path: Path) -> None:
+    """A rank-2 tensor has nowhere to put channels, so say so."""
+    with pytest.raises(InputGenerationError, match="needs channels=1"):
+        generate_time_series_tensor(
+            tmp_path / "bad.npy",
+            samples=8,
+            channels=3,
+            layout="NC",
+        )
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
