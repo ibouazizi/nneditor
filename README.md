@@ -265,6 +265,10 @@ Mobile packaging is outside the 1.0 release.
 - The original Python, module definitions, and training code cannot be
   reconstructed from serialized artifacts.
 
+## Author
+
+NNEditor was developed by **[Imed Bouazizi](https://bouazizi.dev)**.
+
 ## License
 
 NNEditor is licensed under the [Apache License 2.0](LICENSE). Attribution and
