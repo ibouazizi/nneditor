@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import onnx
@@ -190,7 +191,10 @@ def test_worker_unsupported_operator_returns_inputs_and_diagnostics(
     assert np.array_equal(captures["input-id"], feed)
     assert "output-id" not in captures
     assert diagnostics
-    assert "degraded" in diagnostics[0]
+    # The first diagnostic explains that whole-model evaluation gave way to
+    # per-value capture, and names the operator responsible.
+    assert "capturing per value" in diagnostics[0]
+    assert "FusedGelu" in diagnostics[0]
 
 
 def test_worker_prefix_fallback_restores_model_without_copying_weights() -> None:
@@ -331,3 +335,114 @@ def test_evaluate_attributes_failures_to_the_value_that_failed(
     assert "ghost" in failures
     assert "scaled" not in failures
     assert "scaled-id" in captures
+
+
+def test_unbuildable_runtime_still_captures_and_names_the_real_cause(
+    tmp_path: Path,
+) -> None:
+    """An operator the runtime cannot build must name itself, not MemoryError.
+
+    Reproduces a real xLSTM export whose Scan uses input axis 1, which the
+    reference runtime refuses outright.
+    """
+    body = onnx.helper.make_graph(
+        nodes=[onnx.helper.make_node("Identity", ["state_in"], ["state_out"])],
+        name="scan_body",
+        inputs=[
+            onnx.helper.make_tensor_value_info("state_in", onnx.TensorProto.FLOAT, [1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("state_out", onnx.TensorProto.FLOAT, [1])
+        ],
+    )
+    graph = onnx.helper.make_graph(
+        nodes=[
+            onnx.helper.make_node(
+                "Scan",
+                ["state", "series"],
+                ["final"],
+                name="scan",
+                body=body,
+                num_scan_inputs=1,
+                scan_input_axes=[1],
+            )
+        ],
+        name="unbuildable",
+        inputs=[
+            onnx.helper.make_tensor_value_info("state", onnx.TensorProto.FLOAT, [1]),
+            onnx.helper.make_tensor_value_info(
+                "series", onnx.TensorProto.FLOAT, [1, 4]
+            ),
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("final", onnx.TensorProto.FLOAT, [1])
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 20)]
+    )
+    feeds = {
+        "state": np.zeros((1,), dtype=np.float32),
+        "series": np.zeros((1, 4), dtype=np.float32),
+    }
+
+    _captures, diagnostics, failures = trace_worker._evaluate(
+        model, feeds, [_target("final-id", "final")]
+    )
+
+    joined = " ".join(diagnostics)
+    assert "cannot execute the whole model" in joined
+    assert "Scan" in joined
+    # The reason the model will not run must survive into the value's own
+    # failure text rather than being replaced by a memory error.
+    assert "Scan" in failures["final"] or "not captured" in failures["final"]
+    assert not any("MemoryError" in item for item in diagnostics)
+
+
+def test_prefix_capture_stops_once_memory_is_exhausted() -> None:
+    """One memory failure ends the pass; it cannot recover by trying again."""
+    calls: list[str] = []
+
+    def exploding(
+        model: onnx.ModelProto,
+        feeds: dict[str, np.ndarray[Any, Any]],
+        name: str,
+        *,
+        producer_limit: int,
+    ) -> np.ndarray[Any, Any]:
+        calls.append(name)
+        raise MemoryError("cap reached")
+
+    targets = [_target(f"v{i}-id", f"v{i}") for i in range(5)]
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            nodes=[
+                onnx.helper.make_node("Identity", ["x"], [f"v{i}"], name=f"n{i}")
+                for i in range(5)
+            ],
+            name="chain",
+            inputs=[
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1])
+            ],
+            outputs=[
+                onnx.helper.make_tensor_value_info("v0", onnx.TensorProto.FLOAT, [1])
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 20)],
+    )
+
+    original = trace_worker._evaluate_prefix
+    trace_worker._evaluate_prefix = exploding
+    try:
+        captures, diagnostics, failures = trace_worker._evaluate_by_prefix(
+            model, {}, targets, {}, [], {}
+        )
+    finally:
+        trace_worker._evaluate_prefix = original
+
+    assert not captures
+    # Only the first value was attempted; the rest inherit the same reason.
+    assert calls == ["v0"]
+    assert len(failures) == 5
+    assert all("memory limit" in reason for reason in failures.values())
+    assert sum("ran out of memory" in item for item in diagnostics) == 1

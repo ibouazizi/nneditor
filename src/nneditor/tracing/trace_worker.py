@@ -99,7 +99,28 @@ def _evaluate(
         return captures, diagnostics, failures
     names = [str(target["value_name"]) for target in runtime_targets]
     try:
-        values = ReferenceEvaluator(model).run(names, feeds)
+        evaluator = ReferenceEvaluator(model)
+    except MemoryError as error:
+        diagnostics.append(
+            "building the reference runtime exhausted the approved memory "
+            f"limit: {error}; increase the Memory limit and approve the trace "
+            "again"
+        )
+        return captures, diagnostics, failures
+    except Exception as error:
+        # The evaluator could not be built over the whole model — an operator
+        # the runtime does not implement, say. Values upstream of it can still
+        # be captured, so fall through to the per-value prefix pass, which
+        # truncates the model and may well build.
+        diagnostics.append(
+            "the reference runtime cannot execute the whole model: "
+            f"{type(error).__name__}: {error}; capturing per value instead"
+        )
+        return _evaluate_by_prefix(
+            model, feeds, runtime_targets, captures, diagnostics, failures
+        )
+    try:
+        values = evaluator.run(names, feeds)
         for target, value in zip(runtime_targets, values, strict=True):
             captures[str(target["value_id"])] = np.asarray(value)
         return captures, diagnostics, failures
@@ -114,15 +135,39 @@ def _evaluate(
             "full trace degraded to per-value prefix evaluation: "
             f"{type(error).__name__}: {error}"
         )
+    return _evaluate_by_prefix(
+        model, feeds, runtime_targets, captures, diagnostics, failures
+    )
 
+
+def _evaluate_by_prefix(
+    model: onnx.ModelProto,
+    feeds: dict[str, np.ndarray[Any, Any]],
+    runtime_targets: list[dict[str, object]],
+    captures: dict[str, np.ndarray[Any, Any]],
+    diagnostics: list[str],
+    failures: dict[str, str],
+) -> tuple[dict[str, np.ndarray[Any, Any]], list[str], dict[str, str]]:
+    """Capture each value from a truncated model when the whole one will not run.
+
+    Every value costs its own evaluator over the model up to its producer, so
+    this pass is expensive by construction. Once memory runs out it cannot
+    recover — each remaining value would rebuild an evaluator that is at least
+    as large — so the pass stops at the first :class:`MemoryError` rather than
+    reporting one per value and burying the reason the model could not run.
+    """
     producer_by_output = {
         output: index
         for index, node in enumerate(model.graph.node)
         for output in node.output
         if output
     }
-    for target in runtime_targets:
+    exhausted: str | None = None
+    for position, target in enumerate(runtime_targets):
         name = str(target["value_name"])
+        if exhausted is not None:
+            failures[name] = exhausted
+            continue
         producer = producer_by_output.get(name)
         if producer is None:
             reason = "this value has no executable producer"
@@ -136,6 +181,18 @@ def _evaluate(
                 name,
                 producer_limit=producer,
             )
+        except MemoryError as error:
+            exhausted = (
+                "per-value capture exhausted the approved memory limit; "
+                "raise the Memory limit, or narrow the trace to fewer values"
+            )
+            diagnostics.append(
+                f"per-value capture ran out of memory after {position} of "
+                f"{len(runtime_targets)} value(s): {error}; the remaining "
+                "values were not attempted. Raise the Memory limit or select "
+                "fewer values to capture."
+            )
+            failures[name] = exhausted
         except Exception as error:
             reason = f"not captured: {type(error).__name__}: {error}"
             diagnostics.append(f"value {name!r} was {reason}")
