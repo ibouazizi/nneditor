@@ -39,6 +39,11 @@ from nneditor.ui.trace_graph import TraceGraphPresentation
 __all__ = ["ActivationRows", "TracePanel", "uses_automatic_mask"]
 
 
+def _plural(count: int, noun: str) -> str:
+    """``3 values`` / ``1 value``: counts read as prose in the scope summary."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
 def uses_automatic_mask(input_name: str) -> bool:
     """True when an input's name marks it as an all-valid attention/pixel mask."""
     normalized = input_name.lower().replace("-", "_")
@@ -72,6 +77,7 @@ class TracePanel:
         current_slice: Callable[[], GraphSlice | None],
         surface_size: Callable[[], tuple[float, float]],
         inspected_ids: Callable[[], frozenset[str]],
+        selected_node_ids: Callable[[], frozenset[str]],
         activation_rows: ActivationRows,
         set_heading: Callable[[str, str], None],
         refresh_inspector: Callable[[frozenset[str]], None],
@@ -92,6 +98,7 @@ class TracePanel:
         self._current_slice = current_slice
         self._surface_size = surface_size
         self._inspected_ids = inspected_ids
+        self._selected_node_ids = selected_node_ids
         self._activation_rows = activation_rows
         self._set_heading = set_heading
         self._refresh_inspector = refresh_inspector
@@ -137,6 +144,16 @@ class TracePanel:
             label="Write chunk (KiB)",
             value="1024",
             dense=True,
+        )
+        self.capture_selected_only = ft.Checkbox(
+            label="Capture only the selected nodes",
+            value=False,
+            on_change=self._on_capture_scope_changed,
+        )
+        self.capture_scope = ft.Text(
+            "Open an artifact to see how many values a trace captures.",
+            size=10,
+            color=palette.muted,
         )
         self.approval_notice = ft.Text(
             "Review the selected inputs and limits. The run button approves "
@@ -207,6 +224,8 @@ class TracePanel:
                     controls=[self.capture_mib, self.chunk_kib],
                     spacing=6,
                 ),
+                self.capture_selected_only,
+                self.capture_scope,
                 self.approval_notice,
                 ft.Row(
                     controls=[self.run_button, self.cancel_button],
@@ -558,6 +577,94 @@ class TracePanel:
 
         return reset
 
+    # -- capture scope -----------------------------------------------------
+
+    def _capturable_value_ids(self) -> frozenset[str]:
+        """Every value an unrestricted trace would capture.
+
+        This mirrors the runner's own target set: model inputs that are not
+        initializers plus every node output, minus the unnamed positional
+        placeholders that stand in for omitted optional ports.
+        """
+        session = self._session()
+        if session is None:
+            return frozenset()
+        graph = session.document.main_graph
+        candidates = {
+            value_id for value_id in graph.inputs if value_id not in graph.initializers
+        }
+        for node in graph.nodes:
+            candidates.update(node.outputs)
+        return frozenset(
+            value_id for value_id in candidates if graph.value(value_id).name
+        )
+
+    def _selected_graph_node_ids(self) -> frozenset[str]:
+        """Selected glyphs that are operators of the traceable graph."""
+        session = self._session()
+        if session is None:
+            return frozenset()
+        selected = self._selected_node_ids()
+        return frozenset(
+            node.id for node in session.document.main_graph.nodes if node.id in selected
+        )
+
+    def _selected_capture_value_ids(self) -> frozenset[str]:
+        """Named output values produced by the currently selected operators.
+
+        The runner refuses a selected value carrying no serialized name, so the
+        placeholders for omitted optional outputs are dropped here rather than
+        failing a trace the user already approved.
+        """
+        session = self._session()
+        if session is None:
+            return frozenset()
+        graph = session.document.main_graph
+        selected = self._selected_graph_node_ids()
+        return frozenset(
+            value_id
+            for node_id in selected
+            for value_id in graph.node(node_id).outputs
+            if graph.value(value_id).name
+        )
+
+    def capture_value_ids(self) -> frozenset[str]:
+        """The values the next trace captures; empty means capture everything."""
+        if not self.capture_selected_only.value:
+            return frozenset()
+        return self._selected_capture_value_ids()
+
+    def refresh_capture_scope(self) -> None:
+        """Restate how much of the model the next approved trace would read."""
+        session = self._session()
+        if session is None:
+            self.capture_scope.value = (
+                "Open an artifact to see how many values a trace captures."
+            )
+            return
+        everything = f"all {_plural(len(self._capturable_value_ids()), 'value')}"
+        if not self.capture_selected_only.value:
+            self.capture_scope.value = f"Capturing {everything}."
+            return
+        nodes = len(self._selected_graph_node_ids())
+        values = len(self._selected_capture_value_ids())
+        if not nodes:
+            self.capture_scope.value = f"No nodes selected; capturing {everything}."
+        elif not values:
+            self.capture_scope.value = (
+                f"No named values in the {_plural(nodes, 'selected node')}; "
+                f"capturing {everything}."
+            )
+        else:
+            self.capture_scope.value = (
+                f"Capturing {_plural(values, 'value')} from "
+                f"{_plural(nodes, 'selected node')}."
+            )
+
+    def _on_capture_scope_changed(self, event: ft.Event[ft.Checkbox]) -> None:
+        self.refresh_capture_scope()
+        self.page.update()
+
     # -- run lifecycle -----------------------------------------------------
 
     def refresh_actions(self) -> None:
@@ -644,6 +751,8 @@ class TracePanel:
         self.compare_button.disabled = (
             self.active_trace_id is None or not alternatives or busy
         )
+        self.capture_selected_only.disabled = busy
+        self.refresh_capture_scope()
 
     def run(self, event: ft.Event[ft.Button]) -> None:
         """Approve and start exactly one isolated trace of the open model."""
@@ -666,6 +775,7 @@ class TracePanel:
         capture_text = self.capture_mib.value or ""
         chunk_text = self.chunk_kib.value or ""
         bindings = dict(self.input_bindings)
+        value_ids = self.capture_value_ids()
         self._preparing = True
         self._clear_error()
         self.active_comparison = None
@@ -695,7 +805,12 @@ class TracePanel:
                     specification,
                     limits,
                 )
-                request = TraceRequest(specification, limits, approval)
+                request = TraceRequest(
+                    specification,
+                    limits,
+                    approval,
+                    value_ids=value_ids,
+                )
                 job = session.trace_async(request)
             except (OSError, TypeError, ValueError) as error:
                 if self._session() is session:

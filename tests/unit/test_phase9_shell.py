@@ -13,7 +13,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from nneditor.application.session import ApplicationService
+from nneditor.analysis.lod import DetailLevel
+from nneditor.application.session import ApplicationService, ModelSession
 from nneditor.desktop.windows_associations import FileAssociationError
 from nneditor.tokenization import TOKENIZER_CHOICES, WordHashCodebook
 from nneditor.tracing import (
@@ -25,14 +26,15 @@ from nneditor.tracing import (
     build_activation_visualizations,
 )
 from nneditor.ui.activation_inspector import build_activation_plot
-from nneditor.ui.app import SHELL_PALETTE
+from nneditor.ui.app import SHELL_PALETTE, Shell
 from nneditor.ui.input_workspace import InputTarget
 from tests.fixtures.onnx_models import (
     build_embedded_model,
     build_masked_image_model,
+    build_optional_output_model,
     build_token_ids_model,
 )
-from tests.unit.test_shell import make_shell
+from tests.unit.test_shell import StubPage, make_shell
 
 
 def test_trace_shell_empty_consent_loading_and_activation_states(
@@ -804,6 +806,146 @@ def test_trace_shell_discloses_partial_capture(tmp_path: Path) -> None:
         shell.trace.active_trace_id = result.id
         shell.trace.refresh_actions()
         assert "Partial trace" in str(shell.trace.status.value)
+
+
+def _select_operators(shell: Shell, session: ModelSession, *node_ids: str) -> None:
+    """Show the operator graph and select those nodes, as a click would."""
+    shell.current_detail = DetailLevel.OPERATOR
+    shell._show_graph(session.document.entry_graph)
+    selection = frozenset(node_ids)
+    shell.renderer.set_selection(selection)
+    shell._on_selected(selection)
+
+
+def _approved_request(
+    shell: Shell,
+    page: StubPage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> TraceRequest:
+    """Approve one trace and return the request, without starting a worker."""
+    requests: list[TraceRequest] = []
+
+    def record(session: ModelSession, request: TraceRequest) -> Any:
+        requests.append(request)
+        return SimpleNamespace(
+            state=SimpleNamespace(is_terminal=False, value="running"),
+            cancel=lambda: None,
+        )
+
+    monkeypatch.setattr(ModelSession, "trace_async", record)
+    callbacks: list[Any] = []
+    cast(Any, page).run_thread = callbacks.append
+    shell.trace.run(cast(ft.Event[ft.Button], cast(Any, SimpleNamespace())))
+    callbacks.pop(0)()
+    shell.trace.job = None
+    (request,) = requests
+    return request
+
+
+def _tick_capture_scope(shell: Shell, ticked: bool) -> None:
+    shell.trace.capture_selected_only.value = ticked
+    cast(Any, shell.trace.capture_selected_only.on_change)(cast(Any, SimpleNamespace()))
+
+
+def test_unticked_capture_scope_still_traces_every_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        _select_operators(shell, session, session.document.main_graph.nodes[0].id)
+
+        assert not shell.trace.capture_selected_only.value
+        assert shell.trace.capture_value_ids() == frozenset()
+        assert _approved_request(shell, page, monkeypatch).value_ids == frozenset()
+
+
+def test_ticked_capture_scope_narrows_the_request_to_selected_nodes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        graph = session.document.main_graph
+        selected = graph.nodes[0]
+        _select_operators(shell, session, selected.id)
+        _tick_capture_scope(shell, True)
+
+        expected = frozenset(selected.outputs)
+        assert expected
+        assert shell.trace.capture_value_ids() == expected
+        assert _approved_request(shell, page, monkeypatch).value_ids == expected
+
+        # An empty selection narrows nothing, so the trace captures everything.
+        shell.renderer.set_selection(frozenset())
+        shell._on_selected(frozenset())
+        assert shell.trace.capture_value_ids() == frozenset()
+
+
+def test_capture_scope_drops_unnamed_placeholder_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "optional-output.onnx"
+    build_optional_output_model(path)
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        graph = session.document.main_graph
+        dropout = next(node for node in graph.nodes if node.op_type == "Dropout")
+        named = frozenset(
+            value_id for value_id in dropout.outputs if graph.value(value_id).name
+        )
+        placeholder = frozenset(dropout.outputs) - named
+        # The runner rejects a selected value with no serialized name, so the
+        # panel must never put one in the request.
+        assert len(placeholder) == 1
+        _select_operators(shell, session, dropout.id)
+        _tick_capture_scope(shell, True)
+
+        assert shell.trace.capture_value_ids() == named
+        assert _approved_request(shell, page, monkeypatch).value_ids == named
+        assert "Capturing 1 value from 1 selected node." in str(
+            shell.trace.capture_scope.value
+        )
+
+
+def test_capture_scope_summary_tracks_the_box_and_the_selection(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        assert "Open an artifact" in str(shell.trace.capture_scope.value)
+
+        session = service.open_model(path)
+        shell.show_session(session)
+        # One model input plus one output per node, none of them unnamed.
+        assert shell.trace.capture_scope.value == "Capturing all 3 values."
+
+        _tick_capture_scope(shell, True)
+        assert shell.trace.capture_scope.value == (
+            "No nodes selected; capturing all 3 values."
+        )
+
+        graph = session.document.main_graph
+        _select_operators(shell, session, *(node.id for node in graph.nodes))
+        assert shell.trace.capture_scope.value == (
+            "Capturing 2 values from 2 selected nodes."
+        )
+
+        _tick_capture_scope(shell, False)
+        assert shell.trace.capture_scope.value == "Capturing all 3 values."
 
 
 def test_activation_plot_adapter_consumes_headless_view_models() -> None:

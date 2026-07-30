@@ -528,6 +528,7 @@ class Shell:
             current_slice=lambda: self.current_slice,
             surface_size=lambda: self.surface_size,
             inspected_ids=lambda: self._inspected_ids,
+            selected_node_ids=lambda: self.renderer.selection,
             activation_rows=self.activations.activation_rows_for_values,
             set_heading=self._set_inspector_heading,
             refresh_inspector=self._refresh_inspector,
@@ -1262,6 +1263,7 @@ class Shell:
             )
         self.activations.autoload_views(ids)
         self._refresh_inspector(ids)
+        self.trace.refresh_capture_scope()
         self._record_view()
         self.page.update()
 

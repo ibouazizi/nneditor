@@ -30,6 +30,7 @@ __all__ = [
     "build_masked_image_model",
     "build_matmul_model",
     "build_optional_input_model",
+    "build_optional_output_model",
     "build_symbolic_shape_model",
     "build_tensor_only_model",
     "build_token_ids_model",
@@ -503,6 +504,21 @@ def build_optional_input_model(path: Path) -> None:
         inputs=[helper.make_tensor_value_info("input", TensorProto.FLOAT, [4])],
         outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, [4])],
         initializer=[limit],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", _OPSET)])
+    onnx.save_model(model, path)
+
+
+def build_optional_output_model(path: Path) -> None:
+    """A ``Dropout`` whose optional ``mask`` output is omitted by position."""
+    graph = helper.make_graph(
+        nodes=[
+            helper.make_node("Identity", ["input"], ["kept"], name="keep"),
+            helper.make_node("Dropout", ["kept"], ["output", ""], name="drop"),
+        ],
+        name="optional_output",
+        inputs=[helper.make_tensor_value_info("input", TensorProto.FLOAT, [4])],
+        outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, [4])],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", _OPSET)])
     onnx.save_model(model, path)
