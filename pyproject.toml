@@ -107,7 +107,36 @@ src = ["src", "tests"]
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["B", "E", "F", "I", "RUF", "UP"]
+select = ["B", "C901", "E", "F", "I", "PLR0912", "PLR0915", "RUF", "UP"]
+
+# Structural ceilings, not style preferences. Without them a single function
+# or constructor can grow without bound: the shell's `__init__` reached 649
+# lines before these rules existed. The limits are deliberately generous, so
+# tripping one means a function genuinely needs splitting.
+[tool.ruff.lint.mccabe]
+max-complexity = 20
+
+[tool.ruff.lint.pylint]
+max-branches = 25
+max-statements = 80
+
+# A shrinking baseline of functions that predate the ceilings above. Each entry
+# is debt with a known owner, not an exemption: delete the entry once the
+# function is split. Do not add new entries — write a smaller function instead.
+[tool.ruff.lint.per-file-ignores]
+# Wire-format and pickle-opcode dispatch loops. These are long by nature
+# (one branch per protobuf field kind / pickle opcode) and splitting them
+# needs a dispatch-table refactor rather than a mechanical extraction.
+"src/nneditor/adapters/onnx/indexer.py" = ["C901", "PLR0912", "PLR0915"]
+"src/nneditor/adapters/pytorch/pickle_scan.py" = ["C901", "PLR0912", "PLR0915"]
+"src/nneditor/adapters/pytorch/pt2.py" = ["C901", "PLR0912", "PLR0915"]
+# Export staging/publication and the streaming statistics pass.
+"src/nneditor/adapters/onnx/exporter.py" = ["C901", "PLR0915"]
+"src/nneditor/analysis/statistics.py" = ["C901"]
+# `Shell.__init__` only: 649 -> 564 lines after the panel extractions, still
+# above the statement ceiling. Remaining work is moving control construction
+# into `shell_layout` factories.
+"src/nneditor/ui/app.py" = ["PLR0915"]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

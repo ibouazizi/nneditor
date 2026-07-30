@@ -277,13 +277,13 @@ def test_typed_preview_requires_explicit_consent(
     shell.show_session(session)
     bias_id = session.document.main_graph.initializers[1]
 
-    prompt = shell._preview_row(bias_id)
+    prompt = shell.activations.preview_row(bias_id)
     assert isinstance(prompt, ft.TextButton)
     assert "full typed tensor" in str(prompt.content)
     assert session.store.open_file_count == 0
 
-    shell._typed_preview_handler(bias_id)(cast(Any, None))
-    preview = shell._preview_row(bias_id)
+    shell.activations.typed_preview_handler(bias_id)(cast(Any, None))
+    preview = shell.activations.preview_row(bias_id)
     assert isinstance(preview, ft.Text)
     assert "Preview:" in (preview.value or "")
     assert session.store.open_file_count == 1

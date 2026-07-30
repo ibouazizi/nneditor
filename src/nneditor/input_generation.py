@@ -13,6 +13,8 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image, ImageOps
 
+from nneditor.tokenization import Codebook
+
 MAX_GENERATED_TENSOR_BYTES: Final = 512 * 1024 * 1024
 MAX_TABULAR_SOURCE_BYTES: Final = 64 * 1024 * 1024
 MAX_IMAGE_EXTENT: Final = 16_384
@@ -32,6 +34,7 @@ ImageNormalization = Literal["none", "zero-one", "minus-one-one", "imagenet"]
 MaskFill = Literal["ones", "zeros", "checkerboard", "random-binary"]
 TimeSeriesWaveform = Literal["sine", "cosine", "sawtooth", "random-walk"]
 TimeSeriesLayout = Literal["NTC", "NCT", "TC", "CT"]
+TokenLayout = Literal["NT", "T"]
 SyntheticDistribution = Literal[
     "zeros",
     "ones",
@@ -57,6 +60,7 @@ _NUMERIC_DTYPES: Final = frozenset(
     }
 )
 _FLOAT_DTYPES: Final = frozenset({"float16", "float32", "float64"})
+_TOKEN_DTYPES: Final = frozenset({"int32", "int64", "uint32", "uint64"})
 
 
 class InputGenerationError(ValueError):
@@ -270,6 +274,93 @@ def generate_mask_tensor(
     else:
         raise InputGenerationError(f"unsupported mask fill: {fill}")
     return _publish_array(array, destination, source=f"{fill} mask")
+
+
+def generate_token_ids_tensor(
+    destination: Path | str,
+    *,
+    text: str,
+    codebook: Codebook,
+    sequence_length: int | None = None,
+    layout: TokenLayout = "NT",
+    dtype: str = "int64",
+    pad_id: int = 0,
+    bos_id: int | None = None,
+    eos_id: int | None = None,
+    truncate: bool = True,
+) -> GeneratedTensor:
+    """Encode ``text`` into a language-model token-id tensor.
+
+    ``sequence_length`` pads with ``pad_id`` or truncates to a fixed length;
+    omit it to keep the natural encoded length. Optional ``bos_id``/``eos_id``
+    wrap the sequence and are counted against the length, so a truncated
+    sequence still ends with its end-of-sequence id.
+
+    Models that also take an attention mask need one generated alongside this
+    tensor; a fixed length here means the mask is all-valid up to the token
+    count reported in :attr:`GeneratedTensor.source`.
+    """
+    target_dtype = _dtype(dtype, allowed=_TOKEN_DTYPES)
+    encoded = list(codebook.encode(text))
+    if bos_id is not None:
+        encoded.insert(0, bos_id)
+    if eos_id is not None:
+        encoded.append(eos_id)
+    if not encoded:
+        raise InputGenerationError(
+            "the text produced no tokens; supply text or a bos/eos id"
+        )
+    limit = codebook.vocab_size
+    for identifier in (pad_id, bos_id, eos_id):
+        if identifier is not None and not 0 <= identifier < limit:
+            raise InputGenerationError(
+                f"token id {identifier} is outside the codebook's vocabulary of {limit}"
+            )
+    out_of_range = [item for item in encoded if not 0 <= item < limit]
+    if out_of_range:
+        raise InputGenerationError(
+            f"{len(out_of_range)} encoded id(s) fall outside the codebook's "
+            f"vocabulary of {limit}"
+        )
+
+    encoded_count = len(encoded)
+    padded = 0
+    if sequence_length is not None:
+        if sequence_length < 1:
+            raise InputGenerationError("sequence_length must be positive")
+        if len(encoded) > sequence_length:
+            if not truncate:
+                raise InputGenerationError(
+                    f"{len(encoded)} tokens exceed the requested "
+                    f"sequence_length of {sequence_length}"
+                )
+            encoded = encoded[:sequence_length]
+            if eos_id is not None:
+                encoded[-1] = eos_id
+        else:
+            padded = sequence_length - len(encoded)
+            encoded.extend([pad_id] * padded)
+
+    length = len(encoded)
+    if layout == "NT":
+        shape: tuple[int, ...] = (1, length)
+    elif layout == "T":
+        shape = (length,)
+    else:
+        raise InputGenerationError(f"unsupported token layout: {layout}")
+    _bounded_allocation(shape, target_dtype)
+    array = np.asarray(encoded, dtype=target_dtype).reshape(shape)
+
+    detail = f"{min(encoded_count, length)} of {encoded_count} token(s)"
+    if padded:
+        detail += f", {padded} pad id(s)"
+    elif encoded_count > length:
+        detail += ", truncated"
+    return _publish_array(
+        array,
+        destination,
+        source=f"{codebook.name} tokens ({detail}; {codebook.fidelity})",
+    )
 
 
 def generate_csv_tensor(

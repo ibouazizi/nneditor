@@ -42,5 +42,25 @@
       "maximum": 1,
       "sha256": "5bff883bcd2eb19b13e61e9b5b7188e97aa50f83571c2fde2edae60959e517e7"
     }
+  },
+  "tokenizers": {
+    "gpt2": {
+      "description": "GPT-2 byte-level BPE vocabulary and merge table, for the Text tokens input generator.",
+      "upstream": "https://huggingface.co/openai-community/gpt2",
+      "license": "MIT (OpenAI GPT-2 model assets)",
+      "vocab_size": 50257,
+      "retrieved": "2026-07-29",
+      "files": {
+        "gpt2/vocab.json": {
+          "byte_size": 1042301,
+          "sha256": "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783"
+        },
+        "gpt2/merges.txt": {
+          "byte_size": 456318,
+          "sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5"
+        }
+      },
+      "verification": "Round-trips through NNEditor's BPE codebook; 'hello world' encodes to [31373, 995] and 'Hello world' to [15496, 995], matching the reference tokenizer."
+    }
   }
 }

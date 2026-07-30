@@ -48,7 +48,13 @@ capture bound, so NNEditor reported an honest partial result while retaining
 - Save only when needed through a dirty-aware top-bar action, or close the
   current model without quitting the application.
 - Generate safe `.npy` test inputs from images, masks, CSV data, synthetic
-  time series, or generic tensor patterns, then assign them to model inputs.
+  time series, text token ids, or generic tensor patterns, then assign them to
+  model inputs.
+- Tokenize prompt text into language-model input ids through a selectable
+  codebook: byte level, Unicode code points, or hashed words with no external
+  files, plus GPT-2/RoBERTa byte-level BPE loaded from a HuggingFace
+  `vocab.json` and `merges.txt` or a single `tokenizer.json`. Every codebook
+  states how faithful its ids are to the model's own tokenizer.
 - Preview quantization and pruning before committing them.
 - Export validated ONNX revisions or clearly labelled weights-only artifacts.
 - Trace ONNX activations in an isolated desktop worker and inspect values by
@@ -251,6 +257,11 @@ Mobile packaging is outside the 1.0 release.
 - Textual StableHLO is inspection-only.
 - Weights-only exports do not contain executable topology.
 - Browser tracing is disabled pending multi-user worker isolation.
+- Text tokenization ships no vocabularies: byte, code-point, and hashed-word
+  codebooks are self-contained, while BPE needs the model's own vocabulary
+  files. The BPE pre-tokenizer approximates GPT-2's, so ids can differ from the
+  reference tokenizer on unusual scripts or symbol runs; each codebook reports
+  its own fidelity and the generated tensor records it.
 - The original Python, module definitions, and training code cannot be
   reconstructed from serialized artifacts.
 

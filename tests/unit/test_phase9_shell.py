@@ -15,6 +15,7 @@ from PIL import Image
 
 from nneditor.application.session import ApplicationService
 from nneditor.desktop.windows_associations import FileAssociationError
+from nneditor.tokenization import TOKENIZER_CHOICES, WordHashCodebook
 from nneditor.tracing import (
     ActivationRecord,
     CaptureState,
@@ -23,9 +24,14 @@ from nneditor.tracing import (
     TraceRequest,
     build_activation_visualizations,
 )
-from nneditor.ui.app import Shell
+from nneditor.ui.activation_inspector import build_activation_plot
+from nneditor.ui.app import SHELL_PALETTE
 from nneditor.ui.input_workspace import InputTarget
-from tests.fixtures.onnx_models import build_embedded_model, build_masked_image_model
+from tests.fixtures.onnx_models import (
+    build_embedded_model,
+    build_masked_image_model,
+    build_token_ids_model,
+)
 from tests.unit.test_shell import make_shell
 
 
@@ -36,31 +42,31 @@ def test_trace_shell_empty_consent_loading_and_activation_states(
     build_embedded_model(path, elements=8)
     with ApplicationService() as service:
         shell, page = make_shell(service)
-        assert shell.run_trace_button.disabled
-        assert "Open an artifact" in str(shell.trace_status.value)
+        assert shell.trace.run_button.disabled
+        assert "Open an artifact" in str(shell.trace.status.value)
 
         session = service.open_model(path)
         shell.show_session(session)
-        assert not shell.run_trace_button.disabled
-        assert "isolated" in str(shell.trace_status.value)
-        assert shell.run_trace_button.content == "Approve & run trace"
-        assert "authorizes one isolated trace" in str(shell.trace_approval_notice.value)
+        assert not shell.trace.run_button.disabled
+        assert "isolated" in str(shell.trace.status.value)
+        assert shell.trace.run_button.content == "Approve & run trace"
+        assert "authorizes one isolated trace" in str(shell.trace.approval_notice.value)
 
         event = cast(ft.Event[ft.Button], cast(Any, SimpleNamespace()))
         callbacks: list[Any] = []
         page.run_thread = cast(Any, callbacks.append)
-        shell._on_run_trace(event)
-        assert "Preparing approved trace" in str(shell.trace_status.value)
-        assert shell.trace_progress.visible
-        assert shell.run_trace_button.disabled
+        shell.trace.run(event)
+        assert "Preparing approved trace" in str(shell.trace.status.value)
+        assert shell.trace.progress.visible
+        assert shell.trace.run_button.disabled
         assert not shell.error_banner.visible
         assert callbacks
         callbacks.pop(0)()
         assert callbacks
         callbacks.pop(0)()
-        assert shell.active_trace_id is not None
-        assert "Complete trace" in str(shell.trace_status.value)
-        assert not shell.trace_progress.visible
+        assert shell.trace.active_trace_id is not None
+        assert "Complete trace" in str(shell.trace.status.value)
+        assert not shell.trace.progress.visible
 
         node_id = session.document.main_graph.nodes[0].id
         shell.current_detail = shell.current_detail.OPERATOR
@@ -99,8 +105,8 @@ def test_open_model_applies_model_aware_trace_defaults(
         shell, _page = make_shell(service)
         shell.show_session(service.open_model(path))
 
-        assert shell.trace_wall_seconds.value == "300"
-        assert shell.trace_memory_mib.value == "16384"
+        assert shell.trace.wall_seconds.value == "300"
+        assert shell.trace.memory_mib.value == "16384"
 
 
 def test_selecting_traced_node_builds_views_and_opens_large_overlay(
@@ -116,10 +122,10 @@ def test_selecting_traced_node_builds_views_and_opens_large_overlay(
         cast(Any, page).run_thread = callbacks.append
 
         event = cast(ft.Event[ft.Button], cast(Any, SimpleNamespace()))
-        shell._on_run_trace(event)
+        shell.trace.run(event)
         callbacks.pop(0)()
         callbacks.pop(0)()
-        assert shell.active_trace_id is not None
+        assert shell.trace.active_trace_id is not None
 
         node_id = session.document.main_graph.nodes[0].id
         shell.current_detail = shell.current_detail.OPERATOR
@@ -199,7 +205,7 @@ def test_graph_first_tensor_picker_and_click_to_inspect_every_value(
         shell, page = make_shell(service)
         session = service.open_model(path)
         shell.show_session(session)
-        presentation = shell._trace_graph_presentation
+        presentation = shell.trace.presentation
         assert presentation is not None
         graph = session.document.main_graph
         input_id = next(
@@ -208,7 +214,7 @@ def test_graph_first_tensor_picker_and_click_to_inspect_every_value(
         input_glyph = presentation.input_glyphs[input_id]
         assert any(
             control.data == f"trace-input-action:{input_id}"
-            for control in shell.graph_trace_actions.controls
+            for control in shell.trace.graph_actions.controls
         )
 
         async def pick_tensor(
@@ -220,13 +226,13 @@ def test_graph_first_tensor_picker_and_click_to_inspect_every_value(
 
         monkeypatch.setattr(ft.FilePicker, "pick_files", pick_tensor)
         event = cast(Any, SimpleNamespace())
-        asyncio.run(shell._choose_trace_tensor_handler(input_id)(event))
-        assert shell._trace_input_bindings["input"].tensor_file == str(
+        asyncio.run(shell.trace.choose_tensor_handler(input_id)(event))
+        assert shell.trace.input_bindings["input"].tensor_file == str(
             tensor_path.resolve()
         )
-        shell._reset_trace_tensor_handler("input", input_glyph)(event)
-        assert "input" not in shell._trace_input_bindings
-        asyncio.run(shell._choose_trace_tensor_handler(input_id)(event))
+        shell.trace.reset_tensor_handler("input", input_glyph)(event)
+        assert "input" not in shell.trace.input_bindings
+        asyncio.run(shell.trace.choose_tensor_handler(input_id)(event))
 
         shell.renderer.set_selection(frozenset({input_glyph}))
         shell._on_selected(frozenset({input_glyph}))
@@ -245,16 +251,16 @@ def test_graph_first_tensor_picker_and_click_to_inspect_every_value(
 
         callbacks: list[Any] = []
         cast(Any, page).run_thread = callbacks.append
-        shell._on_run_trace(cast(ft.Event[ft.Button], event))
+        shell.trace.run(cast(ft.Event[ft.Button], event))
         callbacks.pop(0)()
         callbacks.pop(0)()
-        assert shell.active_trace_id is not None
-        captured = session.activations(shell.active_trace_id).read(input_id)
+        assert shell.trace.active_trace_id is not None
+        captured = session.activations(shell.trace.active_trace_id).read(input_id)
         np.testing.assert_array_equal(
             np.frombuffer(captured, dtype=np.float32),
             expected,
         )
-        block_rows = shell._group_activation_rows(
+        block_rows = shell.activations.group_activation_rows(
             frozenset(node.id for node in graph.nodes),
             owner_id="whole-model",
         )
@@ -264,7 +270,7 @@ def test_graph_first_tensor_picker_and_click_to_inspect_every_value(
             for control in block_rows
         )
 
-        presentation = shell._trace_graph_presentation
+        presentation = shell.trace.presentation
         assert presentation is not None
         connection, connection_value = next(
             (glyph_id, value_ids[0])
@@ -304,10 +310,10 @@ def test_required_mask_is_automatic_after_selecting_an_image(tmp_path: Path) -> 
         shell, page = make_shell(service)
         session = service.open_model(model)
         shell.show_session(session)
-        shell._trace_input_bindings["pixel_values"] = session.trace_tensor_input(
+        shell.trace.input_bindings["pixel_values"] = session.trace_tensor_input(
             "pixel_values", image
         )
-        shell._refresh_graph_trace_actions()
+        shell.trace.refresh_graph_actions()
 
         graph = session.document.main_graph
         mask_id = next(
@@ -317,7 +323,7 @@ def test_required_mask_is_automatic_after_selecting_an_image(tmp_path: Path) -> 
         )
         mask_action = next(
             control
-            for control in shell.graph_trace_actions.controls
+            for control in shell.trace.graph_actions.controls
             if control.data == f"trace-input-action:{mask_id}"
         )
         assert isinstance(mask_action, ft.Container)
@@ -327,12 +333,12 @@ def test_required_mask_is_automatic_after_selecting_an_image(tmp_path: Path) -> 
 
         callbacks: list[Any] = []
         cast(Any, page).run_thread = callbacks.append
-        shell._on_run_trace(cast(Any, SimpleNamespace()))
+        shell.trace.run(cast(Any, SimpleNamespace()))
         assert callbacks
         assert not shell.error_banner.visible
         callbacks.pop(0)()
         callbacks.pop(0)()
-        assert shell.active_trace_id is not None
+        assert shell.trace.active_trace_id is not None
 
 
 def test_generator_tab_saves_and_assigns_to_selected_graph_input(
@@ -374,10 +380,10 @@ def test_generator_tab_saves_and_assigns_to_selected_graph_input(
             np.load(destination, allow_pickle=False),
             np.arange(8, dtype=np.float32),
         )
-        binding = shell._trace_input_bindings["input"]
+        binding = shell.trace.input_bindings["input"]
         assert binding.tensor_file == str(destination.resolve())
         assert shell.workspace_tabs.selected_index == 0
-        presentation = shell._trace_graph_presentation
+        presentation = shell.trace.presentation
         assert presentation is not None
         input_id = session.document.main_graph.inputs[0]
         assert shell.renderer.selection == frozenset(
@@ -519,9 +525,13 @@ def test_generator_source_pickers_update_the_form(
 ) -> None:
     image = tmp_path / "image.png"
     csv = tmp_path / "series.csv"
+    vocabulary = tmp_path / "vocab.json"
+    merges = tmp_path / "merges.txt"
     responses = [
         [SimpleNamespace(path=str(image), name=image.name)],
         [SimpleNamespace(path=str(csv), name=csv.name)],
+        [SimpleNamespace(path=str(vocabulary), name=vocabulary.name)],
+        [SimpleNamespace(path=str(merges), name=merges.name)],
     ]
 
     async def pick_files(
@@ -538,10 +548,139 @@ def test_generator_source_pickers_update_the_form(
         event = cast(Any, SimpleNamespace())
         asyncio.run(generator._on_choose_image(event))
         asyncio.run(generator._on_choose_csv(event))
+        asyncio.run(generator._on_choose_vocabulary(event))
+        asyncio.run(generator._on_choose_merges(event))
 
         assert generator.image_path.value == str(image)
         assert generator.csv_path.value == str(csv)
-        assert generator.status.value == f"Selected {csv.name}"
+        assert generator.token_vocabulary_path.value == str(vocabulary)
+        assert generator.token_merges_path.value == str(merges)
+        assert generator.status.value == f"Selected {merges.name}"
+
+
+def test_generator_offers_every_tokenizer_choice_with_its_note_and_files() -> None:
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        generator = shell.input_generator
+
+        assert [str(option.key) for option in generator.token_codebook.options] == [
+            choice.id for choice in TOKENIZER_CHOICES
+        ]
+        assert [str(option.text) for option in generator.token_codebook.options] == [
+            choice.label for choice in TOKENIZER_CHOICES
+        ]
+
+        for choice in TOKENIZER_CHOICES:
+            generator.token_codebook.value = choice.id
+            generator._on_codebook_changed(cast(Any, SimpleNamespace()))
+            assert generator.token_note.value == choice.note
+            assert generator.token_vocabulary_row.visible is choice.needs_vocabulary
+            assert generator.token_merges_row.visible is choice.needs_merges
+            # A file-backed vocabulary dictates the size, so the field is only
+            # editable for the self-contained codebooks.
+            assert generator.token_vocab_size.disabled is choice.needs_files
+
+        generator.token_codebook.value = "tokenizer-json"
+        generator._on_codebook_changed(None)
+        assert generator.token_vocabulary_path.label == "Vocabulary (tokenizer.json)"
+        assert not generator.token_merges_row.visible
+        assert page.updates
+
+
+def test_generator_text_tokens_save_and_assign_to_a_token_id_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "language-model.onnx"
+    destination = tmp_path / "tokens.npy"
+    build_token_ids_model(model, length=8)
+
+    async def save_file(
+        picker: ft.FilePicker,
+        **kwargs: object,
+    ) -> str:
+        assert kwargs["file_name"] == "tokens.npy"
+        return str(destination)
+
+    monkeypatch.setattr(ft.FilePicker, "save_file", save_file)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        shell.show_session(service.open_model(model))
+        generator = shell.input_generator
+
+        # A rank-2 integer input is a token-id batch, so the form opens there.
+        assert generator.kind.value == "text-tokens"
+        assert generator.token_section.visible
+        assert not generator.image_section.visible
+        assert generator.token_sequence_length.value == "8"
+        assert generator.token_dtype.value == "int64"
+
+        generator.token_codebook.value = "word-hash"
+        generator._on_codebook_changed(None)
+        generator.token_vocab_size.value = "512"
+        generator.token_text.value = "hello token world"
+        generator.token_bos_id.value = "1"
+
+        asyncio.run(generator._on_generate_and_assign(cast(Any, SimpleNamespace())))
+
+        saved = np.load(destination, allow_pickle=False)
+        expected = (1, *WordHashCodebook(vocab_size=512).encode("hello token world"))
+        assert saved.dtype == np.dtype("int64")
+        assert saved.shape == (1, 8)
+        np.testing.assert_array_equal(saved[0, : len(expected)], np.asarray(expected))
+        np.testing.assert_array_equal(
+            saved[0, len(expected) :],
+            np.zeros(8 - len(expected), dtype=np.int64),
+        )
+        assert shell.trace.input_bindings["input_ids"].tensor_file == str(
+            destination.resolve()
+        )
+        assert "Saved and assigned" in str(generator.status.value)
+        # The fidelity disclosure travels with the tensor, undiluted.
+        assert "not the model's own ids" in str(generator.summary.value)
+
+
+def test_generator_text_tokens_refuse_missing_vocabulary_and_merge_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "tokens.npy"
+    vocabulary = tmp_path / "vocab.json"
+    merges = tmp_path / "merges.txt"
+
+    async def save_file(
+        picker: ft.FilePicker,
+        **kwargs: object,
+    ) -> str:
+        return str(destination)
+
+    monkeypatch.setattr(ft.FilePicker, "save_file", save_file)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        generator = shell.input_generator
+        banner = cast(ft.Text, shell.error_banner.content)
+        generator.kind.value = "text-tokens"
+        generator._on_kind_changed(None)
+        generator.token_codebook.value = "gpt2-bpe"
+        generator._on_codebook_changed(None)
+        generator.token_text.value = "hello"
+
+        asyncio.run(generator.generate(assign=False))
+        assert "choose a vocabulary file" in str(banner.value)
+        assert not destination.exists()
+
+        generator.token_vocabulary_path.value = str(vocabulary)
+        asyncio.run(generator.generate(assign=False))
+        assert "choose a merges file" in str(banner.value)
+        assert not destination.exists()
+
+        # Both slots filled, so the loader runs and reports its own refusal.
+        vocabulary.write_text("not json", encoding="utf-8")
+        merges.write_text("#version: 0.2\n", encoding="utf-8")
+        generator.token_merges_path.value = str(merges)
+        asyncio.run(generator.generate(assign=False))
+        assert "not valid JSON" in str(banner.value)
+        assert not destination.exists()
 
 
 def test_generator_reports_validation_and_assignment_errors(
@@ -620,19 +759,19 @@ def test_trace_shell_invalid_limits_and_web_unavailable(tmp_path: Path) -> None:
     with ApplicationService() as service:
         shell, page = make_shell(service)
         shell.show_session(service.open_model(path))
-        shell.trace_capture_mib.value = "0"
+        shell.trace.capture_mib.value = "0"
         event = cast(ft.Event[ft.Button], cast(Any, SimpleNamespace()))
-        shell._on_run_trace(event)
+        shell.trace.run(event)
         assert "configuration is invalid" in str(
             cast(ft.Text, shell.error_banner.content).value
         )
-        assert not shell.trace_progress.visible
-        assert not shell.run_trace_button.disabled
+        assert not shell.trace.progress.visible
+        assert not shell.trace.run_button.disabled
 
         page.web = True  # type: ignore[attr-defined]
-        shell._refresh_trace_actions()
-        assert shell.run_trace_button.disabled
-        assert "Phase 8" in str(shell.trace_status.value)
+        shell.trace.refresh_actions()
+        assert shell.trace.run_button.disabled
+        assert "Phase 8" in str(shell.trace.status.value)
 
 
 def test_trace_shell_discloses_partial_capture(tmp_path: Path) -> None:
@@ -662,9 +801,9 @@ def test_trace_shell_discloses_partial_capture(tmp_path: Path) -> None:
             )
         ).result(timeout=20)
         assert result.partial
-        shell.active_trace_id = result.id
-        shell._refresh_trace_actions()
-        assert "Partial trace" in str(shell.trace_status.value)
+        shell.trace.active_trace_id = result.id
+        shell.trace.refresh_actions()
+        assert "Partial trace" in str(shell.trace.status.value)
 
 
 def test_activation_plot_adapter_consumes_headless_view_models() -> None:
@@ -702,7 +841,8 @@ def test_activation_plot_adapter_consumes_headless_view_models() -> None:
     )
 
     controls = [
-        cast(ft.Container, Shell._activation_plot_control(view)) for view in views
+        cast(ft.Container, build_activation_plot(view, palette=SHELL_PALETTE))
+        for view in views
     ]
 
     assert {control.data for control in controls} == {
@@ -723,7 +863,7 @@ def test_activation_plot_adapter_consumes_headless_view_models() -> None:
     heatmap = next(view for view in views if view.kind.value == "heatmap")
     large_heatmap = cast(
         ft.Container,
-        Shell._activation_plot_control(heatmap, width=780, height=420),
+        build_activation_plot(heatmap, palette=SHELL_PALETTE, width=780, height=420),
     )
     large_image = cast(ft.Image, large_heatmap.content)
     assert large_image.width == 420
@@ -753,7 +893,7 @@ def test_feature_plot_uses_exact_resolution_raster() -> None:
 
     control = cast(
         ft.Container,
-        Shell._activation_plot_control(feature, width=780, height=420),
+        build_activation_plot(feature, palette=SHELL_PALETTE, width=780, height=420),
     )
 
     assert isinstance(control.content, ft.Image)
@@ -785,7 +925,7 @@ def test_tensor_layer_viewer_rotates_and_brings_selected_plane_forward() -> None
     )
     control = cast(
         ft.Container,
-        Shell._activation_plot_control(stack, width=780, height=420),
+        build_activation_plot(stack, palette=SHELL_PALETTE, width=780, height=420),
     )
     controller = cast(Any, control).activation_layer_viewer
     initial_yaw = controller.yaw
