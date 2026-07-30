@@ -72,31 +72,158 @@ def _evaluate_prefix(
         model.graph.node.extend(trailing_nodes)
 
 
-def _evaluate(
+def _prefix_builds(
+    model: onnx.ModelProto,
+    all_nodes: list[onnx.NodeProto],
+    limit: int,
+) -> bool:
+    """Whether the runtime can build an evaluator over ``nodes[:limit + 1]``.
+
+    The graph is restored before returning. Detaching nodes keeps the model's
+    initializers untouched, so probing never copies the weight payload.
+    """
+    model.graph.ClearField("node")
+    model.graph.node.extend(all_nodes[: limit + 1])
+    try:
+        ReferenceEvaluator(model)
+        return True
+    except Exception:
+        # Any build failure answers the question this probe asks.
+        return False
+    finally:
+        model.graph.ClearField("node")
+        model.graph.node.extend(all_nodes)
+
+
+def _buildable_frontier(model: onnx.ModelProto) -> int:
+    """Index of the first node the runtime cannot build an evaluator over.
+
+    Buildability is prefix-closed: if the runtime refuses node *j*, it refuses
+    every prefix containing *j*. That makes a binary search valid and costs
+    about log2(n) evaluator builds instead of one per captured value — ten
+    probes on a 587-node model instead of hundreds of futile attempts, each of
+    which would otherwise rebuild the whole evaluator before failing.
+
+    Returns ``len(nodes)`` when every prefix builds.
+    """
+    all_nodes = list(model.graph.node)
+    low, high = 0, len(all_nodes)
+    while low < high:
+        middle = (low + high) // 2
+        if _prefix_builds(model, all_nodes, middle):
+            low = middle + 1
+        else:
+            high = middle
+    return low
+
+
+class CaptureSource:
+    """Yields one captured value at a time so nothing accumulates.
+
+    Holding every capture until the run finishes makes peak memory grow with
+    the number of values requested, which is what exhausts the worker on a
+    graph with hundreds of them. Callers take a value, write it, and drop it,
+    so only one activation is live at a time beyond whatever the runtime
+    itself retains.
+    """
+
+    __slots__ = (
+        "_exhausted",
+        "_feeds",
+        "_frontier",
+        "_frontier_reason",
+        "_model",
+        "_producer_by_output",
+        "_whole",
+        "diagnostics",
+    )
+
+    def __init__(
+        self,
+        model: onnx.ModelProto,
+        feeds: dict[str, np.ndarray[Any, Any]],
+        whole: dict[str, np.ndarray[Any, Any]] | None,
+        diagnostics: list[str],
+        frontier: int,
+        frontier_reason: str | None,
+    ) -> None:
+        self._model = model
+        self._feeds = feeds
+        self._whole = whole
+        self._frontier = frontier
+        self._frontier_reason = frontier_reason
+        self._exhausted: str | None = None
+        self.diagnostics = diagnostics
+        self._producer_by_output = {
+            output: index
+            for index, node in enumerate(model.graph.node)
+            for output in node.output
+            if output
+        }
+
+    def take(
+        self, target: dict[str, object]
+    ) -> tuple[np.ndarray[Any, Any] | None, str | None]:
+        """Return this target's value, or the reason it has none."""
+        name = str(target["value_name"])
+        if name in self._feeds:
+            return self._feeds[name], None
+        if self._whole is not None:
+            # Pop rather than read: the caller writes it next, and dropping the
+            # reference here is what keeps the whole-model path from holding
+            # every activation at once.
+            captured = self._whole.pop(str(target["value_id"]), None)
+            if captured is None:
+                return None, "the reference runtime produced no value"
+            return captured, None
+        if self._exhausted is not None:
+            return None, self._exhausted
+        producer = self._producer_by_output.get(name)
+        if producer is None:
+            self.diagnostics.append(f"value {name!r} has no executable producer")
+            return None, "this value has no executable producer"
+        if producer >= self._frontier:
+            # Its prefix necessarily contains the node the runtime refuses, so
+            # attempting it would rebuild the evaluator only to fail again.
+            return None, self._frontier_reason
+        try:
+            return (
+                _evaluate_prefix(
+                    self._model, self._feeds, name, producer_limit=producer
+                ),
+                None,
+            )
+        except MemoryError as error:
+            self._exhausted = (
+                "per-value capture exhausted the approved memory limit; "
+                "raise the Memory limit, or capture fewer values"
+            )
+            self.diagnostics.append(
+                f"per-value capture ran out of memory: {error}; the remaining "
+                "values were not attempted. Raise the Memory limit or select "
+                "fewer values to capture."
+            )
+            return None, self._exhausted
+        except Exception as error:
+            reason = f"not captured: {type(error).__name__}: {error}"
+            self.diagnostics.append(f"value {name!r} was {reason}")
+            return None, reason
+
+
+def open_captures(
     model: onnx.ModelProto,
     feeds: dict[str, np.ndarray[Any, Any]],
     targets: list[dict[str, object]],
-) -> tuple[dict[str, np.ndarray[Any, Any]], list[str], dict[str, str]]:
-    """Capture requested values, reporting per-value failures explicitly.
-
-    The third element maps a value *name* to the reason that value alone could
-    not be captured. Attributing failures by matching diagnostic text would
-    mis-blame a value whose name merely appears inside an unrelated runtime
-    error message.
-    """
-    captures: dict[str, np.ndarray[Any, Any]] = {}
+) -> CaptureSource:
+    """Prepare capture, choosing whole-model evaluation when it is possible."""
     diagnostics: list[str] = []
-    failures: dict[str, str] = {}
     input_names = set(feeds)
     runtime_targets = [
         target for target in targets if str(target["value_name"]) not in input_names
     ]
-    for target in targets:
-        name = str(target["value_name"])
-        if name in feeds:
-            captures[str(target["value_id"])] = feeds[name]
     if not runtime_targets:
-        return captures, diagnostics, failures
+        return CaptureSource(model, feeds, {}, diagnostics, len(model.graph.node), None)
+
     names = [str(target["value_name"]) for target in runtime_targets]
     try:
         evaluator = ReferenceEvaluator(model)
@@ -106,98 +233,64 @@ def _evaluate(
             f"limit: {error}; increase the Memory limit and approve the trace "
             "again"
         )
-        return captures, diagnostics, failures
+        return CaptureSource(
+            model, feeds, {}, diagnostics, 0, "the runtime ran out of memory"
+        )
     except Exception as error:
-        # The evaluator could not be built over the whole model — an operator
-        # the runtime does not implement, say. Values upstream of it can still
-        # be captured, so fall through to the per-value prefix pass, which
-        # truncates the model and may well build.
         diagnostics.append(
             "the reference runtime cannot execute the whole model: "
             f"{type(error).__name__}: {error}; capturing per value instead"
         )
-        return _evaluate_by_prefix(
-            model, feeds, runtime_targets, captures, diagnostics, failures
-        )
+        return _prefix_source(model, feeds, diagnostics)
     try:
         values = evaluator.run(names, feeds)
-        for target, value in zip(runtime_targets, values, strict=True):
-            captures[str(target["value_id"])] = np.asarray(value)
-        return captures, diagnostics, failures
     except MemoryError as error:
         diagnostics.append(
             "full trace exhausted the approved memory limit during evaluation: "
             f"{error}; increase the Memory limit and approve the trace again"
         )
-        return captures, diagnostics, failures
+        return CaptureSource(
+            model, feeds, {}, diagnostics, 0, "the runtime ran out of memory"
+        )
     except Exception as error:
         diagnostics.append(
             "full trace degraded to per-value prefix evaluation: "
             f"{type(error).__name__}: {error}"
         )
-    return _evaluate_by_prefix(
-        model, feeds, runtime_targets, captures, diagnostics, failures
-    )
+        return _prefix_source(model, feeds, diagnostics)
+    whole = {
+        str(target["value_id"]): np.asarray(value)
+        for target, value in zip(runtime_targets, values, strict=True)
+    }
+    return CaptureSource(model, feeds, whole, diagnostics, len(model.graph.node), None)
 
 
-def _evaluate_by_prefix(
+def _prefix_source(
     model: onnx.ModelProto,
     feeds: dict[str, np.ndarray[Any, Any]],
-    runtime_targets: list[dict[str, object]],
-    captures: dict[str, np.ndarray[Any, Any]],
     diagnostics: list[str],
-    failures: dict[str, str],
-) -> tuple[dict[str, np.ndarray[Any, Any]], list[str], dict[str, str]]:
-    """Capture each value from a truncated model when the whole one will not run.
+) -> CaptureSource:
+    """Set up per-value capture, first locating what the runtime cannot build.
 
-    Every value costs its own evaluator over the model up to its producer, so
-    this pass is expensive by construction. Once memory runs out it cannot
-    recover — each remaining value would rebuild an evaluator that is at least
-    as large — so the pass stops at the first :class:`MemoryError` rather than
-    reporting one per value and burying the reason the model could not run.
+    Finding the frontier costs about log2(n) evaluator builds and spares every
+    value beyond it a rebuild that is guaranteed to fail — the difference
+    between ten probes and hundreds of futile evaluations on a large graph.
     """
-    producer_by_output = {
-        output: index
-        for index, node in enumerate(model.graph.node)
-        for output in node.output
-        if output
-    }
-    exhausted: str | None = None
-    for position, target in enumerate(runtime_targets):
-        name = str(target["value_name"])
-        if exhausted is not None:
-            failures[name] = exhausted
-            continue
-        producer = producer_by_output.get(name)
-        if producer is None:
-            reason = "this value has no executable producer"
-            diagnostics.append(f"value {name!r} has no executable producer")
-            failures[name] = reason
-            continue
-        try:
-            captures[str(target["value_id"])] = _evaluate_prefix(
-                model,
-                feeds,
-                name,
-                producer_limit=producer,
-            )
-        except MemoryError as error:
-            exhausted = (
-                "per-value capture exhausted the approved memory limit; "
-                "raise the Memory limit, or narrow the trace to fewer values"
-            )
-            diagnostics.append(
-                f"per-value capture ran out of memory after {position} of "
-                f"{len(runtime_targets)} value(s): {error}; the remaining "
-                "values were not attempted. Raise the Memory limit or select "
-                "fewer values to capture."
-            )
-            failures[name] = exhausted
-        except Exception as error:
-            reason = f"not captured: {type(error).__name__}: {error}"
-            diagnostics.append(f"value {name!r} was {reason}")
-            failures[name] = reason
-    return captures, diagnostics, failures
+    frontier = _buildable_frontier(model)
+    reason: str | None = None
+    if frontier < len(model.graph.node):
+        blocking = model.graph.node[frontier]
+        label = blocking.name or f"index {frontier}"
+        reason = (
+            f"unavailable: the reference runtime cannot build {blocking.op_type} "
+            f"({label}), which this value depends on"
+        )
+        diagnostics.append(
+            f"the reference runtime cannot build {blocking.op_type} at node "
+            f"index {frontier} of {len(model.graph.node)}; values produced at "
+            "or after it were reported unavailable without being attempted"
+        )
+    return CaptureSource(model, feeds, None, diagnostics, frontier, reason)
 
 
 def _write_capture(
@@ -307,7 +400,8 @@ def run(request_path: Path) -> None:
             "the Memory limit and approve the trace again"
         ) from error
     targets = [dict(item) for item in raw["targets"] if isinstance(item, dict)]
-    captures, diagnostics, failures = _evaluate(model, feeds, targets)
+    source = open_captures(model, feeds, targets)
+    diagnostics = source.diagnostics
     output = Path(str(raw["output"]))
     remaining = int(raw["capture_bytes"])
     chunk_bytes = int(raw["chunk_bytes"])
@@ -326,9 +420,10 @@ def run(request_path: Path) -> None:
     for phase in (prioritized, ordinary):
         for offset, index in enumerate(phase):
             target = targets[index]
-            value_id = str(target["value_id"])
-            capture = captures.get(value_id)
-            failure = failures.get(str(target["value_name"]))
+            # Produce this value only now, and drop it once written, so peak
+            # memory tracks the largest single activation rather than the sum
+            # of every value the trace was asked to capture.
+            capture, failure = source.take(target)
             # Reserve an equal share for each remaining value in this phase.
             # Small tensors return their unused share to the pool, while large
             # tensors keep a useful prefix rather than starving later nodes.
@@ -347,6 +442,9 @@ def run(request_path: Path) -> None:
             )
             remaining -= budget - unused_budget
             records_by_index[index] = record
+            # The bytes are on disk now; releasing here is what bounds peak
+            # memory to one activation rather than the whole trace.
+            capture = None
     records = [records_by_index[index] for index in range(len(targets))]
     response = {
         "runtime": f"onnx.reference {onnx.__version__}",
