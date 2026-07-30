@@ -611,7 +611,7 @@ class ModelSession:
         token: CancellationToken,
     ) -> TraceComparison:
         token.raise_if_cancelled()
-        result = compare_traces(store, left, right)
+        result = compare_traces(store, left, right, token=token)
         token.raise_if_cancelled()
         return result
 

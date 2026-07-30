@@ -179,7 +179,7 @@ def test_worker_unsupported_operator_returns_inputs_and_diagnostics(
     build_custom_domain_model(path)
     model = onnx.load_model(path)
     feed = np.arange(4, dtype=np.float32)
-    captures, diagnostics = trace_worker._evaluate(
+    captures, diagnostics, _failures = trace_worker._evaluate(
         model,
         {"input": feed},
         [
@@ -229,7 +229,7 @@ def test_worker_prefix_fallback_restores_model_without_copying_weights() -> None
     )
     before = model.SerializeToString()
 
-    captures, diagnostics = trace_worker._evaluate(
+    captures, diagnostics, _failures = trace_worker._evaluate(
         model,
         {"input": np.arange(4, dtype=np.float32)},
         [
@@ -269,7 +269,7 @@ def test_worker_memory_exhaustion_does_not_retry_every_value(
             raise MemoryError("allocation failed")
 
     monkeypatch.setattr(trace_worker, "ReferenceEvaluator", ExhaustedEvaluator)
-    captures, diagnostics = trace_worker._evaluate(
+    captures, diagnostics, _failures = trace_worker._evaluate(
         model,
         {"input": np.arange(4, dtype=np.float32)},
         [
@@ -300,3 +300,34 @@ def test_worker_rejects_bad_requests_and_direct_launch(
     monkeypatch.setattr(sys, "argv", ["trace_worker"])
     with pytest.raises(SystemExit, match="usage"):
         trace_worker.main()
+
+
+def test_evaluate_attributes_failures_to_the_value_that_failed(
+    tmp_path: Path,
+) -> None:
+    """A real value must not inherit a diagnostic that merely mentions it.
+
+    Failures used to be matched by searching diagnostic text for the value's
+    repr, so the generic "full trace degraded" message — which embeds the
+    runtime's own error text — could be blamed on an unrelated value.
+    """
+    model_path = tmp_path / "model.onnx"
+    build_embedded_model(model_path, elements=4)
+    model = onnx.load(model_path)
+    feeds = {"input": np.arange(4, dtype=np.float32)}
+
+    captures, diagnostics, failures = trace_worker._evaluate(
+        model,
+        feeds,
+        [
+            _target("ghost-id", "ghost"),
+            _target("scaled-id", "scaled"),
+        ],
+    )
+
+    # Requesting a value no node produces degrades the whole run to the
+    # per-value fallback, whose generic diagnostic names 'ghost'.
+    assert any("degraded" in diagnostic for diagnostic in diagnostics)
+    assert "ghost" in failures
+    assert "scaled" not in failures
+    assert "scaled-id" in captures

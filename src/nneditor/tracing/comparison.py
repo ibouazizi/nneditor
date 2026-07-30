@@ -9,6 +9,7 @@ from typing import Protocol
 
 import numpy as np
 
+from nneditor.cancellation import CancellationToken
 from nneditor.rendering.scene import Scene, ScenePatch
 from nneditor.tracing.contracts import TraceResult
 from nneditor.tracing.store import ActivationStore
@@ -66,20 +67,112 @@ class TraceComparison:
         raise KeyError(node_id)
 
 
-def _array(store: ActivationStore, result: TraceResult, value_id: str) -> np.ndarray:
-    record = result.record(value_id)
-    return np.frombuffer(
-        store.read(result.id, value_id),
-        dtype=np.dtype(record.numpy_dtype),
-    ).astype(np.float64)
+# Bounds the working set per value to roughly 64Ki elements per side (about
+# 1 MiB of float64 each) instead of materializing whole payloads, so comparing
+# two traces of a large model stays within a predictable memory ceiling.
+_CHUNK_ELEMENTS = 1 << 16
+
+
+@dataclass(slots=True)
+class _Accumulator:
+    """Running comparison state over the common captured element prefix."""
+
+    max_absolute: float = 0.0
+    max_relative: float = 0.0
+    dot: float = 0.0
+    left_square: float = 0.0
+    right_square: float = 0.0
+    nonfinite_pairs: bool = False
+    nonfinite_mismatch: bool = False
+
+
+def _accumulate(
+    accumulator: _Accumulator,
+    left_values: np.ndarray,
+    right_values: np.ndarray,
+) -> None:
+    finite = np.isfinite(left_values) & np.isfinite(right_values)
+    nonfinite_equal = (~finite) & (
+        (np.isnan(left_values) & np.isnan(right_values)) | (left_values == right_values)
+    )
+    if bool(np.any(~finite)):
+        accumulator.nonfinite_pairs = True
+    if bool(np.any((~finite) & ~nonfinite_equal)):
+        accumulator.nonfinite_mismatch = True
+    finite_left = left_values[finite]
+    finite_right = right_values[finite]
+    if not finite_left.size:
+        return
+    difference = np.abs(finite_left - finite_right)
+    denominator = np.maximum(np.abs(finite_left), np.finfo(np.float64).eps)
+    accumulator.max_absolute = max(accumulator.max_absolute, float(np.max(difference)))
+    accumulator.max_relative = max(
+        accumulator.max_relative, float(np.max(difference / denominator))
+    )
+    accumulator.dot += float(np.dot(finite_left, finite_right))
+    accumulator.left_square += float(np.dot(finite_left, finite_left))
+    accumulator.right_square += float(np.dot(finite_right, finite_right))
+
+
+def _stream_comparison(
+    store: ActivationStore,
+    left: TraceResult,
+    right: TraceResult,
+    value_id: str,
+    count: int,
+    left_width: int,
+    right_width: int,
+    token: CancellationToken | None,
+) -> _Accumulator:
+    accumulator = _Accumulator()
+    left_dtype = np.dtype(left.record(value_id).numpy_dtype)
+    right_dtype = np.dtype(right.record(value_id).numpy_dtype)
+    for start in range(0, count, _CHUNK_ELEMENTS):
+        if token is not None:
+            token.raise_if_cancelled()
+        elements = min(_CHUNK_ELEMENTS, count - start)
+        left_values = np.frombuffer(
+            store.read(
+                left.id,
+                value_id,
+                offset=start * left_width,
+                length=elements * left_width,
+                token=token,
+            ),
+            dtype=left_dtype,
+        ).astype(np.float64)
+        right_values = np.frombuffer(
+            store.read(
+                right.id,
+                value_id,
+                offset=start * right_width,
+                length=elements * right_width,
+                token=token,
+            ),
+            dtype=right_dtype,
+        ).astype(np.float64)
+        _accumulate(accumulator, left_values, right_values)
+    return accumulator
 
 
 def compare_traces(
     store: ActivationStore,
     left: TraceResult,
     right: TraceResult,
+    *,
+    token: CancellationToken | None = None,
 ) -> TraceComparison:
-    """Compare readable common captures from the exact same input spec."""
+    """Compare readable common captures from the exact same input spec.
+
+    Captures stream in bounded chunks and the token is honoured between every
+    chunk, so comparing large traces neither materializes whole payloads nor
+    becomes uninterruptible.
+
+    `max_relative` divides by ``max(|left|, float64 eps)`` — a pure
+    element-wise relative error. The export smoke comparison in
+    `adapters.onnx.numerical` floors the same ratio by its numerical tolerance
+    instead, so the two metrics deliberately differ near zero.
+    """
     if left.key.artifact_hash != right.key.artifact_hash:
         raise ValueError("trace comparison requires the same source artifact")
     if left.key.input_specification_hash != right.key.input_specification_hash:
@@ -90,64 +183,61 @@ def compare_traces(
     diagnostics: list[str] = []
     metrics: list[ActivationError] = []
     for value_id in common:
+        if token is not None:
+            token.raise_if_cancelled()
         left_record = left_records[value_id]
         right_record = right_records[value_id]
         if not left_record.readable or not right_record.readable:
             diagnostics.append(f"value {value_id!r} is not readable in both traces")
             continue
-        left_values = _array(store, left, value_id)
-        right_values = _array(store, right, value_id)
-        count = min(left_values.size, right_values.size)
+        left_width = np.dtype(left_record.numpy_dtype).itemsize
+        right_width = np.dtype(right_record.numpy_dtype).itemsize
+        left_size = left_record.stored_byte_length // left_width
+        right_size = right_record.stored_byte_length // right_width
+        count = min(left_size, right_size)
         if count == 0:
             diagnostics.append(f"value {value_id!r} has no captured elements")
             continue
         partial = (
             left.partial
             or right.partial
-            or left_values.size != right_values.size
+            or left_size != right_size
             or left_record.shape != right_record.shape
         )
-        if left_values.size != right_values.size:
+        if left_size != right_size:
             diagnostics.append(
                 f"value {value_id!r} compares only the common captured prefix"
             )
-        left_values = left_values[:count]
-        right_values = right_values[:count]
-        finite = np.isfinite(left_values) & np.isfinite(right_values)
-        nonfinite_equal = (~finite) & (
-            (np.isnan(left_values) & np.isnan(right_values))
-            | (left_values == right_values)
+        accumulator = _stream_comparison(
+            store,
+            left,
+            right,
+            value_id,
+            count,
+            left_width,
+            right_width,
+            token,
         )
-        nonfinite_mismatch = (~finite) & ~nonfinite_equal
-        finite_left = left_values[finite]
-        finite_right = right_values[finite]
-        difference = np.abs(finite_left - finite_right)
-        denominator = np.maximum(np.abs(finite_left), np.finfo(np.float64).eps)
-        maximum_absolute = float(np.max(difference)) if difference.size else 0.0
-        maximum_relative = (
-            float(np.max(difference / denominator)) if difference.size else 0.0
-        )
-        if np.any(nonfinite_mismatch):
+        maximum_absolute = accumulator.max_absolute
+        maximum_relative = accumulator.max_relative
+        if accumulator.nonfinite_mismatch:
             maximum_absolute = math.inf
             maximum_relative = math.inf
-        if np.any(~finite):
+        if accumulator.nonfinite_pairs:
             partial = True
             diagnostics.append(
                 f"value {value_id!r} contains non-finite pairs; finite pairs "
                 "were used for cosine and mismatched non-finite values count "
                 "as infinite error"
             )
-        left_norm = float(np.linalg.norm(finite_left))
-        right_norm = float(np.linalg.norm(finite_right))
+        left_norm = math.sqrt(accumulator.left_square)
+        right_norm = math.sqrt(accumulator.right_square)
         cosine = (
             None
             if left_norm == 0.0 or right_norm == 0.0
             else max(
                 -1.0,
-                min(
-                    1.0,
-                    float(np.dot(finite_left, finite_right) / (left_norm * right_norm)),
-                ),
+                min(1.0, accumulator.dot / (left_norm * right_norm)),
             )
         )
         metrics.append(

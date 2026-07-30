@@ -271,8 +271,15 @@ class ActivationStore:
             previous = self._available.pop(result.id, 0)
             self._current -= previous
             self._results[result.id] = result
+            # Charge every readable record the committed result actually keeps,
+            # not just this run's records: a narrowed rerun copies retained
+            # earlier captures into the new trace directory, so counting only
+            # `records` leaves those bytes on disk but outside the budget, and
+            # a later reload (which recomputes from the manifest) disagrees.
             cost = sum(
-                record.stored_byte_length for record in records if record.readable
+                record.stored_byte_length
+                for record in result.records
+                if record.readable
             )
             if cost:
                 self._available[result.id] = cost

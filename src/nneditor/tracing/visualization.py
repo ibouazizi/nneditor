@@ -271,6 +271,7 @@ def _tensor_layer_view(
     array: np.ndarray,
     *,
     maximum_layers: int,
+    maximum_extent: int,
 ) -> ActivationVisualization | None:
     if array.ndim < 2 or array.ndim > 4:
         return None
@@ -278,6 +279,7 @@ def _tensor_layer_view(
     maps = np.asarray(array).reshape((-1, *array.shape[-2:]))
     indices = _sample_axis(maps.shape[0], maximum_layers)
     selected = maps[indices]
+    selected, sampled_from = _bound_spatial(selected, maximum_extent)
     labels: list[str] = []
     for index in indices:
         coordinates = (
@@ -296,10 +298,18 @@ def _tensor_layer_view(
         colormap="viridis (sequential), shared across layers",
         normalization="global finite-value min-max across displayed layers",
         downsampling=(
-            f"deterministic evenly-spaced selection of {len(indices)} from "
-            f"{maps.shape[0]} layers; exact {rows}x{columns} spatial axes"
-            if reduced
-            else f"all {maps.shape[0]} layers; exact {rows}x{columns} spatial axes"
+            (
+                f"deterministic evenly-spaced selection of {len(indices)} from "
+                f"{maps.shape[0]} layers; "
+                if reduced
+                else f"all {maps.shape[0]} layers; "
+            )
+            + (
+                f"exact {rows}x{columns} spatial axes"
+                if sampled_from is None
+                else f"spatial axes deterministically sampled to {rows}x{columns} "
+                f"from {sampled_from[0]}x{sampled_from[1]}"
+            )
         ),
         partial=False,
         layer_pngs=_layer_pngs(selected),
@@ -368,14 +378,38 @@ def _sample_axis(length: int, maximum: int) -> np.ndarray:
     return np.linspace(0, length - 1, maximum, dtype=np.int64)
 
 
+def _bound_spatial(
+    maps: np.ndarray,
+    maximum: int,
+) -> tuple[np.ndarray, tuple[int, int] | None]:
+    """Deterministically sample the trailing two axes down to `maximum`.
+
+    Rasterizing a large matrix at full resolution costs one uint8 RGB pixel
+    per element, so an unbounded attention map would build a raster (and PNG)
+    hundreds of times larger than the panel can show, inside a job thread.
+    Returns the array unchanged with `None` when both axes already fit, and
+    otherwise the sampled array plus the original extent so callers disclose
+    that the view is a sample rather than the exact tensor.
+    """
+    rows, columns = (int(item) for item in maps.shape[-2:])
+    if rows <= maximum and columns <= maximum:
+        return maps, None
+    row_indices = _sample_axis(rows, maximum)
+    column_indices = _sample_axis(columns, maximum)
+    sampled = maps[..., row_indices[:, None], column_indices[None, :]]
+    return sampled, (rows, columns)
+
+
 def _matrix_view(
     matrix: np.ndarray,
     *,
     kind: PlotKind,
     source_shape: tuple[int, ...],
     partial: bool,
+    maximum_extent: int,
     leading_selection: str = "",
 ) -> ActivationVisualization:
+    matrix, sampled_from = _bound_spatial(matrix, maximum_extent)
     raster_png, raster_size = _feature_map_raster(matrix.reshape((1, *matrix.shape)))
     rows, columns = matrix.shape[-2:]
     return ActivationVisualization(
@@ -389,7 +423,13 @@ def _matrix_view(
         colormap="viridis (sequential)",
         normalization="global finite-value min-max; non-finite values are masked",
         downsampling=(
-            leading_selection + f"spatial axes preserved at exact {rows}x{columns}"
+            leading_selection
+            + (
+                f"spatial axes preserved at exact {rows}x{columns}"
+                if sampled_from is None
+                else "spatial axes deterministically sampled to "
+                f"{rows}x{columns} from {sampled_from[0]}x{sampled_from[1]}"
+            )
         ),
         partial=partial,
         raster_png=raster_png,
@@ -403,7 +443,13 @@ def build_activation_visualizations(
     *,
     attention: bool = False,
     max_points: int = 256,
-    max_map_extent: int = 32,
+    # Caps the trailing two axes of every rasterized summary view. 512 keeps
+    # ordinary activations exact while bounding a rasterized view to roughly
+    # 512x512 pixels, so a large attention matrix cannot build a raster (and
+    # PNG) orders of magnitude bigger than the panel can display. The
+    # reconstructed RGB image view is deliberately exempt: it is a faithful
+    # image rather than a summary, and sampling it would defeat its purpose.
+    max_map_extent: int = 512,
     max_feature_maps: int = 16,
 ) -> tuple[ActivationVisualization, ...]:
     """Build deterministic line, histogram, heatmap, and feature-map views."""
@@ -460,6 +506,7 @@ def build_activation_visualizations(
         record,
         array,
         maximum_layers=max_feature_maps,
+        maximum_extent=max_map_extent,
     )
     if layer_view is not None:
         views.insert(0, layer_view)
@@ -495,6 +542,7 @@ def build_activation_visualizations(
                 kind=PlotKind.ATTENTION_MAP,
                 source_shape=source_shape,
                 partial=partial,
+                maximum_extent=max_map_extent,
                 leading_selection=(
                     "first leading-index matrix; " if array.ndim > 2 else ""
                 ),
@@ -507,6 +555,7 @@ def build_activation_visualizations(
                 kind=PlotKind.HEATMAP,
                 source_shape=source_shape,
                 partial=partial,
+                maximum_extent=max_map_extent,
             )
         )
     else:
@@ -519,8 +568,15 @@ def build_activation_visualizations(
         map_indices = _sample_axis(maps.shape[0], max_feature_maps)
         sampled = maps[map_indices]
         reduced = len(map_indices) != maps.shape[0]
+        sampled, sampled_from = _bound_spatial(sampled, max_map_extent)
         raster_png, raster_size = _feature_map_raster(sampled)
         rows, columns = sampled.shape[-2:]
+        spatial = (
+            f"spatial axes preserved at exact {rows}x{columns}"
+            if sampled_from is None
+            else f"spatial axes deterministically sampled to {rows}x{columns} "
+            f"from {sampled_from[0]}x{sampled_from[1]}"
+        )
         views.append(
             ActivationVisualization(
                 kind=PlotKind.FEATURE_MAP_GRID,
@@ -533,10 +589,9 @@ def build_activation_visualizations(
                 downsampling=(
                     leading_selection
                     + f"deterministic evenly-spaced maps to {max_feature_maps}; "
-                    f"spatial axes preserved at exact {rows}x{columns}"
+                    + spatial
                     if reduced
-                    else leading_selection
-                    + f"spatial axes preserved at exact {rows}x{columns}"
+                    else leading_selection + spatial
                 ),
                 partial=partial,
                 raster_png=raster_png,
