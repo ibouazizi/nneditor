@@ -12,7 +12,9 @@ from typing import Any, cast
 import flet as ft
 import flet.canvas as cv
 import numpy as np
+import onnx
 import pytest
+from onnx import TensorProto, helper
 from PIL import Image
 
 from nneditor.analysis.lod import DetailLevel
@@ -313,6 +315,122 @@ def test_graph_first_tensor_picker_and_click_to_inspect_every_value(
             isinstance(control, ft.ExpansionTile)
             and control.data == f"activation-card:{output_id}"
             for control in shell.inspector.controls
+        )
+
+
+def test_group_selection_shows_only_boundary_activations(tmp_path: Path) -> None:
+    """A selected block lists boundary captures only, inputs before outputs.
+
+    The model declares its initializers as graph inputs too (a common
+    exporter layout), so the trace captures the weight values; neither
+    those parameters nor the value flowing between the block's members may
+    surface under "Block inputs & outputs".
+    """
+    path = tmp_path / "legacy.onnx"
+    gain = helper.make_tensor(
+        "gain",
+        TensorProto.FLOAT,
+        [4],
+        np.full(4, 2.0, dtype=np.float32).tobytes(),
+        raw=True,
+    )
+    shift = helper.make_tensor(
+        "shift",
+        TensorProto.FLOAT,
+        [4],
+        np.full(4, 0.5, dtype=np.float32).tobytes(),
+        raw=True,
+    )
+    graph_proto = helper.make_graph(
+        nodes=[
+            helper.make_node("Mul", ["input", "gain"], ["hidden"], name="entry"),
+            helper.make_node("Mul", ["hidden", "gain"], ["folded"], name="inner"),
+            helper.make_node("Add", ["folded", "shift"], ["output"], name="exit"),
+        ],
+        name="legacy",
+        inputs=[
+            helper.make_tensor_value_info("input", TensorProto.FLOAT, [4]),
+            helper.make_tensor_value_info("gain", TensorProto.FLOAT, [4]),
+            helper.make_tensor_value_info("shift", TensorProto.FLOAT, [4]),
+        ],
+        outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, [4])],
+        initializer=[gain, shift],
+    )
+    onnx.save_model(
+        helper.make_model(graph_proto, opset_imports=[helper.make_opsetid("", 18)]),
+        path,
+    )
+
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+
+        event = cast(ft.Event[ft.Button], cast(Any, SimpleNamespace()))
+        callbacks: list[Any] = []
+        cast(Any, page).run_thread = callbacks.append
+        shell.trace.run(event)
+        while callbacks:
+            callbacks.pop(0)()
+        cast(Any, page).run_thread = lambda target: target()
+        assert shell.trace.active_trace_id is not None
+
+        graph = session.document.main_graph
+
+        def value_id(name: str) -> str:
+            return next(value.id for value in graph.values if value.name == name)
+
+        # The defect needs the internals on record: the trace must have
+        # captured the weight values and the between-members value, so their
+        # absence below proves filtering, not a narrow capture.
+        captured = {
+            record.value_id
+            for record in session.trace(shell.trace.active_trace_id).records
+        }
+        assert {value_id("gain"), value_id("shift"), value_id("folded")} <= captured
+
+        members = frozenset(
+            node.id for node in graph.nodes if node.source_name in {"inner", "exit"}
+        )
+        shell.renderer.set_selection(members)
+        shell._on_selected(members)
+        shell.group_label_field.value = "Boundary block"
+        shell._on_group_selected(cast(Any, None))
+        manual = next(
+            group for group in session.graph_hierarchy().groups if not group.automatic
+        )
+        assert manual.members == members
+
+        shell.renderer.set_selection(frozenset({manual.id}))
+        shell._on_selected(frozenset({manual.id}))
+        markers: list[tuple[str, str]] = []
+        for control in shell.inspector.controls:
+            if isinstance(control, ft.Row):
+                heading = next(
+                    (
+                        child.value
+                        for child in control.controls
+                        if isinstance(child, ft.Text)
+                    ),
+                    None,
+                )
+                if isinstance(heading, str):
+                    markers.append(("heading", heading))
+            elif isinstance(control, ft.ExpansionTile) and isinstance(
+                control.data, str
+            ):
+                markers.append(("card", control.data))
+
+        hidden_card = f"activation-card:{value_id('hidden')}"
+        output_card = f"activation-card:{value_id('output')}"
+        cards = [data for kind, data in markers if kind == "card"]
+        assert cards == [hidden_card, output_card]
+        assert (
+            markers.index(("heading", "Block inputs & outputs"))
+            < markers.index(("heading", "Inputs"))
+            < markers.index(("card", hidden_card))
+            < markers.index(("heading", "Outputs"))
+            < markers.index(("card", output_card))
         )
 
 
@@ -893,7 +1011,9 @@ def test_unticked_capture_scope_still_traces_every_value(
 
         assert not shell.trace.capture_selected_only.value
         assert shell.trace.capture_value_ids() == frozenset()
-        assert _approved_request(shell, page, monkeypatch).value_ids == frozenset()
+        request = _approved_request(shell, page, monkeypatch)
+        assert request.value_ids == frozenset()
+        assert request.capture_policy == "greedy"
 
 
 def test_trace_backend_is_visible_and_bound_into_approval(
@@ -954,7 +1074,10 @@ def test_ticked_capture_scope_narrows_the_request_to_selected_nodes(
         expected = frozenset(selected.outputs)
         assert expected
         assert shell.trace.capture_value_ids() == expected
-        assert _approved_request(shell, page, monkeypatch).value_ids == expected
+        request = _approved_request(shell, page, monkeypatch)
+        assert request.value_ids == expected
+        # A selected-nodes capture always spends its budget on whole values.
+        assert request.capture_policy == "greedy"
 
         # An empty selection narrows nothing, so the trace captures everything.
         shell.renderer.set_selection(frozenset())
@@ -1012,11 +1135,16 @@ def test_capture_scope_summary_tracks_the_box_and_the_selection(
         full = _estimate_text(session, frozenset(all_ids))
         # One model input plus one output per node, none of them unnamed; the
         # summary always states the scope and its estimated decoded bytes.
-        assert shell.trace.capture_scope.value == (f"Capturing all 3 values (~{full}).")
+        # "scaled" declares no shape, so the estimate is an honest lower
+        # bound over the values that do rather than a pretend total.
+        full_suffix = f"(≥{full}, 2 of 3 values declare shapes)."
+        assert shell.trace.capture_scope.value == (
+            f"Capturing all 3 values {full_suffix}"
+        )
 
         _tick_capture_scope(shell, True)
         assert shell.trace.capture_scope.value == (
-            f"No nodes selected; capturing all 3 values (~{full})."
+            f"No nodes selected; capturing all 3 values {full_suffix}"
         )
 
         _select_operators(shell, session, *(node.id for node in graph.nodes))
@@ -1028,17 +1156,19 @@ def test_capture_scope_summary_tracks_the_box_and_the_selection(
         )
         assert shell.trace.capture_scope.value == (
             f"Capturing 2 values from 2 selected nodes "
-            f"(~{_estimate_text(session, selected)})."
+            f"(≥{_estimate_text(session, selected)}, 1 of 2 values declare shapes)."
         )
 
         _tick_capture_scope(shell, False)
-        assert shell.trace.capture_scope.value == (f"Capturing all 3 values (~{full}).")
+        assert shell.trace.capture_scope.value == (
+            f"Capturing all 3 values {full_suffix}"
+        )
 
 
 # -- smart capture-scope default, estimates, and preflight -------------------
 
 
-def test_big_model_defaults_to_boundaries_plus_selection_with_widen_choice(
+def test_big_model_defaults_to_preview_everything_with_per_value_share(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1054,26 +1184,59 @@ def test_big_model_defaults_to_boundaries_plus_selection_with_widen_choice(
         trace = shell.trace
 
         assert trace.capture_scope_choice.visible
-        assert trace.capture_scope_choice.value == "boundaries-plus-selection"
-        assert trace.capture_value_ids() == _boundary_ids(session)
+        assert trace.capture_scope_choice.value == "preview-everything"
+        # Preview traces the full value set — nothing is narrowed — and the
+        # summary states the mode and the per-value preview share of the
+        # panel's 256 MiB capture limit.
+        assert trace.capture_value_ids() == frozenset()
+        per_value = viewmodel.compact_bytes(256 * 1024 * 1024 // 3)
         summary = str(trace.capture_scope.value)
-        assert "boundaries + selection" in summary
-        assert "(~" in summary
-        widen = next(
+        assert "Preview everything" in summary
+        assert f"~{per_value} per value" in summary
+        preview_option = next(
             option
             for option in trace.capture_scope_choice.options
-            if option.key == "everything"
+            if option.key == "preview-everything"
         )
-        assert "3 values" in str(widen.text)
-        assert "~" in str(widen.text)
+        assert "3 values" in str(preview_option.text)
+        assert f"~{per_value} each" in str(preview_option.text)
 
-        # The current selection joins the boundary scope, and the approved
-        # request carries exactly that narrowed set.
+        # The approved request carries the full scope and the preview policy.
+        request = _approved_request(shell, page, monkeypatch)
+        assert request.value_ids == frozenset()
+        assert request.capture_policy == "preview"
+
+
+def test_boundaries_choice_narrows_the_request_and_stays_greedy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    monkeypatch.setattr("nneditor.ui.trace_panel._FULL_CAPTURE_ADVISORY_BYTES", 32)
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        trace = shell.trace
+        assert trace.capture_scope_choice.value == "preview-everything"
+
+        trace.capture_scope_choice.value = "boundaries-plus-selection"
+        cast(Any, trace.capture_scope_choice.on_select)(cast(Any, SimpleNamespace()))
+        assert "boundaries + selection" in str(trace.capture_scope.value)
+
+        # The current selection joins the boundary scope, the choice
+        # survives selection churn, and the approved request carries exactly
+        # that narrowed set under whole-value greedy budgeting.
         selected = session.document.main_graph.nodes[0]
         _select_operators(shell, session, selected.id)
+        trace.refresh_actions()
+        assert trace.capture_scope_choice.value == "boundaries-plus-selection"
         expected = _boundary_ids(session) | frozenset(selected.outputs)
         assert trace.capture_value_ids() == expected
-        assert _approved_request(shell, page, monkeypatch).value_ids == expected
+        request = _approved_request(shell, page, monkeypatch)
+        assert request.value_ids == expected
+        assert request.capture_policy == "greedy"
 
 
 def test_small_model_keeps_the_capture_everything_default(tmp_path: Path) -> None:
@@ -1083,11 +1246,117 @@ def test_small_model_keeps_the_capture_everything_default(tmp_path: Path) -> Non
         shell, _page = make_shell(service)
         shell.show_session(service.open_model(path))
 
-        assert not shell.trace.capture_scope_choice.visible
+        # The scope control is offered for every open session — hiding it
+        # behind the byte advisory hid "Preview everything" on exactly the
+        # models that needed it — while a small model still defaults to the
+        # greedy capture-everything scope.
+        assert shell.trace.capture_scope_choice.visible
+        assert shell.trace.capture_scope_choice.value == "everything"
         assert shell.trace.capture_value_ids() == frozenset()
+        assert shell.trace.capture_policy() == "greedy"
         assert str(shell.trace.capture_scope.value).startswith(
-            "Capturing all 3 values (~"
+            "Capturing all 3 values (≥"
         )
+
+
+def test_undeclared_shape_count_defaults_to_preview_everything(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    # "scaled" declares no shape, so the byte estimate stays at a tiny 64 B —
+    # far under the 1 GiB advisory — and only the always-known capturable
+    # value count can move the default. Two stands in for the real 256-value
+    # threshold a thousand-node model would cross.
+    monkeypatch.setattr("nneditor.ui.trace_panel._PREVIEW_DEFAULT_VALUE_COUNT", 2)
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        trace = shell.trace
+
+        assert trace.capture_scope_choice.visible
+        assert trace.capture_scope_choice.value == "preview-everything"
+        assert trace.capture_value_ids() == frozenset()
+        assert trace.capture_policy() == "preview"
+        request = _approved_request(shell, page, monkeypatch)
+        assert request.value_ids == frozenset()
+        assert request.capture_policy == "preview"
+
+
+def test_partially_declared_shapes_read_as_a_lower_bound(tmp_path: Path) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        full = _estimate_text(session, _boundary_ids(session))
+
+        # The 64 B sum covers only the input and output — "scaled" declares
+        # no shape — so every estimate string must read as a lower bound
+        # over the values it covers, never as the total.
+        assert shell.trace.capture_scope.value == (
+            f"Capturing all 3 values (≥{full}, 2 of 3 values declare shapes)."
+        )
+        assert shell.trace.capture_estimate.value == (
+            f"Estimated decoded activations for this scope: "
+            f"≥{full}, 2 of 3 values declare shapes."
+        )
+        everything_option = next(
+            option
+            for option in shell.trace.capture_scope_choice.options
+            if option.key == "everything"
+        )
+        assert f"≥{full}" in str(everything_option.text)
+
+
+def test_budget_dropped_majority_status_names_the_preview_way_out(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=4)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        specification = session.default_trace_inputs()
+        limits = TraceLimits(
+            wall_seconds=10,
+            memory_bytes=1024 * 1024 * 1024,
+            capture_bytes=16,
+            chunk_bytes=4,
+        )
+        result = session.trace_async(
+            TraceRequest(
+                specification,
+                limits,
+                TraceApproval.approve(
+                    session.title,
+                    session.document.source.content_hash,
+                    specification,
+                    limits,
+                ),
+            )
+        ).result(timeout=20)
+        # The 16-byte pool stores one whole 16 B value and drops the other
+        # two for budget, so most of the requested values are unreadable and
+        # the status must name the way out rather than read as failure.
+        dropped = [
+            record
+            for record in result.records
+            if "capture byte ceiling" in (record.reason or "")
+        ]
+        assert 2 * len(dropped) > len(result.records)
+        shell.trace.active_trace_id = result.id
+        shell.trace.refresh_actions()
+        status = str(shell.trace.status.value)
+        assert "Partial trace" in status
+        assert (
+            "most values were not captured — switch Capture scope to "
+            "Preview everything to cover every node"
+        ) in status
 
 
 def test_explicit_widen_sticks_for_the_session_but_not_the_next_one(
@@ -1098,30 +1367,35 @@ def test_explicit_widen_sticks_for_the_session_but_not_the_next_one(
     build_embedded_model(path, elements=8)
     monkeypatch.setattr("nneditor.ui.trace_panel._FULL_CAPTURE_ADVISORY_BYTES", 32)
     with ApplicationService() as service:
-        shell, _page = make_shell(service)
+        shell, page = make_shell(service)
         session = service.open_model(path)
         shell.show_session(session)
         trace = shell.trace
-        assert trace.capture_scope_choice.value == "boundaries-plus-selection"
+        assert trace.capture_scope_choice.value == "preview-everything"
 
         trace.capture_scope_choice.value = "everything"
         cast(Any, trace.capture_scope_choice.on_select)(cast(Any, SimpleNamespace()))
         assert trace.capture_value_ids() == frozenset()
-        assert str(trace.capture_scope.value).startswith("Capturing all 3 values (~")
+        assert str(trace.capture_scope.value).startswith("Capturing all 3 values (≥")
 
-        # Selection churn and later refreshes keep the explicit choice.
+        # Selection churn and later refreshes keep the explicit choice, and
+        # the approved request drops back to whole-value greedy budgeting.
         _select_operators(shell, session, session.document.main_graph.nodes[0].id)
         trace.refresh_actions()
         assert trace.capture_scope_choice.value == "everything"
         assert trace.capture_value_ids() == frozenset()
+        request = _approved_request(shell, page, monkeypatch)
+        assert request.value_ids == frozenset()
+        assert request.capture_policy == "greedy"
 
         # A new session returns to the smart default; the choice was per-session.
         second_path = tmp_path / "second.onnx"
         build_embedded_model(second_path, elements=8)
         second = service.open_model(second_path)
         shell.show_session(second)
-        assert shell.trace.capture_scope_choice.value == "boundaries-plus-selection"
-        assert shell.trace.capture_value_ids() == _boundary_ids(second)
+        assert shell.trace.capture_scope_choice.value == "preview-everything"
+        assert shell.trace.capture_value_ids() == frozenset()
+        assert shell.trace.capture_policy() == "preview"
 
 
 def test_over_half_memory_estimate_warns_inline_before_the_run(
@@ -1886,6 +2160,14 @@ def test_escape_closes_the_large_view_overlay_before_clearing_selection(
 
         press_key(shell, "Escape")
         assert not dialog.open
+        assert shell.renderer.selection == frozenset({node_id})
+
+        # The operations drawer is next in the dismissal chain: it closes
+        # before the selection is touched.
+        cast(Any, shell.operation_buttons["edit"].on_click)(cast(Any, None))
+        assert shell.operations_drawer.visible
+        press_key(shell, "Escape")
+        assert not shell.operations_drawer.visible
         assert shell.renderer.selection == frozenset({node_id})
 
         press_key(shell, "Escape")

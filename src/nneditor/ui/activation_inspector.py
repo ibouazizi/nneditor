@@ -161,6 +161,7 @@ class ActivationInspector:
             overview.section_heading(
                 "Weights & tensors",
                 ft.Icons.MEMORY_ROUNDED,
+                palette=self.palette,
                 trailing=str(len(tensor_ids)),
             ),
         ]
@@ -198,20 +199,76 @@ class ActivationInspector:
         *,
         owner_id: str,
     ) -> list[ft.Control]:
-        """Captured values crossing a selected block/region boundary."""
+        """Captured values crossing a selected block/region boundary.
+
+        Only the boundary of the member set is shown — what the block
+        consumes from the rest of the graph and what it hands back — under
+        "Inputs" and "Outputs" sub-headings. Values both produced and
+        consumed inside the block are its internals and never appear here.
+        """
         session = self._session()
+        trace_id = self._active_trace_id()
         if (
             session is None
-            or self._active_trace_id() is None
+            or trace_id is None
             or self._current_graph() != session.document.entry_graph
         ):
             return []
-        value_ids = self._value_ids_for_members(members)
-        return self.activation_rows_for_values(
-            value_ids,
-            owner_id=owner_id,
-            title="Block inputs & outputs",
+        input_ids, output_ids = self._value_ids_for_members(members)
+        result = session.trace(trace_id)
+        records_by_value = {record.value_id: record for record in result.records}
+        sections = tuple(
+            (
+                subtitle,
+                icon,
+                tuple(
+                    record
+                    for value_id in value_ids
+                    if (record := records_by_value.get(value_id)) is not None
+                ),
+            )
+            for subtitle, icon, value_ids in (
+                ("Inputs", ft.Icons.INPUT_ROUNDED, input_ids),
+                ("Outputs", ft.Icons.OUTPUT_ROUNDED, output_ids),
+            )
         )
+        total = sum(len(records) for _subtitle, _icon, records in sections)
+        rows: list[ft.Control] = [
+            ft.Divider(height=8, color=self.palette.border),
+            overview.section_heading(
+                "Block inputs & outputs",
+                ft.Icons.PLAY_CIRCLE_OUTLINE_ROUNDED,
+                palette=self.palette,
+                trailing=str(total),
+            ),
+        ]
+        if not total:
+            rows.append(
+                ft.Text(
+                    "No boundary activation was captured for this block. The "
+                    "trace may have used a narrowed selection or stopped "
+                    "earlier.",
+                    size=10,
+                    color=self.palette.muted,
+                )
+            )
+            return rows
+        for subtitle, icon, records in sections:
+            if not records:
+                continue
+            rows.append(
+                overview.section_heading(
+                    subtitle,
+                    icon,
+                    palette=self.palette,
+                    trailing=str(len(records)),
+                )
+            )
+            rows.extend(
+                self._activation_card(trace_id, record, owner_id, expanded=True)
+                for record in records
+            )
+        return rows
 
     def activation_rows_for_values(
         self,
@@ -231,6 +288,7 @@ class ActivationInspector:
                 overview.section_heading(
                     title,
                     ft.Icons.PLAY_CIRCLE_OUTLINE_ROUNDED,
+                    palette=self.palette,
                     trailing="not run",
                 ),
                 ft.Container(
@@ -313,7 +371,8 @@ class ActivationInspector:
         if current_slice is None:
             return ()
         members = current_slice.members_by_glyph.get(glyph_id, frozenset())
-        value_ids = self._value_ids_for_members(members)
+        input_ids, output_ids = self._value_ids_for_members(members)
+        value_ids = (*input_ids, *output_ids)
         if not value_ids:
             return ()
         result = session.trace(trace_id)
@@ -324,32 +383,53 @@ class ActivationInspector:
             if (record := by_value.get(value_id)) is not None
         )
 
-    def _value_ids_for_members(self, members: frozenset[str]) -> tuple[str, ...]:
-        """Values crossing the boundary of an aggregated graph glyph."""
+    def _value_ids_for_members(
+        self,
+        members: frozenset[str],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Boundary ``(inputs, outputs)`` of an aggregated graph glyph.
+
+        Inputs are values a member consumes from outside the set: produced
+        by a non-member node, or arriving as graph inputs. Outputs are
+        values a member produces that leave the set: consumed by a
+        non-member node, or declared as graph outputs. Values produced and
+        consumed entirely inside the set are internals and appear in
+        neither tuple; initializer-backed weight values are parameters, not
+        activations, and are likewise excluded.
+        """
         session = self._session()
         if (
             session is None
             or not members
             or self._current_graph() != session.document.entry_graph
         ):
-            return ()
+            return ((), ())
         graph = session.document.main_graph
-        value_ids: set[str] = set()
+        # graph.initializers holds tensor ids (``t:{graph}#{name}``); the
+        # value a node consumes carries the same scope and name under the
+        # value prefix (``v:{graph}#{name}``, see nneditor.ir.identity), so
+        # the swap is the exact tensor-to-value binding.
+        initializer_values = {f"v{tensor_id[1:]}" for tensor_id in graph.initializers}
+        input_ids: set[str] = set()
+        output_ids: set[str] = set()
         for node_id in members:
             node = graph.node(node_id)
             for value_id in node.inputs:
+                if value_id in initializer_values:
+                    continue
                 producer = graph.producer(value_id)
-                if value_id not in graph.initializers and (
-                    producer is None or producer[0] not in members
-                ):
-                    value_ids.add(value_id)
+                if producer is not None:
+                    if producer[0] not in members:
+                        input_ids.add(value_id)
+                elif value_id in graph.inputs:
+                    input_ids.add(value_id)
             for value_id in node.outputs:
                 if value_id in graph.outputs or any(
                     consumer not in members
                     for consumer, _port in graph.consumers(value_id)
                 ):
-                    value_ids.add(value_id)
-        return tuple(sorted(value_ids))
+                    output_ids.add(value_id)
+        return tuple(sorted(input_ids)), tuple(sorted(output_ids))
 
     def _activation_record_rows(
         self,
@@ -366,6 +446,7 @@ class ActivationInspector:
             overview.section_heading(
                 title,
                 ft.Icons.PLAY_CIRCLE_OUTLINE_ROUNDED,
+                palette=self.palette,
                 trailing=str(len(records)),
             ),
         ]
@@ -428,6 +509,7 @@ class ActivationInspector:
                     controls=[
                         overview.metadata_section(
                             metadata,
+                            palette=self.palette,
                             title=metadata_title,
                             icon=metadata_icon,
                             role=metadata_role,
@@ -460,6 +542,7 @@ class ActivationInspector:
         controls: list[ft.Control] = [
             overview.metadata_section(
                 viewmodel.statistics_lines(stats),
+                palette=self.palette,
                 title="Statistics",
                 icon=ft.Icons.QUERY_STATS_ROUNDED,
                 role=role,
@@ -703,6 +786,7 @@ class ActivationInspector:
                         ("Downsampling", plot.downsampling),
                         ("Capture", "partial" if plot.partial else "complete"),
                     ),
+                    palette=self.palette,
                     title=plot.title,
                     icon=ft.Icons.INSERT_CHART_OUTLINED_ROUNDED,
                     role=f"activation-view:{value_id}:{plot.kind.value}",
@@ -846,6 +930,7 @@ class ActivationInspector:
                             f"{record.full_byte_length:,}",
                         ),
                     ),
+                    palette=self.palette,
                     title="Captured activation",
                     icon=ft.Icons.DATA_ARRAY_ROUNDED,
                     role=f"activation-overlay-metadata:{record.value_id}",
@@ -863,6 +948,7 @@ class ActivationInspector:
                         overview.section_heading(
                             plot.title,
                             ft.Icons.INSERT_CHART_OUTLINED_ROUNDED,
+                            palette=self.palette,
                             trailing=plot.kind.value,
                         ),
                         build_activation_plot(
@@ -892,6 +978,7 @@ class ActivationInspector:
                                     "partial" if plot.partial else "complete",
                                 ),
                             ),
+                            palette=self.palette,
                             title="View details",
                             icon=ft.Icons.INFO_OUTLINE_ROUNDED,
                             role=(
@@ -1275,6 +1362,7 @@ class ActivationInspector:
                 overview.section_heading(
                     "Value map",
                     ft.Icons.GRID_ON_ROUNDED,
+                    palette=self.palette,
                     trailing=f"FIRST {len(values)}",
                 ),
                 ft.Container(
@@ -1352,6 +1440,7 @@ class ActivationInspector:
                 overview.section_heading(
                     "Hex editor",
                     ft.Icons.CODE_ROUNDED,
+                    palette=self.palette,
                     trailing=f"{len(raw)} BYTE PAGE",
                 ),
                 ft.Text(

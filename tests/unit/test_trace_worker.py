@@ -1453,3 +1453,140 @@ def test_batched_budgets_are_greedy_whole_values_not_equal_shares(
     assert by_name["output"]["state"] == "complete"
     assert by_name["scaled"]["state"] == "truncated"
     assert by_name["scaled"]["stored_byte_length"] == 8
+
+
+def test_preview_policy_stages_everything_and_shares_the_budget_equally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under "preview", breadth wins: no value is pruned from the staged
+    outputs and every ordinary value keeps an equal share of the pool.
+
+    The same request under greedy budgeting would drop the trailing value
+    from the staged model entirely and spend the whole remainder on the
+    first ordinary value; here both keep a 4-byte sliver instead, boundaries
+    still complete via the exact-budget path, and every batch is fetched.
+    """
+    model_path = tmp_path / "model.onnx"
+    build_embedded_model(model_path, elements=4)
+    inputs = tmp_path / "inputs.npz"
+    np.savez(inputs, input=np.arange(4, dtype=np.float32))
+    output = tmp_path / "output"
+    output.mkdir()
+    response = tmp_path / "response.json"
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "model": str(model_path),
+                "inputs": str(inputs),
+                "output": str(output),
+                "response": str(response),
+                "targets": [
+                    _target("input-id", "input", node_id=None),
+                    _target("a-id", "a", shape=[8]),
+                    _target("b-id", "b"),
+                    _target("output-id", "output", graph_output=True),
+                ],
+                "backend": "onnxruntime",
+                "capture_policy": "preview",
+                "wall_seconds": 10,
+                "memory_bytes": 1024 * 1024 * 1024,
+                # The prioritized input and output fit exactly (32 bytes);
+                # the ordinary 'a' (32 B) and 'b' (16 B) share the last 8.
+                "capture_bytes": 40,
+                "chunk_bytes": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+    element_counts = {"output": 4, "a": 8, "b": 4}
+    observed: dict[str, Any] = {}
+
+    class FakeInferenceSession:
+        def __init__(
+            self,
+            model_source: object,
+            sess_options: Any = None,
+            providers: Any = None,
+            provider_options: Any = None,
+        ) -> None:
+            assert isinstance(model_source, str)
+            loaded = onnx.load_model(model_source, load_external_data=False)
+            observed["staged_outputs"] = [value.name for value in loaded.graph.output]
+
+        def run(
+            self,
+            names: list[str],
+            run_feeds: dict[str, Any],
+        ) -> list[Any]:
+            calls.append(list(names))
+            return [np.arange(element_counts[name], dtype=np.float32) for name in names]
+
+    fake = SimpleNamespace(
+        SessionOptions=_fake_session_options(),
+        ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL=0),
+        GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_BASIC=1),
+        InferenceSession=FakeInferenceSession,
+        get_available_providers=lambda: ["CPUExecutionProvider"],
+        __version__="0-test",
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", cast(Any, fake))
+    monkeypatch.setattr(trace_worker, "_ORT_BATCH_BYTES", 8)
+    monkeypatch.setenv("NNEDITOR_TRACE_WORKER", "1")
+    monkeypatch.setattr(trace_worker, "_limit_process", lambda raw: None)
+
+    trace_worker.run(request)
+
+    payload = json.loads(response.read_text(encoding="utf-8"))
+    by_name = {record["value_name"]: record for record in payload["records"]}
+    # A greedy 40-byte budget would prune 'b' from the staged outputs
+    # (output + a already exceed it); preview stages every requested value.
+    assert set(observed["staged_outputs"]) >= {"output", "a", "b"}
+    # Every batch was fetched — no runtime pass was skipped for breadth.
+    assert calls == [["output"], ["a"], ["b"]]
+    assert by_name["input"]["state"] == "complete"
+    assert by_name["output"]["state"] == "complete"
+    # Both ordinary values keep an equal truncated share; under greedy 'a'
+    # would take the whole 8-byte remainder and 'b' would be dropped.
+    assert by_name["a"]["state"] == "truncated"
+    assert by_name["a"]["stored_byte_length"] == 4
+    assert by_name["b"]["state"] == "truncated"
+    assert by_name["b"]["stored_byte_length"] == 4
+    assert all(record["state"] != "dropped" for record in payload["records"])
+
+
+def test_worker_rejects_unknown_capture_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.onnx"
+    build_embedded_model(model_path, elements=4)
+    inputs = tmp_path / "inputs.npz"
+    np.savez(inputs, input=np.arange(4, dtype=np.float32))
+    output = tmp_path / "output"
+    output.mkdir()
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "model": str(model_path),
+                "inputs": str(inputs),
+                "output": str(output),
+                "response": str(tmp_path / "response.json"),
+                "targets": [_target("scaled-id", "scaled")],
+                "capture_policy": "eager",
+                "wall_seconds": 10,
+                "memory_bytes": 1024 * 1024 * 1024,
+                "capture_bytes": 1024,
+                "chunk_bytes": 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NNEDITOR_TRACE_WORKER", "1")
+    monkeypatch.setattr(trace_worker, "_limit_process", lambda raw: None)
+
+    with pytest.raises(ValueError, match="capture policy"):
+        trace_worker.run(request)

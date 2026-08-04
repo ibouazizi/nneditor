@@ -84,6 +84,7 @@ def estimated_capture_bytes(values: Iterable[DeclaredValue]) -> int:
 def _capture_pressure_note(
     targets: list[dict[str, object]],
     limits: TraceLimits,
+    capture_policy: str = "greedy",
 ) -> str | None:
     """A pre-run warning — never a refusal — when the capture looks too big.
 
@@ -100,6 +101,11 @@ def _capture_pressure_note(
         )
         if size is not None:
             estimated += size
+    if capture_policy == "preview":
+        # A preview trace stores equal shares of the capture pool, so by
+        # construction it fits its capture budget; the declared total alone
+        # must not fire the note for it.
+        estimated = min(estimated, limits.capture_bytes)
     if estimated <= limits.memory_bytes // 2:
         return None
     estimated_mib = math.ceil(estimated / _MIB)
@@ -338,7 +344,11 @@ def run_onnx_trace(
         targets = _targets(document, request.value_ids)
         # Known pre-launch: warn (as a note, not a refusal) when the declared
         # capture set alone approaches the approved worker memory.
-        pressure_note = _capture_pressure_note(targets, request.limits)
+        pressure_note = _capture_pressure_note(
+            targets,
+            request.limits,
+            request.capture_policy,
+        )
         payload = {
             "model": str(model_path),
             "inputs": str(inputs_path),
@@ -347,6 +357,7 @@ def run_onnx_trace(
             "targets": targets,
             "backend": request.backend.value,
             "device": request.device.value,
+            "capture_policy": request.capture_policy,
             **request.limits.to_json(),
         }
         request_path.write_text(

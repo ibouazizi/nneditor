@@ -148,6 +148,31 @@ def test_pin_from_activation_card_unpin_and_clear_on_close(
         assert not find_data(shell.watch.strip, "watch-row:")
 
 
+def test_watch_rows_mount_under_the_activations_section(tmp_path: Path) -> None:
+    with ApplicationService() as service:
+        shell, _page, session = open_traced_shell(service, tmp_path)
+        assert shell.info_activations_tile.expanded, "a trace opens the section"
+        status = find_data(shell.info_activations_tile, "trace-status-line")
+        assert len(status) == 1
+        trace_id = shell.trace.active_trace_id
+        assert trace_id is not None
+        assert trace_id[:12] in str(cast(ft.Text, status[0]).value)
+
+        output_id = session.document.main_graph.outputs[0]
+        shell.watch.pin(output_id, "output")
+        rows = find_data(shell.info_activations_tile, f"watch-row:{output_id}")
+        assert len(rows) == 1, "pinned rows render inside info:activations"
+        assert not find_data(shell.right_panel, "watch-strip"), (
+            "the explorer no longer hosts the watch strip"
+        )
+
+        unpin = find_data(rows[0], f"watch-unpin:{output_id}")
+        assert len(unpin) == 1
+        cast(Any, cast(ft.IconButton, unpin[0]).on_click)(_event())
+        assert shell.watch.pinned() == ()
+        assert not find_data(shell.info_activations_tile, "watch-row:")
+
+
 # -- (b) statistics job lifecycle -----------------------------------------
 
 

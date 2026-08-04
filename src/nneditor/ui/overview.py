@@ -1,4 +1,9 @@
-"""Reusable Flet controls for model and selection overviews."""
+"""Reusable Flet controls for model and selection overviews.
+
+Every builder takes the shell's active :class:`ShellPalette` so the same
+control renders legibly in both the light and dark themes; nothing in this
+module bakes a theme-specific hex value.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ import flet as ft
 
 from nneditor.ir.core import Document
 from nneditor.ui import viewmodel
+from nneditor.ui.shell_layout import ShellPalette
 
 __all__ = [
     "metadata_section",
@@ -17,36 +23,21 @@ __all__ = [
     "selected_region_controls",
 ]
 
-_ACCENT = "#7F56D9"
-_ACCENT_SOFT = "#F4F3FF"
-_BORDER = "#E4E7EC"
-_DANGER = "#B42318"
-_DANGER_SOFT = "#FEF3F2"
-_INFO = "#175CD3"
-_INFO_SOFT = "#EFF8FF"
-_INK = "#101828"
-_MUTED = "#667085"
-_PANEL = "#FFFFFF"
-_SUBTLE = "#F8FAFC"
-_SUCCESS = "#067647"
-_SUCCESS_SOFT = "#ECFDF3"
-_WARNING = "#B54708"
-_WARNING_SOFT = "#FFFAEB"
-
 
 def section_heading(
     title: str,
     icon: ft.IconData,
     *,
+    palette: ShellPalette,
     trailing: str | None = None,
 ) -> ft.Row:
     controls: list[ft.Control] = [
-        ft.Icon(icon, size=17, color=_ACCENT),
+        ft.Icon(icon, size=17, color=palette.accent),
         ft.Text(
             title,
             size=13,
             weight=ft.FontWeight.W_700,
-            color=_INK,
+            color=palette.ink,
             expand=True,
         ),
     ]
@@ -57,10 +48,10 @@ def section_heading(
                     trailing,
                     size=9,
                     weight=ft.FontWeight.W_700,
-                    color=_ACCENT,
+                    color=palette.accent,
                 ),
                 padding=ft.Padding.symmetric(horizontal=8, vertical=3),
-                bgcolor=_ACCENT_SOFT,
+                bgcolor=palette.accent_soft,
                 border_radius=20,
             )
         )
@@ -76,6 +67,7 @@ def _metric_card(
     value: str,
     icon: ft.IconData,
     *,
+    palette: ShellPalette,
     role_prefix: str = "overview-metric",
 ) -> ft.Container:
     return ft.Container(
@@ -85,12 +77,12 @@ def _metric_card(
             controls=[
                 ft.Row(
                     controls=[
-                        ft.Icon(icon, size=15, color=_ACCENT),
+                        ft.Icon(icon, size=15, color=palette.accent),
                         ft.Text(
                             label.upper(),
                             size=9,
                             weight=ft.FontWeight.W_700,
-                            color=_MUTED,
+                            color=palette.muted,
                         ),
                     ],
                     spacing=6,
@@ -100,7 +92,7 @@ def _metric_card(
                     value,
                     size=18,
                     weight=ft.FontWeight.W_700,
-                    color=_INK,
+                    color=palette.ink,
                     max_lines=1,
                     overflow=ft.TextOverflow.ELLIPSIS,
                     tooltip=value,
@@ -110,8 +102,8 @@ def _metric_card(
             tight=True,
         ),
         padding=12,
-        bgcolor=_SUBTLE,
-        border=ft.Border.all(1, _BORDER),
+        bgcolor=palette.subtle,
+        border=ft.Border.all(1, palette.border),
         border_radius=12,
     )
 
@@ -119,6 +111,7 @@ def _metric_card(
 def metadata_section(
     items: tuple[tuple[str, str], ...],
     *,
+    palette: ShellPalette,
     title: str = "Artifact",
     icon: ft.IconData = ft.Icons.INSERT_DRIVE_FILE_ROUNDED,
     role: str = "model-overview-artifact",
@@ -132,12 +125,12 @@ def metadata_section(
                         label.upper(),
                         size=9,
                         weight=ft.FontWeight.W_700,
-                        color=_MUTED,
+                        color=palette.muted,
                     ),
                     ft.Text(
                         value,
                         size=11,
-                        color=_INK,
+                        color=palette.ink,
                         selectable=True,
                         tooltip=value,
                     ),
@@ -147,16 +140,16 @@ def metadata_section(
             )
         )
         if position < len(items) - 1:
-            details.append(ft.Divider(height=10, thickness=1, color=_BORDER))
+            details.append(ft.Divider(height=10, thickness=1, color=palette.border))
     return ft.Column(
         data=role,
         controls=[
-            section_heading(title, icon),
+            section_heading(title, icon, palette=palette),
             ft.Container(
                 content=ft.Column(controls=details, spacing=0, tight=True),
                 padding=12,
-                bgcolor=_PANEL,
-                border=ft.Border.all(1, _BORDER),
+                bgcolor=palette.panel,
+                border=ft.Border.all(1, palette.border),
                 border_radius=12,
             ),
         ],
@@ -167,6 +160,7 @@ def metadata_section(
 
 def selected_block_controls(
     *,
+    palette: ShellPalette,
     pattern: str,
     members: int,
     confidence: float,
@@ -176,7 +170,11 @@ def selected_block_controls(
         ft.Column(
             data="selection-block-summary",
             controls=[
-                section_heading("Block summary", ft.Icons.GRID_VIEW_ROUNDED),
+                section_heading(
+                    "Block summary",
+                    ft.Icons.GRID_VIEW_ROUNDED,
+                    palette=palette,
+                ),
                 ft.ResponsiveRow(
                     data="selection-block-metrics",
                     controls=[
@@ -184,12 +182,14 @@ def selected_block_controls(
                             "Operators",
                             f"{members:,}",
                             ft.Icons.HUB_ROUNDED,
+                            palette=palette,
                             role_prefix="selection-metric",
                         ),
                         _metric_card(
                             "Confidence",
                             f"{confidence:.0%}",
                             ft.Icons.VERIFIED_ROUNDED,
+                            palette=palette,
                             role_prefix="selection-metric",
                         ),
                     ],
@@ -205,6 +205,7 @@ def selected_block_controls(
                 ("Pattern", viewmodel.humanize_identifier(pattern)),
                 ("Explanation", explanation),
             ),
+            palette=palette,
             title="Block metadata",
             icon=ft.Icons.INFO_OUTLINE_ROUNDED,
             role="selection-item-metadata",
@@ -212,12 +213,20 @@ def selected_block_controls(
     ]
 
 
-def selected_region_controls(members: int) -> list[ft.Control]:
+def selected_region_controls(
+    members: int,
+    *,
+    palette: ShellPalette,
+) -> list[ft.Control]:
     return [
         ft.Column(
             data="selection-region-summary",
             controls=[
-                section_heading("Region summary", ft.Icons.HUB_ROUNDED),
+                section_heading(
+                    "Region summary",
+                    ft.Icons.HUB_ROUNDED,
+                    palette=palette,
+                ),
                 ft.ResponsiveRow(
                     data="selection-region-metrics",
                     controls=[
@@ -225,12 +234,14 @@ def selected_region_controls(members: int) -> list[ft.Control]:
                             "Operators",
                             f"{members:,}",
                             ft.Icons.DATA_OBJECT_ROUNDED,
+                            palette=palette,
                             role_prefix="selection-metric",
                         ),
                         _metric_card(
                             "Next view",
                             "Blocks",
                             ft.Icons.GRID_VIEW_ROUNDED,
+                            palette=palette,
                             role_prefix="selection-metric",
                         ),
                     ],
@@ -246,6 +257,7 @@ def selected_region_controls(members: int) -> list[ft.Control]:
                 ("Region", "Architecture overview"),
                 ("Next step", "Open this region to inspect its blocks"),
             ),
+            palette=palette,
             title="Region metadata",
             icon=ft.Icons.INFO_OUTLINE_ROUNDED,
             role="selection-item-metadata",
@@ -255,42 +267,48 @@ def selected_region_controls(members: int) -> list[ft.Control]:
 
 def _capability_style(
     availability: str,
+    palette: ShellPalette,
 ) -> tuple[str, str, ft.IconData, str]:
     styles = {
         "available": (
-            _SUCCESS,
-            _SUCCESS_SOFT,
+            palette.success,
+            palette.success_soft,
             ft.Icons.CHECK_CIRCLE_ROUNDED,
             "Ready",
         ),
         "partial": (
-            _WARNING,
-            _WARNING_SOFT,
+            palette.warning,
+            palette.warning_soft,
             ft.Icons.INFO_OUTLINE_ROUNDED,
             "Partial",
         ),
         "unavailable": (
-            _DANGER,
-            _DANGER_SOFT,
+            palette.danger,
+            palette.danger_soft,
             ft.Icons.CANCEL_ROUNDED,
             "Unavailable",
         ),
         "requires trusted mode": (
-            "#6941C6",
-            "#F4F3FF",
+            palette.accent,
+            palette.accent_soft,
             ft.Icons.LOCK_ROUNDED,
             "Trusted mode",
         ),
         "requires companion artifact": (
-            _INFO,
-            _INFO_SOFT,
+            palette.info,
+            palette.info_soft,
             ft.Icons.LINK_ROUNDED,
             "Companion",
         ),
     }
     return styles.get(
         availability,
-        (_MUTED, _SUBTLE, ft.Icons.HELP_OUTLINE_ROUNDED, availability.title()),
+        (
+            palette.muted,
+            palette.subtle,
+            ft.Icons.HELP_OUTLINE_ROUNDED,
+            availability.title(),
+        ),
     )
 
 
@@ -298,8 +316,10 @@ def _capability_card(
     name: str,
     availability: str,
     reason: str,
+    *,
+    palette: ShellPalette,
 ) -> ft.Container:
-    color, background, icon, status_label = _capability_style(availability)
+    color, background, icon, status_label = _capability_style(availability, palette)
     return ft.Container(
         data=f"overview-capability:{name}",
         content=ft.Column(
@@ -311,7 +331,7 @@ def _capability_card(
                             viewmodel.humanize_identifier(name),
                             size=11,
                             weight=ft.FontWeight.W_700,
-                            color=_INK,
+                            color=palette.ink,
                             expand=True,
                         ),
                         ft.Container(
@@ -329,20 +349,22 @@ def _capability_card(
                     spacing=7,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
-                ft.Text(reason, size=10, color=_MUTED, selectable=True),
+                ft.Text(reason, size=10, color=palette.muted, selectable=True),
             ],
             spacing=6,
             tight=True,
         ),
         padding=10,
-        bgcolor=_PANEL,
-        border=ft.Border.all(1, _BORDER),
+        bgcolor=palette.panel,
+        border=ft.Border.all(1, palette.border),
         border_radius=10,
     )
 
 
 def _capabilities_section(
     capabilities: tuple[tuple[str, str, str], ...],
+    *,
+    palette: ShellPalette,
 ) -> ft.Column:
     ready = sum(availability == "available" for _, availability, _ in capabilities)
     return ft.Column(
@@ -351,10 +373,11 @@ def _capabilities_section(
             section_heading(
                 "Capabilities",
                 ft.Icons.VERIFIED_USER_ROUNDED,
+                palette=palette,
                 trailing=f"{ready}/{len(capabilities)} ready",
             ),
             *[
-                _capability_card(name, availability, reason)
+                _capability_card(name, availability, reason, palette=palette)
                 for name, availability, reason in capabilities
             ],
         ],
@@ -363,15 +386,29 @@ def _capabilities_section(
     )
 
 
-def _finding_card(severity: str, title: str, message: str) -> ft.Container:
+def _finding_card(
+    severity: str,
+    title: str,
+    message: str,
+    *,
+    palette: ShellPalette,
+) -> ft.Container:
     styles = {
-        "error": (_DANGER, _DANGER_SOFT, ft.Icons.ERROR_OUTLINE_ROUNDED),
-        "warning": (_WARNING, _WARNING_SOFT, ft.Icons.WARNING_AMBER_ROUNDED),
-        "info": (_INFO, _INFO_SOFT, ft.Icons.INFO_OUTLINE_ROUNDED),
+        "error": (
+            palette.danger,
+            palette.danger_soft,
+            ft.Icons.ERROR_OUTLINE_ROUNDED,
+        ),
+        "warning": (
+            palette.warning,
+            palette.warning_soft,
+            ft.Icons.WARNING_AMBER_ROUNDED,
+        ),
+        "info": (palette.info, palette.info_soft, ft.Icons.INFO_OUTLINE_ROUNDED),
     }
     color, background, icon = styles.get(
         severity,
-        (_MUTED, _SUBTLE, ft.Icons.INFO_OUTLINE_ROUNDED),
+        (palette.muted, palette.subtle, ft.Icons.INFO_OUTLINE_ROUNDED),
     )
     return ft.Container(
         data=f"overview-finding:{severity}",
@@ -384,9 +421,9 @@ def _finding_card(severity: str, title: str, message: str) -> ft.Container:
                             title,
                             size=11,
                             weight=ft.FontWeight.W_700,
-                            color=_INK,
+                            color=palette.ink,
                         ),
-                        ft.Text(message, size=10, color=_MUTED, selectable=True),
+                        ft.Text(message, size=10, color=palette.muted, selectable=True),
                     ],
                     spacing=2,
                     tight=True,
@@ -403,7 +440,11 @@ def _finding_card(severity: str, title: str, message: str) -> ft.Container:
     )
 
 
-def model_overview_controls(document: Document) -> list[ft.Control]:
+def model_overview_controls(
+    document: Document,
+    *,
+    palette: ShellPalette,
+) -> list[ft.Control]:
     summary = dict(viewmodel.model_summary(document))
     artifact_path = summary["Artifact"]
     artifact_items: list[tuple[str, str]] = [
@@ -422,21 +463,25 @@ def model_overview_controls(document: Document) -> list[ft.Control]:
                 "Graphs",
                 f"{int(summary['Graphs']):,}",
                 ft.Icons.ACCOUNT_TREE_ROUNDED,
+                palette=palette,
             ),
             _metric_card(
                 "Operators",
                 f"{int(summary['Nodes']):,}",
                 ft.Icons.HUB_ROUNDED,
+                palette=palette,
             ),
             _metric_card(
                 "Tensors",
                 f"{int(summary['Tensors']):,}",
                 ft.Icons.GRID_VIEW_ROUNDED,
+                palette=palette,
             ),
             _metric_card(
                 "Model size",
                 viewmodel.compact_bytes(document.source.byte_size),
                 ft.Icons.DATA_OBJECT_ROUNDED,
+                palette=palette,
             ),
         ],
         spacing=8,
@@ -446,14 +491,18 @@ def model_overview_controls(document: Document) -> list[ft.Control]:
         ft.Column(
             data="model-overview-summary",
             controls=[
-                section_heading("At a glance", ft.Icons.DASHBOARD_ROUNDED),
+                section_heading(
+                    "At a glance",
+                    ft.Icons.DASHBOARD_ROUNDED,
+                    palette=palette,
+                ),
                 metrics,
             ],
             spacing=8,
             tight=True,
         ),
-        metadata_section(tuple(artifact_items)),
-        _capabilities_section(viewmodel.capability_lines(document)),
+        metadata_section(tuple(artifact_items), palette=palette),
+        _capabilities_section(viewmodel.capability_lines(document), palette=palette),
     ]
     findings = viewmodel.diagnostic_lines(document)
     if findings:
@@ -464,10 +513,11 @@ def model_overview_controls(document: Document) -> list[ft.Control]:
                     section_heading(
                         "Findings",
                         ft.Icons.RULE_ROUNDED,
+                        palette=palette,
                         trailing=str(len(findings)),
                     ),
                     *[
-                        _finding_card(severity, title, message)
+                        _finding_card(severity, title, message, palette=palette)
                         for severity, title, message in findings
                     ],
                 ],

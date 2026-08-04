@@ -111,7 +111,8 @@ class WatchPanel:
 
     @property
     def control(self) -> ft.Column:
-        """The retained strip the shell mounts behind its collapsible tile."""
+        """The retained strip the shell mounts in the left panel's
+        Activations section."""
         return self.strip
 
     # -- pin state ---------------------------------------------------------
@@ -285,6 +286,7 @@ class WatchPanel:
             return [
                 overview.metadata_section(
                     viewmodel.statistics_lines(stats),
+                    palette=self.palette,
                     title="Statistics",
                     icon=ft.Icons.QUERY_STATS_ROUNDED,
                     role=f"watch-statistics:{record.value_id}",
@@ -390,6 +392,7 @@ class WatchPanel:
         )
         return overview.metadata_section(
             lines,
+            palette=self.palette,
             title="Delta vs previous trace",
             icon=ft.Icons.COMPARE_ARROWS_ROUNDED,
             role=f"watch-delta:{value_id}",

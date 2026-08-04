@@ -1166,6 +1166,75 @@ def test_capture_pressure_note_attaches_only_beyond_half_the_memory_limit() -> N
     assert _capture_pressure_note([target([-1])], limits) is None
 
 
+def test_capture_pressure_note_is_capped_by_the_capture_pool_under_preview() -> None:
+    limits = TraceLimits(
+        wall_seconds=1,
+        memory_bytes=1000,
+        capture_bytes=100,
+        chunk_bytes=10,
+    )
+    targets: list[dict[str, object]] = [{"element_type": "float32", "shape": [200]}]
+
+    # The 800 declared bytes fire the note under greedy budgeting, but a
+    # preview stores at most the 100-byte capture pool by construction, so
+    # the same declared total cannot fire it.
+    assert _capture_pressure_note(targets, limits) is not None
+    assert _capture_pressure_note(targets, limits, "preview") is None
+
+    # A capture pool that itself exceeds half the memory limit still warns.
+    roomy = TraceLimits(
+        wall_seconds=1,
+        memory_bytes=1000,
+        capture_bytes=600,
+        chunk_bytes=10,
+    )
+    assert _capture_pressure_note(targets, roomy, "preview") is not None
+
+
+def test_capture_policy_is_validated_and_never_joins_the_trace_key() -> None:
+    specification = InputSpecification(
+        "artifact",
+        (
+            InputBinding(
+                "x",
+                "float32",
+                (1,),
+                InputSource.CONSTANT,
+                constant=(1.0,),
+            ),
+        ),
+    )
+    limits = TraceLimits()
+    approval = TraceApproval.approve("model", "artifact", specification, limits)
+    request = TraceRequest(specification, limits, approval)
+    assert request.capture_policy == "greedy"
+
+    preview = replace(request, capture_policy="preview")
+    assert preview.capture_policy == "preview"
+    with pytest.raises(ValueError, match="capture policy"):
+        replace(request, capture_policy="eager")
+
+    # The policy stays out of the trace identity on purpose: a preview trace
+    # and a later narrowed whole-value re-trace of the same specification
+    # must share one trace id so the store's merge (longer records win)
+    # upgrades the preview records in place.
+    greedy_key = TraceKey(
+        "artifact",
+        None,
+        request.specification.hash,
+        request.backend,
+        request.device,
+    )
+    preview_key = TraceKey(
+        "artifact",
+        None,
+        preview.specification.hash,
+        preview.backend,
+        preview.device,
+    )
+    assert greedy_key.id == preview_key.id
+
+
 def test_worker_response_parsing_carries_notes_and_tolerates_old_workers() -> None:
     record = _record("value", np.zeros(2, dtype=np.float32).tobytes())
     payload: dict[str, object] = {

@@ -1,9 +1,11 @@
 """The Flet application shell.
 
-The workspace is deliberately architecture-first: model and block metadata live
-in the left context panel, the graph owns the middle of the screen, and model
-navigation lives in the right explorer. Editing tools use progressive
-disclosure so the normal viewing path stays calm.
+The workspace is deliberately architecture-first: the left panel shows
+information only — model metadata, the current selection, and captured
+activations — in collapsible sections, the graph owns the middle of the
+screen, and model navigation lives in the right explorer. Operations (trace,
+edit, optimize) live in the workspace toolbar and open one at a time in a
+drawer docked over the graph surface, so the normal viewing path stays calm.
 
 The shell owns *view* state only — which session is shown, the viewport, the
 selection. Model state lives in the application service, and everything the
@@ -122,6 +124,30 @@ _OVERLAY_LABELS: Final = {
     "magnitude": "Overlay: Magnitude",
 }
 
+_OPERATIONS: Final[dict[str, tuple[str, str, ft.IconData, str]]] = {
+    "trace": (
+        "Trace",
+        "Trace activations",
+        ft.Icons.PLAY_CIRCLE_OUTLINE_ROUNDED,
+        "Run an approved inference trace and capture activations",
+    ),
+    "edit": (
+        "Edit",
+        "Edit model",
+        ft.Icons.EDIT_ROUNDED,
+        "Validate and commit transactional graph edits",
+    ),
+    "optimize": (
+        "Optimize",
+        "Optimize weights",
+        ft.Icons.TUNE_ROUNDED,
+        "Preview and apply quantization and pruning transformations",
+    ),
+}
+"""The workspace operations: key -> (button label, drawer title, icon,
+tooltip).  Each toggles the operations drawer over the graph surface, which
+hosts that operation's retained controls Column."""
+
 
 @runtime_checkable
 class _SupportsGlyphTint(Protocol):
@@ -206,6 +232,10 @@ class Shell:
     loading_overlay: ft.Container
     surface: ft.Container
     workspace_tabs: ft.Tabs
+    operations_drawer: ft.Container
+    info_model_tile: ft.ExpansionTile
+    info_selection_tile: ft.ExpansionTile
+    info_activations_tile: ft.ExpansionTile
 
     def __init__(
         self,
@@ -786,12 +816,56 @@ class Shell:
         page.services.append(self.clipboard)
 
     def _init_watch_and_overlay(self, page: ft.Page) -> None:
-        """Construct the watch strip and the anomaly-overlay toolbar state.
+        """Construct the watch strip, anomaly-overlay, operations-drawer,
+        and info-section state.
 
         The watch panel's accessors are deliberately lazy lambdas: the
         activation inspector and trace panel they reach are constructed
         after this call, and are only dereferenced at event time.
         """
+        # The user's explicit expand/collapse choices for the left panel's
+        # information sections this app session; a key absent here follows
+        # the state-driven default (see _info_section_expanded).
+        self._info_section_state: dict[str, bool] = {}
+        # Which operation's controls the drawer hosts; None means closed.
+        self._active_operation: str | None = None
+        # The Model section's retained content column; _refresh_inspector
+        # re-renders the overview rows into it.
+        self.model_info = ft.Column(spacing=14, tight=True, data="model-info-content")
+        self.trace_status_line = ft.Text(
+            "No activation trace yet.",
+            size=10,
+            color=self.palette.muted,
+            data="trace-status-line",
+        )
+        self.drawer_title = ft.Text(
+            "",
+            size=13,
+            weight=ft.FontWeight.W_700,
+            color=self.palette.ink,
+        )
+        self.drawer_close_button = ft.IconButton(
+            icon=ft.Icons.CLOSE_ROUNDED,
+            icon_size=16,
+            tooltip="Close the operations drawer (Esc)",
+            data="operations-drawer-close",
+            on_click=self._on_close_operations_drawer,
+        )
+        # The retained container the drawer wraps; its content is swapped to
+        # the active operation's controls Column so those Columns stay the
+        # exact objects the rest of the shell mutates.
+        self.drawer_body = ft.Container(data="operations-drawer-body")
+        self.operation_buttons: dict[str, ft.TextButton] = {
+            operation: ft.TextButton(
+                content=label,
+                icon=icon,
+                tooltip=tooltip,
+                data=f"operation:{operation}",
+                style=ft.ButtonStyle(color=self.palette.ink),
+                on_click=self._operation_click_handler(operation),
+            )
+            for operation, (label, _title, icon, tooltip) in _OPERATIONS.items()
+        }
         self.overlay_mode: str = "off"
         # Per-operator anomaly severity: node id -> (rank, tint color). A
         # semantic glyph tints by the worst rank among its members.
@@ -957,6 +1031,164 @@ class Shell:
             self.renderer.set_tint(None)
         self._sync_overlay_controls()
 
+    # -- operations drawer -------------------------------------------------
+
+    def _operation_click_handler(
+        self, operation: str
+    ) -> Callable[[ft.Event[ft.TextButton]], None]:
+        """A toolbar handler toggling the drawer onto one operation."""
+
+        def toggle(event: ft.Event[ft.TextButton]) -> None:
+            self._active_operation = (
+                None if self._active_operation == operation else operation
+            )
+            self._sync_operations_drawer()
+            self.page.update()
+
+        return toggle
+
+    def _on_close_operations_drawer(self, event: ft.Event[ft.IconButton]) -> None:
+        if self._close_operations_drawer():
+            self.page.update()
+
+    def _close_operations_drawer(self) -> bool:
+        """Close the operations drawer; report whether it was open."""
+        if self._active_operation is None:
+            return False
+        self._active_operation = None
+        self._sync_operations_drawer()
+        return True
+
+    def _operation_controls(self) -> dict[str, ft.Column]:
+        """The retained controls Column each operation's drawer hosts."""
+        return {
+            "trace": self.trace.control,
+            "edit": self._edit_controls,
+            "optimize": self._transformation_controls,
+        }
+
+    def _sync_operations_drawer(self) -> None:
+        """Reflect the active operation on the drawer and toolbar buttons."""
+        operation = self._active_operation
+        for key, button in self.operation_buttons.items():
+            active = key == operation
+            button.style = ft.ButtonStyle(
+                color=self.palette.accent if active else self.palette.ink,
+                bgcolor=self.palette.accent_soft if active else None,
+            )
+        if operation is None:
+            self.operations_drawer.visible = False
+            self.drawer_body.content = None
+            return
+        self.drawer_title.value = _OPERATIONS[operation][1]
+        self.drawer_body.content = self._operation_controls()[operation]
+        self.operations_drawer.visible = True
+
+    # -- left-panel information sections -----------------------------------
+
+    def _info_section_expanded(self, key: str) -> bool:
+        """The stored user choice for a section, else its state default.
+
+        Defaults: the Model section opens while nothing is selected, the
+        Selection section is always open, and the Activations section opens
+        once a trace exists.
+        """
+        stored = self._info_section_state.get(key)
+        if stored is not None:
+            return stored
+        if key == "info:model":
+            return not self._inspected_ids
+        if key == "info:activations":
+            return self.trace.active_trace_id is not None
+        return True
+
+    def _section_toggle_handler(
+        self, key: str
+    ) -> Callable[[ft.Event[ft.ExpansionTile]], None]:
+        def remember(event: ft.Event[ft.ExpansionTile]) -> None:
+            data = getattr(event, "data", None)
+            self._info_section_state[key] = (
+                data if isinstance(data, bool) else str(data).lower() == "true"
+            )
+
+        return remember
+
+    def _sync_info_sections(self) -> None:
+        """Re-derive each tile's expanded state; explicit choices win."""
+        if not hasattr(self, "info_model_tile"):
+            return
+        for key, tile in (
+            ("info:model", self.info_model_tile),
+            ("info:selection", self.info_selection_tile),
+            ("info:activations", self.info_activations_tile),
+        ):
+            tile.expanded = self._info_section_expanded(key)
+
+    def _build_info_sections(
+        self,
+    ) -> tuple[ft.ExpansionTile, ft.ExpansionTile, ft.ExpansionTile]:
+        """(Re)build the left panel's section tiles around retained content."""
+        self.info_model_tile = shell_layout.build_info_section(
+            palette=self.palette,
+            key="info:model",
+            title="Model",
+            icon=ft.Icons.INSERT_DRIVE_FILE_ROUNDED,
+            content=[self.model_info],
+            expanded=self._info_section_expanded("info:model"),
+            on_change=self._section_toggle_handler("info:model"),
+        )
+        self.info_selection_tile = shell_layout.build_info_section(
+            palette=self.palette,
+            key="info:selection",
+            title="Selection",
+            icon=ft.Icons.INFO_OUTLINE_ROUNDED,
+            content=shell_layout.build_selection_section_content(
+                palette=self.palette,
+                inspector_title=self.inspector_title,
+                inspector_subtitle=self.inspector_subtitle,
+                open_selection_button=self.open_selection_button,
+                back_to_parent_button=self.back_to_parent_button,
+                inspector=self.inspector,
+            ),
+            expanded=self._info_section_expanded("info:selection"),
+            on_change=self._section_toggle_handler("info:selection"),
+        )
+        self.info_activations_tile = shell_layout.build_info_section(
+            palette=self.palette,
+            key="info:activations",
+            title="Activations",
+            icon=ft.Icons.PUSH_PIN_ROUNDED,
+            content=[self.trace_status_line, self.watch.control],
+            expanded=self._info_section_expanded("info:activations"),
+            on_change=self._section_toggle_handler("info:activations"),
+        )
+        return (
+            self.info_model_tile,
+            self.info_selection_tile,
+            self.info_activations_tile,
+        )
+
+    def _refresh_trace_status_line(self) -> None:
+        """The Activations section's read-only summary of the active trace."""
+        if not hasattr(self, "trace"):
+            return
+        trace_id = self.trace.active_trace_id
+        if self.session is None or trace_id is None:
+            self.trace_status_line.value = "No activation trace yet."
+            self.trace_status_line.color = self.palette.muted
+            return
+        try:
+            result = self.session.trace(trace_id)
+        except (KeyError, ValueError):
+            self.trace_status_line.value = f"Trace {trace_id[:12]}"
+            self.trace_status_line.color = self.palette.muted
+            return
+        self.trace_status_line.value = (
+            f"Trace {trace_id[:12]} · "
+            f"{result.execution_device.value.upper()} · {result.runtime}"
+        )
+        self.trace_status_line.color = self.palette.ink
+
     def _compose_chrome(self) -> None:
         """(Re)compose the palette-bearing containers around retained controls.
 
@@ -974,16 +1206,14 @@ class Shell:
         loading_visible = (
             self.loading_overlay.visible if hasattr(self, "loading_overlay") else False
         )
+        model_section, selection_section, activations_section = (
+            self._build_info_sections()
+        )
         self.left_panel = shell_layout.build_left_panel(
             palette=self.palette,
-            inspector_title=self.inspector_title,
-            inspector_subtitle=self.inspector_subtitle,
-            open_selection_button=self.open_selection_button,
-            back_to_parent_button=self.back_to_parent_button,
-            inspector=self.inspector,
-            trace_controls=self.trace.control,
-            edit_controls=self._edit_controls,
-            transformation_controls=self._transformation_controls,
+            model_section=model_section,
+            selection_section=selection_section,
+            activations_section=activations_section,
         )
         self.left_panel.visible = left_visible
         hierarchy_tools = shell_layout.build_hierarchy_tools(
@@ -1007,7 +1237,14 @@ class Shell:
             minimap=self.minimap,
         )
         self.right_panel.visible = right_visible
-        self._mount_watch_section()
+        self.operations_drawer = shell_layout.build_operations_drawer(
+            palette=self.palette,
+            title=self.drawer_title,
+            close_button=self.drawer_close_button,
+            body=self.drawer_body,
+        )
+        # A theme rebuild re-hosts the open operation in the fresh drawer.
+        self._sync_operations_drawer()
         self.empty_state = shell_layout.build_empty_state(
             palette=self.palette,
             on_open=self._on_open_clicked,
@@ -1026,36 +1263,10 @@ class Shell:
             graph_actions=self.trace.graph_actions,
             empty_state=self.empty_state,
             hover_card=self.hover_card,
+            operations_drawer=self.operations_drawer,
             loading_overlay=self.loading_overlay,
             on_size_change=self._on_surface_size,
         )
-
-    def _mount_watch_section(self) -> None:
-        """Slot the watch strip into the right panel, above the minimap.
-
-        `shell_layout.build_right_panel` owns the explorer arrangement; the
-        watch strip mounts behind its own collapsible tile so pinned values
-        stay reachable without crowding navigation. The strip control is
-        retained, so a theme rebuild re-wraps the same rows.
-        """
-        column = self.right_panel.content
-        assert isinstance(column, ft.Column)
-        tile = ft.ExpansionTile(
-            data="watch-panel-section",
-            title=ft.Text("Watched activations", size=12, color=self.palette.ink),
-            leading=ft.Icon(
-                ft.Icons.PUSH_PIN_ROUNDED,
-                size=17,
-                color=self.palette.accent,
-            ),
-            controls=[self.watch.control],
-            controls_padding=ft.Padding.only(left=8, right=8, bottom=12),
-            dense=True,
-            maintain_state=True,
-        )
-        # The last two explorer rows are the minimap heading and the minimap
-        # itself; the watch section slots in directly above them.
-        column.controls.insert(len(column.controls) - 2, tile)
 
     def build(self) -> ft.Control:
         top_bar = ft.Row(
@@ -1102,6 +1313,8 @@ class Shell:
                 controls=[
                     self.breadcrumbs_row,
                     ft.Container(expand=True),
+                    *self.operation_buttons.values(),
+                    ft.Container(width=1, height=22, bgcolor=self.palette.border),
                     self.reset_view_button,
                     self.organize_button,
                     self.overlay_button,
@@ -1263,6 +1476,9 @@ class Shell:
         controls = getattr(self.page, "controls", None)
         if controls is not None and old_root in controls:
             controls[controls.index(old_root)] = new_root
+        # The watch strip bakes colors at render time even when empty, so it
+        # re-renders regardless of whether a model is open.
+        self.watch.refresh()
         if self.session is not None:
             # Dynamic rows bake colors at render time; re-render them all so
             # the open model recolors live rather than on the next click.
@@ -1271,7 +1487,6 @@ class Shell:
             self._refresh_breadcrumbs()
             self._refresh_inspector(self._inspected_ids)
             self._rebuild_minimap()
-            self.watch.refresh()
             if self.overlay_mode != "off":
                 # Severity colors were baked from the previous palette.
                 self._refresh_overlay_tint()
@@ -1302,6 +1517,8 @@ class Shell:
         self.overlay_button.style = ft.ButtonStyle(
             color=palette.accent if self.overlay_mode != "off" else palette.ink
         )
+        self.drawer_title.color = palette.ink
+        self._refresh_trace_status_line()
 
     def _on_register_file_types(
         self,
@@ -1539,6 +1756,8 @@ class Shell:
         self.trace.graph_actions.controls = []
         self.minimap_canvas.shapes = []
         self.inspector.controls = []
+        self.model_info.controls = []
+        self._sync_info_sections()
         self.inspector_title.value = "Model overview"
         self.inspector_subtitle.value = "Open a model to inspect it"
         self.open_selection_button.visible = False
@@ -2552,6 +2771,12 @@ class Shell:
             return
         self._inspected_ids = ids
         document = self.session.document
+        # The Model section always mirrors the open document; the inspector
+        # list below shows only what the selection is.
+        self.model_info.controls = overview.model_overview_controls(
+            document, palette=self.palette
+        )
+        self._sync_info_sections()
         rows: list[ft.Control] = []
         self.back_to_parent_button.visible = self.current_root_group is not None
         self.open_selection_button.visible = False
@@ -2574,6 +2799,7 @@ class Shell:
                 self.open_selection_button.visible = group.id != self.current_root_group
                 rows.extend(
                     overview.selected_block_controls(
+                        palette=self.palette,
                         pattern=group.kind.value,
                         members=len(group.members),
                         confidence=group.confidence,
@@ -2590,7 +2816,11 @@ class Shell:
                 self.inspector_title.value = "Architecture region"
                 self.inspector_subtitle.value = f"{len(members)} operators"
                 self.open_selection_button.visible = True
-                rows.extend(overview.selected_region_controls(len(members)))
+                rows.extend(
+                    overview.selected_region_controls(
+                        len(members), palette=self.palette
+                    )
+                )
                 rows.extend(
                     self.activations.group_activation_rows(members, owner_id=node_id)
                 )
@@ -2605,6 +2835,7 @@ class Shell:
                 rows.append(
                     overview.metadata_section(
                         details,
+                        palette=self.palette,
                         title="Operator metadata",
                         icon=ft.Icons.DATA_OBJECT_ROUNDED,
                         role="selection-item-metadata",
@@ -2635,7 +2866,15 @@ class Shell:
                     f"{viewmodel.humanize_identifier(document.artifact_kind.value)}"
                     f" · {node_count:,} operators"
                 )
-            rows.extend(overview.model_overview_controls(document))
+                rows.append(
+                    ft.Text(
+                        "Nothing is selected. Click a block or operator to "
+                        "inspect it here; model-level details live in the "
+                        "Model section above.",
+                        size=10,
+                        color=self.palette.muted,
+                    )
+                )
         self.inspector.controls = rows
         self._refresh_edit_actions()
 
@@ -3478,7 +3717,11 @@ class Shell:
             return False
         key = event.key or ""
         if key == "Escape":
+            # Dismissal order: the large activation overlay first, then the
+            # operations drawer, and only then the selection itself.
             if self.activations.close_overlay():
+                self.page.update()
+            elif self._close_operations_drawer():
                 self.page.update()
             else:
                 self.renderer.set_selection(frozenset())
@@ -3598,6 +3841,10 @@ class Shell:
         self.device_icon.color = color
         self.device_text.color = color
         self.device_indicator.border = ft.Border.all(1, color)
+        # Trace state changed with the device report: mirror it on the
+        # Activations info section and its default expansion.
+        self._refresh_trace_status_line()
+        self._sync_info_sections()
 
     def _clear_error(self) -> None:
         self.error_banner.visible = False

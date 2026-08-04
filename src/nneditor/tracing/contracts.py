@@ -13,6 +13,7 @@ from pathlib import Path
 from nneditor.ir.dtypes import dtype_info
 
 __all__ = [
+    "CAPTURE_POLICIES",
     "ActivationRecord",
     "CaptureState",
     "InputBinding",
@@ -27,6 +28,16 @@ __all__ = [
     "TraceResult",
     "declared_byte_size",
 ]
+
+# How a trace spends its capture byte pool. "greedy" keeps whole values in
+# consume order until the pool is spent, bounding runtime fetches by the
+# budget; "preview" spreads equal shares so every requested value keeps at
+# least a sliver — the breadth that lets any node be inspected after one
+# trace. The policy deliberately never joins ``TraceKey``: a preview trace
+# and a later narrowed whole-value re-trace of the same specification must
+# share one trace id so the store's merge (longer records win) upgrades the
+# preview records in place.
+CAPTURE_POLICIES = frozenset({"greedy", "preview"})
 
 
 def declared_byte_size(
@@ -356,6 +367,7 @@ class TraceRequest:
     value_ids: frozenset[str] = frozenset()
     backend: TraceBackend = TraceBackend.AUTO
     device: TraceDevice = TraceDevice.AUTO
+    capture_policy: str = "greedy"
 
     def __post_init__(self) -> None:
         if self.backend in {
@@ -363,6 +375,11 @@ class TraceRequest:
             TraceBackend.REFERENCE_NORMALIZED,
         } and self.device not in {TraceDevice.AUTO, TraceDevice.CPU}:
             raise ValueError("reference tracing only supports CPU execution")
+        if self.capture_policy not in CAPTURE_POLICIES:
+            raise ValueError(
+                f"unknown capture policy {self.capture_policy!r}; expected "
+                f"one of {sorted(CAPTURE_POLICIES)}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

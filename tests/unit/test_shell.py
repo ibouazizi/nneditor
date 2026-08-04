@@ -137,7 +137,8 @@ def test_show_session_populates_all_panels(
         "graph-output",
     }
     assert len(shell.graph_list.controls) == 1
-    assert shell.inspector.controls, "the inspector shows the model summary"
+    assert shell.model_info.controls, "the Model section shows the model summary"
+    assert shell.inspector.controls, "the Selection section explains the empty state"
     assert shell.hierarchy_list.controls
     assert shell.minimap_model is not None
     assert "model.onnx" in (shell.title_text.value or "")
@@ -237,6 +238,7 @@ def test_close_model_releases_session_and_clears_the_shell(
     assert shell.graph_list.controls == []
     assert shell.hierarchy_list.controls == []
     assert shell.inspector.controls == []
+    assert shell.model_info.controls == []
     assert shell.status_text.value == "Closed model.onnx"
 
 
@@ -250,7 +252,7 @@ def test_model_overview_uses_structured_metadata_sections(
 
     sections = {
         control.data: control
-        for control in shell.inspector.controls
+        for control in shell.model_info.controls
         if isinstance(control.data, str)
     }
     assert {
@@ -1246,6 +1248,173 @@ def test_shortcuts_yield_to_a_focused_text_field(
     assert shell.view["scale"] == pytest.approx(scale)
 
 
+# -- operations drawer and information sections ------------------------------
+
+
+def test_operation_buttons_toggle_swap_and_close_the_drawer(
+    service: ApplicationService,
+) -> None:
+    shell, _page = make_shell(service)
+    assert shell.operations_drawer.data == "operations-drawer"
+    assert not shell.operations_drawer.visible
+    trace_button = shell.operation_buttons["trace"]
+    edit_button = shell.operation_buttons["edit"]
+    optimize_button = shell.operation_buttons["optimize"]
+    assert trace_button.data == "operation:trace"
+    assert edit_button.data == "operation:edit"
+    assert optimize_button.data == "operation:optimize"
+
+    cast(Any, trace_button.on_click)(cast(Any, None))
+    assert shell.operations_drawer.visible
+    assert shell.drawer_body.content is shell.trace.control
+    assert shell.drawer_title.value == "Trace activations"
+    assert trace_button.style is not None
+    assert trace_button.style.color == shell.palette.accent
+
+    # Opening a second operation swaps the drawer content in place.
+    cast(Any, edit_button.on_click)(cast(Any, None))
+    assert shell.operations_drawer.visible
+    assert shell.drawer_body.content is shell._edit_controls
+    assert shell.drawer_title.value == "Edit model"
+    assert trace_button.style is not None
+    assert trace_button.style.color == shell.palette.ink
+    assert edit_button.style is not None
+    assert edit_button.style.color == shell.palette.accent
+
+    # Toggling the active operation closes the drawer.
+    cast(Any, edit_button.on_click)(cast(Any, None))
+    assert not shell.operations_drawer.visible
+    assert shell.drawer_body.content is None
+    assert edit_button.style is not None
+    assert edit_button.style.color == shell.palette.ink
+
+    cast(Any, optimize_button.on_click)(cast(Any, None))
+    assert shell.drawer_body.content is shell._transformation_controls
+    assert shell.drawer_title.value == "Optimize weights"
+    cast(Any, shell.drawer_close_button.on_click)(cast(Any, None))
+    assert not shell.operations_drawer.visible
+
+
+def test_operations_drawer_survives_a_theme_rebuild(
+    service: ApplicationService,
+) -> None:
+    shell, _page = make_shell(service)
+    cast(Any, shell.operation_buttons["optimize"].on_click)(cast(Any, None))
+    assert shell.operations_drawer.visible
+
+    shell._on_toggle_theme(None)
+
+    assert shell.operations_drawer.visible
+    assert shell.drawer_body.content is shell._transformation_controls
+    assert shell.operations_drawer.data == "operations-drawer"
+    button = shell.operation_buttons["optimize"]
+    assert button.style is not None
+    assert button.style.color == shell.palette.accent
+
+
+def test_escape_closes_overlay_then_drawer_then_clears_selection(
+    tmp_path: Path,
+    service: ApplicationService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    shell.show_session(service.open_model(path))
+    scene = shell.renderer.scene
+    assert scene is not None
+    shell.renderer.set_selection(frozenset({scene.nodes[0].id}))
+    cast(Any, shell.operation_buttons["trace"].on_click)(cast(Any, None))
+
+    # A large activation overlay outranks the drawer and the selection.
+    overlay_closes = iter([True, False, False])
+    monkeypatch.setattr(
+        shell.activations, "close_overlay", lambda: next(overlay_closes)
+    )
+    press_key(shell, "Escape")
+    assert shell.operations_drawer.visible, "the overlay consumed this Escape"
+    assert shell.renderer.selection
+
+    press_key(shell, "Escape")
+    assert not shell.operations_drawer.visible
+    assert shell.renderer.selection, "closing the drawer keeps the selection"
+
+    press_key(shell, "Escape")
+    assert shell.renderer.selection == frozenset()
+
+
+def test_left_panel_sections_carry_markers_and_persist_expansion(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    column = shell.left_panel.content
+    assert isinstance(column, ft.Column)
+    assert [tile.data for tile in column.controls] == [
+        "info:model",
+        "info:selection",
+        "info:activations",
+    ]
+    assert all(isinstance(tile, ft.ExpansionTile) for tile in column.controls), (
+        "the left panel is a column of collapsible information sections"
+    )
+
+    session = service.open_model(path)
+    shell.show_session(session)
+    assert shell.info_model_tile.expanded, "no selection: Model starts open"
+    assert shell.info_selection_tile.expanded
+    assert not shell.info_activations_tile.expanded, "no trace exists yet"
+
+    node_id = session.document.main_graph.nodes[0].id
+    shell._refresh_inspector(frozenset({node_id}))
+    assert not shell.info_model_tile.expanded, (
+        "a selection collapses the Model section by default"
+    )
+    assert shell.info_selection_tile.expanded
+
+    # An explicit choice outranks the default and survives refreshes.
+    assert shell.info_model_tile.on_change is not None
+    cast(Any, shell.info_model_tile.on_change)(SimpleNamespace(data=True))
+    shell._refresh_inspector(frozenset({node_id}))
+    assert shell.info_model_tile.expanded
+
+    # ... and a theme rebuild, which replaces the tile objects.
+    previous_tile = shell.info_model_tile
+    shell._on_toggle_theme(None)
+    assert shell.info_model_tile is not previous_tile
+    assert shell.info_model_tile.data == "info:model"
+    assert shell.info_model_tile.expanded, "the stored choice survived"
+    assert not shell.info_activations_tile.expanded
+
+    # A collapse choice persists the same way.
+    cast(Any, shell.info_selection_tile.on_change)(SimpleNamespace(data=False))
+    shell._refresh_inspector(frozenset())
+    assert not shell.info_selection_tile.expanded
+
+
+def test_left_panel_hosts_no_operation_controls(
+    service: ApplicationService,
+) -> None:
+    shell, _page = make_shell(service)
+
+    def walk(control: Any) -> list[Any]:
+        found = [control]
+        for attribute in ("leading", "title", "content"):
+            child = getattr(control, attribute, None)
+            if isinstance(child, ft.Control):
+                found.extend(walk(child))
+        for child in getattr(control, "controls", None) or []:
+            found.extend(walk(child))
+        return found
+
+    mounted = {id(control) for control in walk(shell.left_panel)}
+    assert id(shell.trace.control) not in mounted
+    assert id(shell._edit_controls) not in mounted
+    assert id(shell._transformation_controls) not in mounted
+    assert id(shell.watch.control) in mounted, "the watch strip is information"
+
+
 # -- dark mode ---------------------------------------------------------------
 
 
@@ -1302,10 +1471,48 @@ def test_theme_toggle_switches_palette_and_rebuilds_the_chrome(
     assert shell.hierarchy_list.controls
     assert "dark mode" in (shell.status_text.value or "")
 
+    # The left panel's Model-section content re-rendered with dark colors:
+    # metadata labels/values bake their palette at build time, so stale light
+    # ink here would be invisible on the dark panel.
+    def texts(control: Any) -> list[ft.Text]:
+        found = [control] if isinstance(control, ft.Text) else []
+        for attribute in ("leading", "title", "content"):
+            child = getattr(control, attribute, None)
+            if isinstance(child, ft.Control):
+                found.extend(texts(child))
+        for child in getattr(control, "controls", None) or []:
+            found.extend(texts(child))
+        return found
+
+    def artifact_colors() -> set[str | None]:
+        section = next(
+            control
+            for control in shell.model_info.controls
+            if control.data == "model-overview-artifact"
+        )
+        return {text.color for text in texts(section)}
+
+    assert dark.ink in artifact_colors(), "metadata values use dark ink"
+    assert dark.muted in artifact_colors(), "metadata labels use dark muted"
+    model_info_colors = {
+        text.color for control in shell.model_info.controls for text in texts(control)
+    }
+    assert SHELL_PALETTE.ink not in model_info_colors
+    assert SHELL_PALETTE.muted not in model_info_colors
+    # The Activations section's watch strip bakes its colors the same way.
+    watch_hint = shell.watch.strip.controls[0]
+    assert isinstance(watch_hint, ft.Text)
+    assert watch_hint.color == dark.muted
+
     shell._on_toggle_theme(None)
     assert shell.palette is SHELL_PALETTE
     assert stub.theme_mode is ft.ThemeMode.LIGHT
     assert shell.left_panel.bgcolor == SHELL_PALETTE.panel
+    assert SHELL_PALETTE.ink in artifact_colors(), "light ink is restored"
+    assert dark.ink not in artifact_colors()
+    watch_hint = shell.watch.strip.controls[0]
+    assert isinstance(watch_hint, ft.Text)
+    assert watch_hint.color == SHELL_PALETTE.muted
 
 
 def test_theme_toggle_preserves_panel_visibility_choices(

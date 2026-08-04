@@ -17,9 +17,12 @@ __all__ = [
     "ShellPalette",
     "build_empty_state",
     "build_hierarchy_tools",
+    "build_info_section",
     "build_left_panel",
     "build_loading_overlay",
+    "build_operations_drawer",
     "build_right_panel",
+    "build_selection_section_content",
     "build_surface",
 ]
 
@@ -83,7 +86,44 @@ soft backgrounds are deep washes of the same hue, keeping the same
 foreground-on-soft pairings legible in both themes."""
 
 
-def build_left_panel(
+_INSPECTOR_HEIGHT = 380
+"""Fixed height of the selection inspector list inside its section tile.
+
+The left panel's sections scroll together as one column, so an
+expand-to-fill inspector would have no bounded height to fill; the list
+scrolls internally within this box instead."""
+
+
+def build_info_section(
+    *,
+    palette: ShellPalette,
+    key: str,
+    title: str,
+    icon: ft.IconData,
+    content: list[ft.Control],
+    expanded: bool,
+    on_change: EventHandler,
+) -> ft.ExpansionTile:
+    """Compose one collapsible information section of the left panel."""
+    return ft.ExpansionTile(
+        data=key,
+        title=ft.Text(
+            title,
+            size=12,
+            weight=ft.FontWeight.W_700,
+            color=palette.ink,
+        ),
+        leading=ft.Icon(icon, size=17, color=palette.accent),
+        controls=content,
+        controls_padding=ft.Padding.only(left=8, right=8, bottom=12),
+        dense=True,
+        maintain_state=True,
+        expanded=expanded,
+        on_change=on_change,
+    )
+
+
+def build_selection_section_content(
     *,
     palette: ShellPalette,
     inspector_title: ft.Text,
@@ -91,73 +131,97 @@ def build_left_panel(
     open_selection_button: ft.FilledButton,
     back_to_parent_button: ft.TextButton,
     inspector: ft.ListView,
-    trace_controls: ft.Column,
-    edit_controls: ft.Column,
-    transformation_controls: ft.Column,
+) -> list[ft.Control]:
+    """The Selection section's body: heading, navigation, inspector list."""
+    return [
+        ft.Column(
+            controls=[inspector_title, inspector_subtitle],
+            spacing=0,
+            tight=True,
+        ),
+        ft.Row(
+            controls=[open_selection_button, back_to_parent_button],
+            wrap=True,
+            spacing=4,
+        ),
+        ft.Divider(height=12, color=palette.border),
+        ft.Container(content=inspector, height=_INSPECTOR_HEIGHT),
+    ]
+
+
+def build_left_panel(
+    *,
+    palette: ShellPalette,
+    model_section: ft.ExpansionTile,
+    selection_section: ft.ExpansionTile,
+    activations_section: ft.ExpansionTile,
 ) -> ft.Container:
-    """Compose the inspector and edit sidebar from stateful child controls."""
+    """Compose the information sidebar from its collapsible sections.
+
+    Information only: the trace, edit, and optimize *operations* live in the
+    workspace toolbar's operations drawer, not in this panel.
+    """
     return ft.Container(
         width=palette.sidebar_width,
         bgcolor=palette.panel,
         border=ft.Border.only(right=ft.BorderSide(1, palette.border)),
-        padding=ft.Padding.only(left=18, right=18, top=18, bottom=12),
+        padding=ft.Padding.only(left=10, right=10, top=12, bottom=12),
+        content=ft.Column(
+            controls=[model_section, selection_section, activations_section],
+            expand=True,
+            spacing=8,
+            scroll=ft.ScrollMode.AUTO,
+        ),
+    )
+
+
+def build_operations_drawer(
+    *,
+    palette: ShellPalette,
+    title: ft.Text,
+    close_button: ft.IconButton,
+    body: ft.Container,
+) -> ft.Container:
+    """Compose the docked card hosting one operation's controls.
+
+    The drawer overlays the right edge of the graph surface inside the
+    surface stack; the shell owns which operation's retained controls Column
+    the ``body`` container hosts and toggles visibility around it.
+    """
+    return ft.Container(
+        data="operations-drawer",
         content=ft.Column(
             controls=[
                 ft.Row(
-                    controls=[
-                        ft.Container(
-                            content=ft.Icon(
-                                ft.Icons.INFO_OUTLINE_ROUNDED,
-                                size=19,
-                                color=palette.accent,
-                            ),
-                            width=34,
-                            height=34,
-                            alignment=ft.Alignment.CENTER,
-                            bgcolor=palette.accent_soft,
-                            border_radius=10,
-                        ),
-                        ft.Column(
-                            controls=[inspector_title, inspector_subtitle],
-                            spacing=0,
-                            expand=True,
-                        ),
-                    ],
-                    spacing=10,
+                    controls=[title, ft.Container(expand=True), close_button],
+                    spacing=6,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
-                ft.Row(
-                    controls=[open_selection_button, back_to_parent_button],
-                    wrap=True,
-                    spacing=4,
-                ),
-                ft.Divider(height=12, color=palette.border),
-                ft.Container(content=inspector, expand=True),
-                ft.ExpansionTile(
-                    data="trace-controls",
-                    title=ft.Text("Trace activations", size=12),
-                    leading=ft.Icon(ft.Icons.PLAY_CIRCLE_OUTLINE_ROUNDED, size=17),
-                    controls=[trace_controls],
-                    controls_padding=ft.Padding.only(left=8, right=8, bottom=12),
-                    dense=True,
-                ),
-                ft.ExpansionTile(
-                    title=ft.Text("Edit model", size=12),
-                    leading=ft.Icon(ft.Icons.EDIT_ROUNDED, size=17),
-                    controls=[edit_controls],
-                    controls_padding=ft.Padding.only(left=8, right=8, bottom=12),
-                    dense=True,
-                ),
-                ft.ExpansionTile(
-                    title=ft.Text("Optimize weights", size=12),
-                    leading=ft.Icon(ft.Icons.TUNE_ROUNDED, size=17),
-                    controls=[transformation_controls],
-                    controls_padding=ft.Padding.only(left=8, right=8, bottom=12),
-                    dense=True,
+                ft.Divider(height=8, color=palette.border),
+                ft.Column(
+                    controls=[body],
+                    expand=True,
+                    spacing=0,
+                    scroll=ft.ScrollMode.AUTO,
                 ),
             ],
             expand=True,
-            spacing=8,
+            spacing=6,
         ),
+        width=palette.sidebar_width + 24,
+        right=12,
+        top=12,
+        bottom=12,
+        padding=14,
+        bgcolor=palette.panel,
+        border=ft.Border.all(1, palette.border),
+        border_radius=14,
+        shadow=ft.BoxShadow(
+            blur_radius=28,
+            color="#240F172A",
+            offset=ft.Offset(0, 8),
+        ),
+        visible=False,
     )
 
 
@@ -378,6 +442,7 @@ def build_surface(
     graph_actions: ft.Stack,
     empty_state: ft.Container,
     hover_card: ft.Container,
+    operations_drawer: ft.Container,
     loading_overlay: ft.Container,
     on_size_change: EventHandler,
 ) -> ft.Container:
@@ -389,6 +454,7 @@ def build_surface(
                 graph_actions,
                 empty_state,
                 hover_card,
+                operations_drawer,
                 loading_overlay,
             ],
             expand=True,

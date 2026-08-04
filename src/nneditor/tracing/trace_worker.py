@@ -16,7 +16,12 @@ import numpy as np
 import onnx
 from onnx.reference import ReferenceEvaluator
 
-from nneditor.tracing.contracts import TraceBackend, TraceDevice, declared_byte_size
+from nneditor.tracing.contracts import (
+    CAPTURE_POLICIES,
+    TraceBackend,
+    TraceDevice,
+    declared_byte_size,
+)
 from nneditor.tracing.scan import AxisAwareScan, normalize_scan_axes
 
 EvaluatorFactory = Callable[[onnx.ModelProto], Any]
@@ -849,6 +854,7 @@ def _open_onnxruntime(
     targets: list[dict[str, object]],
     device: TraceDevice,
     capture_budget: int,
+    capture_policy: str = "greedy",
 ) -> tuple[TraceCaptureSource, str, TraceDevice, str]:
     try:
         import onnxruntime as ort
@@ -872,11 +878,18 @@ def _open_onnxruntime(
             f"available providers: {', '.join(available) or 'none'}"
         )
     input_names = set(feeds)
-    # Staging outputs the greedy budget can never store would force the
-    # runtime to materialize activations only to drop them unread.
-    runtime_targets = _fetch_worthy(
-        [target for target in targets if str(target["value_name"]) not in input_names],
-        capture_budget,
+    staged_targets = [
+        target for target in targets if str(target["value_name"]) not in input_names
+    ]
+    # Under greedy budgeting, staging outputs the budget can never store
+    # would force the runtime to materialize activations only to drop them
+    # unread. A preview trace keeps every requested value staged instead:
+    # breadth is its whole point, and the memory-pressure note plus the
+    # recommended worker memory carry the cost of the wider output set.
+    runtime_targets = (
+        staged_targets
+        if capture_policy == "preview"
+        else _fetch_worthy(staged_targets, capture_budget)
     )
     if not runtime_targets:
         feeds_only: TraceCaptureSource = CaptureSource(
@@ -951,11 +964,18 @@ def _open_backend(
     backend: TraceBackend,
     device: TraceDevice = TraceDevice.AUTO,
     capture_budget: int = _DEFAULT_CAPTURE_BUDGET,
+    capture_policy: str = "greedy",
 ) -> tuple[TraceCaptureSource, str, TraceDevice, str]:
     if backend is TraceBackend.ONNX_RUNTIME:
         try:
             return _open_onnxruntime(
-                model, model_path, feeds, targets, device, capture_budget
+                model,
+                model_path,
+                feeds,
+                targets,
+                device,
+                capture_budget,
+                capture_policy,
             )
         except Exception as error:
             message = (
@@ -1007,7 +1027,13 @@ def _open_backend(
 
     try:
         return _open_onnxruntime(
-            model, model_path, feeds, targets, device, capture_budget
+            model,
+            model_path,
+            feeds,
+            targets,
+            device,
+            capture_budget,
+            capture_policy,
         )
     except Exception as error:
         if device in {TraceDevice.GPU, TraceDevice.NPU}:
@@ -1168,6 +1194,11 @@ def run(request_path: Path) -> None:
         device = TraceDevice(str(raw.get("device", TraceDevice.AUTO.value)))
     except ValueError as error:
         raise ValueError(f"unknown trace device {raw.get('device')!r}") from error
+    # Requests written before the policy existed are greedy, the behavior
+    # they were built around.
+    capture_policy = str(raw.get("capture_policy", "greedy"))
+    if capture_policy not in CAPTURE_POLICIES:
+        raise ValueError(f"unknown capture policy {raw.get('capture_policy')!r}")
     source, runtime, execution_device, execution_provider = _open_backend(
         model,
         Path(str(raw["model"])),
@@ -1176,6 +1207,7 @@ def run(request_path: Path) -> None:
         backend,
         device,
         int(raw["capture_bytes"]),
+        capture_policy,
     )
     if isinstance(source, OrtCaptureSource):
         # The runtime serves captures from its own session; keeping the
@@ -1216,11 +1248,13 @@ def run(request_path: Path) -> None:
                 # than dropping a value while bytes remain free.
                 if exact_budgets:
                     budget = cast(int, sizes[offset])
-                elif source.greedy_budgets:
+                elif source.greedy_budgets and capture_policy != "preview":
                     # Batched sources take whole values in consume order:
                     # once the pool is spent every later value skips, which
                     # bounds runtime passes by the capture budget instead of
-                    # the model's activation total.
+                    # the model's activation total. A preview trace opts out:
+                    # it pays those passes deliberately so every value keeps
+                    # an equal share of the pool.
                     budget = remaining
                 else:
                     share = remaining // (len(phase) - offset)

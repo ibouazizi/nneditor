@@ -11,7 +11,13 @@ import pytest
 
 from nneditor.application.session import ApplicationService, ModelSession
 from nneditor.cancellation import OperationCancelled
-from nneditor.tracing import TraceApproval, TraceDevice, TraceLimits, TraceRequest
+from nneditor.tracing import (
+    CaptureState,
+    TraceApproval,
+    TraceDevice,
+    TraceLimits,
+    TraceRequest,
+)
 from nneditor.tracing.runner import TraceError, recommended_trace_limits
 from tests.fixtures.onnx_models import (
     build_custom_domain_model,
@@ -120,6 +126,86 @@ def test_trace_refuses_missing_or_mismatched_per_run_approval(tmp_path: Path) ->
         with pytest.raises(ValueError, match="explicit per-run approval"):
             session.trace_async(refused).result(timeout=10)
         assert session.traces() == ()
+
+
+def test_preview_trace_keeps_breadth_and_a_narrowed_rerun_upgrades_it(
+    tmp_path: Path,
+) -> None:
+    """A preview keeps a sliver of every value; a whole-value re-trace of one
+    value lands in the same trace id and upgrades that record via the merge."""
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=32)
+    with ApplicationService() as service:
+        session = service.open_model(path)
+        specification = session.default_trace_inputs(seed=29)
+        # 320 bytes: the 128-byte input and output boundaries complete via
+        # the exact-budget path, leaving 64 bytes for the ordinary 'scaled'
+        # value — a truncated preview share instead of a greedy whole value.
+        preview_limits = TraceLimits(
+            wall_seconds=10,
+            memory_bytes=1024 * 1024 * 1024,
+            capture_bytes=320,
+            chunk_bytes=64,
+        )
+        preview = session.trace_async(
+            TraceRequest(
+                specification,
+                preview_limits,
+                TraceApproval.approve(
+                    session.title,
+                    session.document.source.content_hash,
+                    specification,
+                    preview_limits,
+                ),
+                capture_policy="preview",
+            )
+        ).result(timeout=20)
+        assert {record.value_name for record in preview.records} == {
+            "input",
+            "scaled",
+            "output",
+        }
+        # Breadth: every requested value is readable, truncated or complete.
+        assert all(record.readable for record in preview.records)
+        scaled = next(
+            record for record in preview.records if record.value_name == "scaled"
+        )
+        assert scaled.state is CaptureState.TRUNCATED
+        assert scaled.stored_byte_length == 64
+
+        # The narrowed whole-value re-trace of the same specification shares
+        # the trace id — the policy never joins the key — so the store's
+        # merge upgrades the preview record in place and keeps the rest.
+        rerun_limits = TraceLimits(
+            wall_seconds=10,
+            memory_bytes=1024 * 1024 * 1024,
+            capture_bytes=1024 * 1024,
+            chunk_bytes=64,
+        )
+        upgraded = session.trace_async(
+            TraceRequest(
+                specification,
+                rerun_limits,
+                TraceApproval.approve(
+                    session.title,
+                    session.document.source.content_hash,
+                    specification,
+                    rerun_limits,
+                ),
+                value_ids=frozenset({scaled.value_id}),
+            )
+        ).result(timeout=20)
+
+        assert upgraded.id == preview.id
+        record = upgraded.record(scaled.value_id)
+        assert record.state is CaptureState.COMPLETE
+        assert record.stored_byte_length == 32 * 4
+        # The untouched preview captures survive the merge alongside it.
+        assert {item.value_name for item in upgraded.records} == {
+            "input",
+            "scaled",
+            "output",
+        }
 
 
 def test_capture_ceiling_is_visible_as_partial_not_silent(tmp_path: Path) -> None:

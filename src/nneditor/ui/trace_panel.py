@@ -27,6 +27,7 @@ from nneditor.ir.capabilities import Availability, Capability
 from nneditor.rendering.contract import InteractiveGraphRenderer
 from nneditor.tracing.comparison import TraceComparison
 from nneditor.tracing.contracts import (
+    CaptureState,
     InputBinding,
     TraceApproval,
     TraceBackend,
@@ -34,6 +35,7 @@ from nneditor.tracing.contracts import (
     TraceLimits,
     TraceRequest,
     TraceResult,
+    declared_byte_size,
 )
 from nneditor.tracing.preflight import RuntimeStatus, runtime_status
 from nneditor.tracing.runner import estimated_capture_bytes
@@ -47,13 +49,31 @@ _MIB = 1024 * 1024
 # One GiB of estimated decoded activations (1024 MiB). Above this, capturing
 # everything is a heavyweight choice a user should make knowingly — a 1.33 GB,
 # 2,199-node model decodes to roughly 8 GiB of activations — so the panel
-# defaults the scope to the graph's boundaries plus the current selection and
-# offers an explicit control to widen back to everything.
+# defaults the scope to previewing everything and leaves the greedy
+# whole-value capture an explicit choice.
 _FULL_CAPTURE_ADVISORY_BYTES = 1024 * _MIB
 
-# Capture-scope choices offered when the full-capture advisory is active.
+# The count trigger for the same smart preview default. The byte advisory
+# alone is blind on real models: ONNX intermediates rarely declare shapes,
+# so a 2,199-node model whose activations actually total ~13 GB estimated
+# only 6.9 MiB of declared values, kept the greedy default, and dropped
+# 2,155 of its 2,248 values. The capturable-value count is always known,
+# so past this many values the session defaults to the preview scope.
+_PREVIEW_DEFAULT_VALUE_COUNT = 256
+
+# Capture-scope choices offered whenever a session is open.
+# "Preview everything" trades depth for breadth: it captures the full value
+# set under the worker's equal-share "preview" policy, so every value keeps
+# roughly capture_bytes / N bytes and any node can be inspected after one
+# trace. A later narrowed whole-value re-trace shares the same trace id and
+# upgrades the previews in place.
 _SCOPE_BOUNDARIES = "boundaries-plus-selection"
 _SCOPE_EVERYTHING = "everything"
+_SCOPE_PREVIEW = "preview-everything"
+
+# Fallback for the per-value preview estimate while the capture-limit field
+# holds unparseable text; matches the field's initial value of 256 MiB.
+_DEFAULT_CAPTURE_LIMIT_BYTES = 256 * _MIB
 
 
 def _plural(count: int, noun: str) -> str:
@@ -65,6 +85,27 @@ def uses_automatic_mask(input_name: str) -> bool:
     """True when an input's name marks it as an all-valid attention/pixel mask."""
     normalized = input_name.lower().replace("-", "_")
     return normalized == "mask" or normalized.endswith("_mask")
+
+
+def _budget_dropped_majority(result: TraceResult) -> bool:
+    """True when the capture budget dropped most of the requested values.
+
+    A greedy trace of a large model reads as failure — "93 readable
+    value(s)" against thousands requested — when the pool simply ran out,
+    so the status owes the user the way out (the preview scope).
+    """
+    starved = sum(
+        1
+        for record in result.records
+        if record.state is CaptureState.EVICTED
+        or (
+            record.state is CaptureState.DROPPED
+            # The worker's reason for a budget drop, as opposed to a value
+            # some backend failed to produce at all.
+            and "capture byte ceiling" in (record.reason or "")
+        )
+    )
+    return 2 * starved > len(result.records)
 
 
 class ActivationRows(Protocol):
@@ -135,8 +176,9 @@ class TracePanel:
         self.presentation: TraceGraphPresentation | None = None
         self._preparing = False
         # The user's explicit capture-scope choice for this session; None means
-        # the smart default (everything, or boundaries + selection once the
-        # full-capture estimate trips the advisory threshold) applies.
+        # the smart default (everything, or preview-everything once the
+        # capturable-value count or the declared-byte estimate trips its
+        # threshold) applies.
         self._scope_choice: str | None = None
         self._runtime_probe_started = False
         self._probing_runtime = False
@@ -221,8 +263,8 @@ class TracePanel:
             value=False,
             on_change=self._on_capture_scope_changed,
         )
-        # Shown only when the full-capture advisory is active: the explicit
-        # widen/narrow choice between boundaries + selection and everything.
+        # Shown whenever a session is open: the explicit widen/narrow choice
+        # between boundaries + selection, previewing, and everything.
         self.capture_scope_choice = ft.Dropdown(
             label="Capture scope",
             value=_SCOPE_EVERYTHING,
@@ -234,6 +276,7 @@ class TracePanel:
                     key=_SCOPE_BOUNDARIES,
                     text="Boundaries + selection",
                 ),
+                ft.DropdownOption(key=_SCOPE_PREVIEW, text="Preview everything"),
                 ft.DropdownOption(key=_SCOPE_EVERYTHING, text="Everything"),
             ],
         )
@@ -452,6 +495,7 @@ class TracePanel:
                 overview.section_heading(
                     "Connection values",
                     ft.Icons.CABLE_ROUNDED,
+                    palette=self.palette,
                     trailing=str(len(value_ids)),
                 )
             )
@@ -494,6 +538,7 @@ class TracePanel:
                             else "external input",
                         ),
                     ),
+                    palette=self.palette,
                     title="Tensor metadata",
                     icon=ft.Icons.DATA_ARRAY_ROUNDED,
                     role=f"trace-value-metadata:{value_id}",
@@ -821,14 +866,60 @@ class TracePanel:
         graph = session.document.main_graph
         return estimated_capture_bytes(graph.value(value_id) for value_id in value_ids)
 
+    def _declared_shape_count(self, value_ids: frozenset[str]) -> int:
+        """How many of these values declare a sizeable shape and dtype."""
+        session = self._session()
+        if session is None:
+            return 0
+        graph = session.document.main_graph
+        return sum(
+            1
+            for value_id in value_ids
+            if declared_byte_size(
+                graph.value(value_id).element_type,
+                graph.value(value_id).shape,
+            )
+            is not None
+        )
+
+    def _estimate_label(self, value_ids: frozenset[str]) -> str:
+        """These values' decoded-bytes estimate, honest about missing shapes.
+
+        ``estimated_capture_bytes`` sums only values with declared shapes and
+        fixed-width dtypes, so when some values declare neither the number is
+        a lower bound (``≥``) and the label says how many values it covers
+        rather than presenting the partial sum as the total.
+        """
+        estimate = viewmodel.compact_bytes(self._estimated_bytes(value_ids))
+        declared = self._declared_shape_count(value_ids)
+        total = len(value_ids)
+        if declared == total:
+            return f"~{estimate}"
+        return f"≥{estimate}, {declared:,} of {total:,} values declare shapes"
+
+    def _capture_limit_bytes(self) -> int:
+        """The capture byte pool the limits form currently names."""
+        try:
+            return int(self.capture_mib.value or "") * _MIB
+        except ValueError:
+            return _DEFAULT_CAPTURE_LIMIT_BYTES
+
     def _effective_scope(self) -> str:
         """The active scope once the smart default and the user's explicit
-        session choice are reconciled; the explicit choice always wins."""
+        session choice are reconciled; the explicit choice always wins.
+
+        The smart default turns to previewing on either trigger: the
+        always-known capturable-value count, or the declared-byte estimate —
+        a lower bound that a model with undeclared intermediate shapes never
+        trips, which is exactly why the count trigger exists.
+        """
         if self._scope_choice is not None:
             return self._scope_choice
-        estimate = self._estimated_bytes(self._capturable_value_ids())
-        if estimate > _FULL_CAPTURE_ADVISORY_BYTES:
-            return _SCOPE_BOUNDARIES
+        capturable = self._capturable_value_ids()
+        if len(capturable) > _PREVIEW_DEFAULT_VALUE_COUNT:
+            return _SCOPE_PREVIEW
+        if self._estimated_bytes(capturable) > _FULL_CAPTURE_ADVISORY_BYTES:
+            return _SCOPE_PREVIEW
         return _SCOPE_EVERYTHING
 
     def capture_value_ids(self) -> frozenset[str]:
@@ -840,6 +931,13 @@ class TracePanel:
                 self._boundary_capture_value_ids() | self._selected_capture_value_ids()
             )
         return frozenset()
+
+    def capture_policy(self) -> str:
+        """How the next trace spends its capture pool: whole values, or an
+        equal preview share for every value under the preview scope."""
+        if self.capture_selected_only.value:
+            return "greedy"
+        return "preview" if self._effective_scope() == _SCOPE_PREVIEW else "greedy"
 
     def refresh_capture_scope(self) -> None:
         """Restate how much of the model the next approved trace would read."""
@@ -853,24 +951,38 @@ class TracePanel:
             return
         all_ids = self._capturable_value_ids()
         full_estimate = self._estimated_bytes(all_ids)
+        # The full-capture size keeps its lower-bound marker in the option
+        # row: values without declared shapes contribute nothing to it.
+        full_bound = "~" if self._declared_shape_count(all_ids) == len(all_ids) else "≥"
+        preview_share = self._capture_limit_bytes() // max(1, len(all_ids))
         self.capture_scope_choice.options = [
             ft.DropdownOption(
                 key=_SCOPE_BOUNDARIES,
                 text="Boundaries + selection",
             ),
             ft.DropdownOption(
+                key=_SCOPE_PREVIEW,
+                text=(
+                    f"Preview everything ({_plural(len(all_ids), 'value')}, "
+                    f"~{viewmodel.compact_bytes(preview_share)} each)"
+                ),
+            ),
+            ft.DropdownOption(
                 key=_SCOPE_EVERYTHING,
                 text=(
                     f"Everything ({_plural(len(all_ids), 'value')}, "
-                    f"~{viewmodel.compact_bytes(full_estimate)})"
+                    f"{full_bound}{viewmodel.compact_bytes(full_estimate)})"
                 ),
             ),
         ]
-        self.capture_scope_choice.visible = full_estimate > _FULL_CAPTURE_ADVISORY_BYTES
+        # Always offered while a session is open: the byte advisory cannot
+        # see undeclared shapes, so the scope control must not hide behind it.
+        self.capture_scope_choice.visible = True
         self.capture_scope_choice.value = self._effective_scope()
         scoped_ids = self.capture_value_ids() or all_ids
         estimate = self._estimated_bytes(scoped_ids)
-        suffix = f" (~{viewmodel.compact_bytes(estimate)})"
+        estimate_label = self._estimate_label(scoped_ids)
+        suffix = f" ({estimate_label})"
         everything = f"all {_plural(len(all_ids), 'value')}"
         if self.capture_selected_only.value:
             nodes = len(self._selected_graph_node_ids())
@@ -900,11 +1012,21 @@ class TracePanel:
                 f"Capturing boundaries + selection: "
                 f"{_plural(len(scoped_ids), 'value')} ({detail}){suffix}."
             )
+        elif self._effective_scope() == _SCOPE_PREVIEW:
+            self.capture_scope.value = (
+                f"Preview everything: capturing {everything} at "
+                f"~{viewmodel.compact_bytes(preview_share)} per value."
+            )
+            # A preview stores at most the capture pool, so the inline
+            # estimate — like the runner's pressure note — is capped by it,
+            # and that pool ÷ count math needs no declared shapes.
+            estimate = min(estimate, self._capture_limit_bytes())
+            estimate_label = f"~{viewmodel.compact_bytes(estimate)}"
         else:
             self.capture_scope.value = f"Capturing {everything}{suffix}."
-        self._refresh_capture_estimate(estimate)
+        self._refresh_capture_estimate(estimate, estimate_label)
 
-    def _refresh_capture_estimate(self, estimate: int) -> None:
+    def _refresh_capture_estimate(self, estimate: int, label: str) -> None:
         """Show the scope's decoded size near the limits, and warn with the
         runner's own note wording before the run when the estimate exceeds
         half the approved memory limit."""
@@ -925,8 +1047,7 @@ class TracePanel:
             self.capture_estimate.color = self.palette.warning
         else:
             self.capture_estimate.value = (
-                "Estimated decoded activations for this scope: "
-                f"~{viewmodel.compact_bytes(estimate)}."
+                f"Estimated decoded activations for this scope: {label}."
             )
             self.capture_estimate.color = self.palette.muted
 
@@ -936,7 +1057,7 @@ class TracePanel:
 
     def _on_capture_choice_changed(self, event: ft.Event[ft.Dropdown]) -> None:
         choice = self.capture_scope_choice.value
-        if choice in {_SCOPE_BOUNDARIES, _SCOPE_EVERYTHING}:
+        if choice in {_SCOPE_BOUNDARIES, _SCOPE_EVERYTHING, _SCOPE_PREVIEW}:
             self._scope_choice = choice
         self.refresh_capture_scope()
         self.page.update()
@@ -1011,6 +1132,11 @@ class TracePanel:
                 f"{len(active_result.captured_value_ids)} readable value(s) • "
                 f"{active_result.runtime}"
             )
+            if _budget_dropped_majority(active_result):
+                self.status.value += (
+                    " • most values were not captured — switch Capture scope "
+                    "to Preview everything to cover every node"
+                )
         traces = session.traces() if session is not None else ()
         alternatives = [
             result
@@ -1119,6 +1245,7 @@ class TracePanel:
             device_text = TraceDevice.CPU.value
         bindings = dict(self.input_bindings)
         value_ids = self.capture_value_ids()
+        capture_policy = self.capture_policy()
         self._preparing = True
         self._clear_error()
         self.active_comparison = None
@@ -1161,6 +1288,7 @@ class TracePanel:
                     value_ids=value_ids,
                     backend=backend,
                     device=device,
+                    capture_policy=capture_policy,
                 )
                 job = session.trace_async(request)
             except (OSError, TypeError, ValueError) as error:
