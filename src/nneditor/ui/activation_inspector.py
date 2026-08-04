@@ -12,10 +12,14 @@ wants the shell to do afterwards arrives as an injected callable.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+import re
+from collections.abc import Callable, Coroutine, Sequence
+from pathlib import Path
+from typing import Any
 
 import flet as ft
 import flet.canvas as cv
+import numpy as np
 
 from nneditor.analysis.statistics import TensorStatistics, element_width
 from nneditor.application.session import ModelSession
@@ -61,6 +65,7 @@ class ActivationInspector:
         self,
         *,
         page: ft.Page,
+        picker: ft.FilePicker,
         palette: ShellPalette,
         session: Callable[[], ModelSession | None],
         current_graph: Callable[[], str | None],
@@ -75,9 +80,12 @@ class ActivationInspector:
         on_error: Callable[[str], None],
         on_status: Callable[[str], None],
         watch_text_focus: Callable[[ft.TextField], ft.TextField],
+        pin_value: Callable[[str, str], None] | None = None,
+        on_statistics_ready: Callable[[], None] | None = None,
         visualization_cache_budget: int = _VISUALIZATION_CACHE_BUDGET,
     ) -> None:
         self.page = page
+        self._picker = picker
         self.palette = palette
         self._session = session
         self._current_graph = current_graph
@@ -92,6 +100,8 @@ class ActivationInspector:
         self._on_error = on_error
         self._on_status = on_status
         self._watch_text_focus = watch_text_focus
+        self._pin_value = pin_value
+        self._on_statistics_ready = on_statistics_ready
 
         self.typed_preview_consent: set[str] = set()
         self.hex_offsets: dict[str, int] = {}
@@ -105,6 +115,9 @@ class ActivationInspector:
         self.activation_visualizations = self._new_visualization_cache()
         self.activation_visualization_errors: dict[tuple[str, str], str] = {}
         self.activation_loading: set[tuple[str, str, str]] = set()
+        # The large-view dialog currently shown, so Escape can close exactly
+        # this overlay and nothing else the page may have stacked.
+        self._overlay_dialog: ft.AlertDialog | None = None
 
     def _new_visualization_cache(
         self,
@@ -128,6 +141,7 @@ class ActivationInspector:
         self.activation_visualizations = self._new_visualization_cache()
         self.activation_visualization_errors.clear()
         self.activation_loading.clear()
+        self._overlay_dialog = None
 
     # -- inspector rows ----------------------------------------------------
 
@@ -563,6 +577,14 @@ class ActivationInspector:
                     )
                 )
             controls.extend(self._activation_view_controls(key, record, node_id))
+            controls.append(
+                ft.TextButton(
+                    content="Save activation as .npy",
+                    icon=ft.Icons.SAVE_ALT_ROUNDED,
+                    data=f"activation-save-npy:{record.value_id}",
+                    on_click=self._save_activation_handler(trace_id, record),
+                )
+            )
         else:
             controls.append(
                 self._warning_panel(
@@ -588,7 +610,30 @@ class ActivationInspector:
             expanded=expanded,
             spacing=8,
             controls_padding=ft.Padding.only(left=8, right=8, bottom=12),
+            leading=self._pin_button(record),
         )
+
+    def _pin_button(self, record: ActivationRecord) -> ft.Control | None:
+        """The card's pin-to-watch action, when a watch list is wired in."""
+        if self._pin_value is None:
+            return None
+        return ft.IconButton(
+            icon=ft.Icons.PUSH_PIN_OUTLINED,
+            icon_size=15,
+            tooltip="Pin to watch list",
+            data=f"activation-pin:{record.value_id}",
+            on_click=self._pin_handler(record),
+        )
+
+    def _pin_handler(
+        self, record: ActivationRecord
+    ) -> Callable[[ft.Event[ft.IconButton]], None]:
+        def pin(event: ft.Event[ft.IconButton]) -> None:
+            assert self._pin_value is not None
+            self._pin_value(record.value_id, record.value_name)
+            self.page.update()
+
+        return pin
 
     def _activation_view_controls(
         self,
@@ -663,6 +708,15 @@ class ActivationInspector:
                     role=f"activation-view:{value_id}:{plot.kind.value}",
                 )
             )
+            if plot.raster_png:
+                controls.append(
+                    ft.TextButton(
+                        content="Save view as PNG",
+                        icon=ft.Icons.IMAGE_ROUNDED,
+                        data=f"activation-save-png:{value_id}:{plot.kind.value}",
+                        on_click=self._save_view_png_handler(plot, record.value_name),
+                    )
+                )
         return controls
 
     def _activation_stats_handler(
@@ -690,6 +744,11 @@ class ActivationInspector:
                     self._on_error(f"Activation statistics failed: {job.error}")
                 if self._inspected_ids() == frozenset({node_id}):
                     self._refresh_inspector(self._inspected_ids())
+                if self._on_statistics_ready is not None:
+                    # The watch strip and anomaly overlay tint from computed
+                    # statistics; every landing must reach them, whichever
+                    # panel started the job.
+                    self._on_statistics_ready()
                 self.page.update()
 
             self.page.run_thread(wait)
@@ -790,7 +849,13 @@ class ActivationInspector:
                     title="Captured activation",
                     icon=ft.Icons.DATA_ARRAY_ROUNDED,
                     role=f"activation-overlay-metadata:{record.value_id}",
-                )
+                ),
+                ft.TextButton(
+                    content="Save activation as .npy",
+                    icon=ft.Icons.SAVE_ALT_ROUNDED,
+                    data=f"activation-overlay-save-npy:{record.value_id}",
+                    on_click=self._save_activation_handler(trace_id, record),
+                ),
             ]
             for plot in views:
                 rows.extend(
@@ -836,6 +901,20 @@ class ActivationInspector:
                         ),
                     ]
                 )
+                if plot.raster_png:
+                    rows.append(
+                        ft.TextButton(
+                            content="Save view as PNG",
+                            icon=ft.Icons.IMAGE_ROUNDED,
+                            data=(
+                                f"activation-overlay-save-png:{record.value_id}:"
+                                f"{plot.kind.value}"
+                            ),
+                            on_click=self._save_view_png_handler(
+                                plot, record.value_name
+                            ),
+                        )
+                    )
             dialog = ft.AlertDialog(
                 data=f"activation-overlay:{record.value_id}",
                 modal=True,
@@ -861,12 +940,105 @@ class ActivationInspector:
                 ],
                 scrollable=False,
             )
+            self._overlay_dialog = dialog
             self.page.show_dialog(dialog)
 
         return open_overlay
 
-    def _close_overlay(self, event: ft.Event[ft.TextButton]) -> None:
+    def close_overlay(self) -> bool:
+        """Close the large activation view if it is open; report whether it was."""
+        dialog = self._overlay_dialog
+        self._overlay_dialog = None
+        if dialog is None or not getattr(dialog, "open", False):
+            return False
         self.page.pop_dialog()
+        return True
+
+    def _close_overlay(self, event: ft.Event[ft.TextButton]) -> None:
+        self.close_overlay()
+
+    # -- export affordances ------------------------------------------------
+
+    @staticmethod
+    def _file_stem(value_name: str) -> str:
+        """A filesystem-safe default file stem for a captured value name."""
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", value_name).strip("._") or "activation"
+        return stem[:64]
+
+    def _save_activation_handler(
+        self,
+        trace_id: str,
+        record: ActivationRecord,
+    ) -> Callable[[ft.Event[ft.TextButton]], Coroutine[Any, Any, None]]:
+        """Save the captured bytes as a .npy tensor via the shell's picker.
+
+        The array is rebuilt from the record's dtype and shape through the
+        session's activation read path; a truncated capture saves the stored
+        prefix and the status message states the truncation.
+        """
+
+        async def save(event: ft.Event[ft.TextButton]) -> None:
+            session = self._session()
+            if session is None:
+                return
+            destination = await self._picker.save_file(
+                dialog_title=f"Save activation {record.value_name} as .npy",
+                file_name=f"{self._file_stem(record.value_name)}.npy",
+                allowed_extensions=["npy"],
+            )
+            if destination is None:
+                self._on_status("Activation save cancelled")
+                self.page.update()
+                return
+            try:
+                raw = session.activations(trace_id).read(record.value_id)
+                array, truncated = viewmodel.activation_array(
+                    record.numpy_dtype, record.shape, raw
+                )
+                with Path(destination).open("wb") as handle:
+                    np.save(handle, array)
+            except Exception as error:
+                self._on_error(f"Could not save the activation: {error}")
+            else:
+                if truncated:
+                    self._on_status(
+                        f"Saved the captured prefix of {record.value_name} "
+                        f"({record.stored_byte_length:,} of "
+                        f"{record.full_byte_length:,} bytes; the capture was "
+                        f"truncated) to {destination}"
+                    )
+                else:
+                    self._on_status(f"Saved {record.value_name} to {destination}")
+            self.page.update()
+
+        return save
+
+    def _save_view_png_handler(
+        self,
+        view: ActivationVisualization,
+        value_name: str,
+    ) -> Callable[[ft.Event[ft.TextButton]], Coroutine[Any, Any, None]]:
+        """Save a raster view's exact PNG bytes via the shell's picker."""
+
+        async def save(event: ft.Event[ft.TextButton]) -> None:
+            destination = await self._picker.save_file(
+                dialog_title=f"Save {view.title} as PNG",
+                file_name=f"{self._file_stem(value_name)}-{view.kind.value}.png",
+                allowed_extensions=["png"],
+            )
+            if destination is None:
+                self._on_status("View save cancelled")
+                self.page.update()
+                return
+            try:
+                Path(destination).write_bytes(view.raster_png)
+            except OSError as error:
+                self._on_error(f"Could not save the view: {error}")
+            else:
+                self._on_status(f"Saved {view.title} to {destination}")
+            self.page.update()
+
+        return save
 
     def _node_is_attention(self, node_id: str) -> bool:
         session = self._session()

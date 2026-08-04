@@ -20,9 +20,10 @@ import math
 import sys
 import tempfile
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from concurrent.futures import Future
 from pathlib import Path
+from typing import Any, Final, Protocol, runtime_checkable
 
 import flet as ft
 import flet.canvas as cv
@@ -58,7 +59,7 @@ from nneditor.ir.capabilities import ArtifactKind
 from nneditor.ir.core import AttrKind
 from nneditor.rendering import create_flet_renderer
 from nneditor.rendering.contract import InteractiveGraphRenderer, RendererFactory
-from nneditor.rendering.scene import Scene, Viewport
+from nneditor.rendering.scene import NodeGlyph, Scene, Viewport
 from nneditor.tracing.contracts import TraceDevice
 from nneditor.tracing.runner import recommended_trace_limits
 from nneditor.transformations.engine import (
@@ -70,6 +71,7 @@ from nneditor.ui import input_workspace, overview, shell_layout, viewmodel
 from nneditor.ui.activation_inspector import ActivationInspector
 from nneditor.ui.trace_graph import build_trace_graph
 from nneditor.ui.trace_panel import TracePanel, uses_automatic_mask
+from nneditor.ui.watch_panel import WatchPanel
 
 APP_TITLE = "NNEditor"
 APP_ASSETS_DIRECTORY = Path(__file__).resolve().parents[1] / "assets"
@@ -104,9 +106,106 @@ SHELL_PALETTE = shell_layout.ShellPalette(
     sidebar_width=_SIDEBAR_WIDTH,
 )
 
+_DETAIL_SEQUENCE: Final = (
+    DetailLevel.ARCHITECTURE,
+    DetailLevel.BLOCK,
+    DetailLevel.LAYER,
+    DetailLevel.OPERATOR,
+)
+
+_OVERLAY_MODES: Final = ("off", "nonfinite", "magnitude")
+"""The anomaly-overlay cycle: Off -> Non-finite -> Magnitude -> Off."""
+
+_OVERLAY_LABELS: Final = {
+    "off": "Overlay: Off",
+    "nonfinite": "Overlay: Non-finite",
+    "magnitude": "Overlay: Magnitude",
+}
+
+
+@runtime_checkable
+class _SupportsGlyphTint(Protocol):
+    """Renderers accepting a per-glyph fill override (the anomaly overlay).
+
+    Structural on purpose: the seam stays out of the mandatory renderer
+    contract, so a renderer without it simply shows no overlay instead of
+    failing to plug in.
+    """
+
+    def set_tint(self, tint: Callable[[str], str | None] | None) -> None: ...
+
+
+_DRILL_COVERAGE: Final = 0.45
+"""Surface share a hovered group glyph must reach before zooming in advances
+the representation regardless of absolute scale.
+
+``detail_for_scale`` thresholds assume layouts whose glyphs are readable near
+scale 1.0. A huge model's architecture fit sits at the minimum scale, an
+order of magnitude below the first transition threshold, so a region glyph
+can fill the screen while the absolute thresholds are still ~19 wheel steps
+away. What the user means by "zoom into that block" is glyph screen size, so
+the drill-through criterion is relative to it."""
+
+
+def next_detail_level(detail: DetailLevel) -> DetailLevel | None:
+    """The next-deeper semantic representation, or None at operator detail."""
+    position = _DETAIL_SEQUENCE.index(detail)
+    if position + 1 == len(_DETAIL_SEQUENCE):
+        return None
+    return _DETAIL_SEQUENCE[position + 1]
+
+
+def glyph_screen_coverage(
+    glyph_width: float,
+    glyph_height: float,
+    scale: float,
+    surface_width: float,
+    surface_height: float,
+) -> float:
+    """The dominant share of the surface a glyph occupies at a zoom level."""
+    if surface_width <= 0.0 or surface_height <= 0.0:
+        return 0.0
+    return max(
+        glyph_width * scale / surface_width,
+        glyph_height * scale / surface_height,
+    )
+
+
+def nearest_glyph_center(
+    nodes: Sequence[NodeGlyph],
+    x: float,
+    y: float,
+) -> tuple[float, float]:
+    """The center of the glyph closest to a world position."""
+    nearest = min(
+        nodes,
+        key=lambda node: (
+            (node.x + node.width / 2.0 - x) ** 2 + (node.y + node.height / 2.0 - y) ** 2
+        ),
+    )
+    return (nearest.x + nearest.width / 2.0, nearest.y + nearest.height / 2.0)
+
+
+def resolve_initial_palette(brightness: object) -> shell_layout.ShellPalette:
+    """Follow the platform brightness when Flet exposes it; default to light."""
+    value = getattr(brightness, "value", brightness)
+    if str(value).lower() == "dark":
+        return shell_layout.DARK_SHELL_PALETTE
+    return SHELL_PALETTE
+
 
 class Shell:
     """One page's worth of UI state and wiring."""
+
+    # Chrome containers composed by _compose_chrome and build; declared here
+    # because both consult the previous instance (visibility, tab index)
+    # before reassigning it on a theme rebuild.
+    left_panel: ft.Container
+    right_panel: ft.Container
+    empty_state: ft.Container
+    loading_overlay: ft.Container
+    surface: ft.Container
+    workspace_tabs: ft.Tabs
 
     def __init__(
         self,
@@ -172,24 +271,25 @@ class Shell:
         # one render instead of queueing a render per event.
         self._viewport_dirty = False
         self._viewport_flush: Future[None] | None = None
+        # One blank-canvas recovery may run per applied viewport; the flag
+        # keeps a recovery's own rebuilds from recursing into more recovery.
+        self._blank_recovery_active = False
         # The minimap's persistent viewport rectangle; dots rebuild only when
         # the scene changes, this rectangle mutates on every pan/zoom.
         self._minimap_view_rect: cv.Rect | None = None
 
-        self.picker = ft.FilePicker(on_upload=self._on_upload_progress)
-        # FilePicker is a Service, not a Control, in Flet 0.86: registering it
-        # in `page.overlay` makes the client reject it with "Unknown control:
-        # FilePicker" the moment the page renders.
-        page.services.append(self.picker)
+        self._init_theme_and_services(page)
 
         self.title_text = ft.Text(
             APP_TITLE,
             size=17,
-            color=_INK,
+            color=self.palette.ink,
             weight=ft.FontWeight.W_700,
         )
-        self.model_subtitle = ft.Text("Neural network explorer", size=11, color=_MUTED)
-        self.job_text = ft.Text("", size=11, color=_MUTED)
+        self.model_subtitle = ft.Text(
+            "Neural network explorer", size=11, color=self.palette.muted
+        )
+        self.job_text = ft.Text("", size=11, color=self.palette.muted)
         self.save_model_button = ft.FilledButton(
             content="Save changesâ€¦",
             icon=ft.Icons.SAVE_ROUNDED,
@@ -217,17 +317,19 @@ class Shell:
             on_click=self._on_toggle_right_panel,
         )
         self.status_text = ft.Text(
-            "Open a supported model artifact to begin.", size=11, color=_MUTED
+            "Open a supported model artifact to begin.",
+            size=11,
+            color=self.palette.muted,
         )
         self.device_icon = ft.Icon(
             ft.Icons.MEMORY_ROUNDED,
             size=15,
-            color=_MUTED,
+            color=self.palette.muted,
         )
         self.device_text = ft.Text(
             "Device: idle",
             size=10,
-            color=_MUTED,
+            color=self.palette.muted,
             weight=ft.FontWeight.W_600,
         )
         self.device_indicator = ft.Container(
@@ -238,14 +340,14 @@ class Shell:
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             padding=ft.Padding.symmetric(horizontal=9, vertical=6),
-            bgcolor=_CANVAS,
-            border=ft.Border.all(1, _BORDER),
+            bgcolor=self.palette.canvas,
+            border=ft.Border.all(1, self.palette.border),
             border_radius=14,
             tooltip="No inference trace is running.",
         )
         self.error_banner = ft.Container(
             content=ft.Text("", color="#FFFFFF"),
-            bgcolor="#B42318",
+            bgcolor=self.palette.danger,
             padding=ft.Padding.symmetric(horizontal=16, vertical=10),
             visible=False,
         )
@@ -343,10 +445,13 @@ class Shell:
         self.search_results = ft.ListView(expand=True, spacing=0)
         self.inspector = ft.ListView(expand=True, spacing=14)
         self.inspector_title = ft.Text(
-            "Model overview", size=17, weight=ft.FontWeight.W_700, color=_INK
+            "Model overview",
+            size=17,
+            weight=ft.FontWeight.W_700,
+            color=self.palette.ink,
         )
         self.inspector_subtitle = ft.Text(
-            "Select a block to inspect it", size=11, color=_MUTED
+            "Select a block to inspect it", size=11, color=self.palette.muted
         )
         self.open_selection_button = ft.FilledButton(
             content="Open block",
@@ -360,8 +465,10 @@ class Shell:
             on_click=self._on_back_to_parent,
             visible=False,
         )
-        self.hover_title = ft.Text("", size=13, weight=ft.FontWeight.W_700, color=_INK)
-        self.hover_summary = ft.Text("", size=11, color=_MUTED, max_lines=3)
+        self.hover_title = ft.Text(
+            "", size=13, weight=ft.FontWeight.W_700, color=self.palette.ink
+        )
+        self.hover_summary = ft.Text("", size=11, color=self.palette.muted, max_lines=3)
         self.hover_card = ft.Container(
             content=ft.Column(
                 controls=[self.hover_title, self.hover_summary],
@@ -370,8 +477,8 @@ class Shell:
             ),
             width=260,
             padding=12,
-            bgcolor=_PANEL,
-            border=ft.Border.all(1, _BORDER),
+            bgcolor=self.palette.panel,
+            border=ft.Border.all(1, self.palette.border),
             border_radius=12,
             shadow=ft.BoxShadow(
                 blur_radius=24,
@@ -517,16 +624,18 @@ class Shell:
         self.input_generator = input_workspace.TestInputWorkspace(
             page=page,
             picker=self.picker,
-            palette=SHELL_PALETTE,
+            palette=self.palette,
             assign=self._assign_generated_input,
             on_error=self._show_error,
             on_status=self._set_status,
             clear_error=self._clear_error,
             watch_text_focus=self._watch_text_focus,
         )
+        self._init_watch_and_overlay(page)
         self.activations = ActivationInspector(
             page=page,
-            palette=SHELL_PALETTE,
+            picker=self.picker,
+            palette=self.palette,
             session=lambda: self.session,
             current_graph=lambda: self.current_graph,
             current_slice=lambda: self.current_slice,
@@ -542,11 +651,13 @@ class Shell:
             on_error=self._show_error,
             on_status=self._set_status,
             watch_text_focus=self._watch_text_focus,
+            pin_value=self.watch.pin,
+            on_statistics_ready=self._on_statistics_landed,
         )
         self.trace = TracePanel(
             page=page,
             picker=self.picker,
-            palette=SHELL_PALETTE,
+            palette=self.palette,
             renderer=self.renderer,
             session=lambda: self.session,
             current_graph=lambda: self.current_graph,
@@ -567,7 +678,7 @@ class Shell:
             watch_text_focus=self._watch_text_focus,
         )
 
-        edit_controls = ft.Column(
+        self._edit_controls = ft.Column(
             controls=[
                 self.edit_kind,
                 self.edit_primary,
@@ -598,7 +709,7 @@ class Shell:
             ],
             spacing=8,
         )
-        transformation_controls = ft.Column(
+        self._transformation_controls = ft.Column(
             controls=[
                 self.transformation_kind,
                 self.transformation_granularity,
@@ -622,72 +733,23 @@ class Shell:
             ],
             spacing=8,
         )
-        self.left_panel = shell_layout.build_left_panel(
-            palette=SHELL_PALETTE,
-            inspector_title=self.inspector_title,
-            inspector_subtitle=self.inspector_subtitle,
-            open_selection_button=self.open_selection_button,
-            back_to_parent_button=self.back_to_parent_button,
-            inspector=self.inspector,
-            trace_controls=self.trace.control,
-            edit_controls=edit_controls,
-            transformation_controls=transformation_controls,
-        )
-        hierarchy_tools = shell_layout.build_hierarchy_tools(
-            multi_select_field=self.multi_select_field,
-            group_label_field=self.group_label_field,
-            group_button=self.group_button,
-            merge_button=self.merge_button,
-            rename_button=self.rename_button,
-            split_button=self.split_button,
-            lock_button=self.lock_button,
-            reject_button=self.reject_button,
-            reset_groups_button=self.reset_groups_button,
-        )
-        self.right_panel = shell_layout.build_right_panel(
-            palette=SHELL_PALETTE,
-            search_field=self.search_field,
-            search_results=self.search_results,
-            graph_list=self.graph_list,
-            hierarchy_list=self.hierarchy_list,
-            hierarchy_tools=hierarchy_tools,
-            minimap=self.minimap,
-        )
-        self.empty_state = shell_layout.build_empty_state(
-            palette=SHELL_PALETTE,
-            on_open=self._on_open_clicked,
-        )
         self.loading_title = ft.Text(
             "Preparing model",
             size=18,
             weight=ft.FontWeight.W_700,
-            color=_INK,
+            color=self.palette.ink,
         )
         self.loading_stage = ft.Text(
             "Indexing topology, detecting blocks, and laying out the architecture…",
             size=12,
-            color=_MUTED,
+            color=self.palette.muted,
             text_align=ft.TextAlign.CENTER,
         )
         self.cancel_open_button = ft.TextButton(
             content="Cancel",
             on_click=self._on_cancel_open,
         )
-        self.loading_overlay = shell_layout.build_loading_overlay(
-            palette=SHELL_PALETTE,
-            title=self.loading_title,
-            stage=self.loading_stage,
-            cancel_button=self.cancel_open_button,
-        )
-        self.surface = shell_layout.build_surface(
-            palette=SHELL_PALETTE,
-            renderer_control=self.renderer_control,
-            graph_actions=self.trace.graph_actions,
-            empty_state=self.empty_state,
-            hover_card=self.hover_card,
-            loading_overlay=self.loading_overlay,
-            on_size_change=self._on_surface_size,
-        )
+        self._compose_chrome()
         for text_field in (
             self.group_label_field,
             self.search_field,
@@ -700,6 +762,300 @@ class Shell:
             self._watch_text_focus(text_field)
 
     # -- construction ------------------------------------------------------
+
+    def _init_theme_and_services(self, page: ft.Page) -> None:
+        """Pick the starting palette and register the page-level services."""
+        self.palette = resolve_initial_palette(
+            getattr(page, "platform_brightness", None)
+        )
+        dark = self.palette is shell_layout.DARK_SHELL_PALETTE
+        page.theme_mode = ft.ThemeMode.DARK if dark else ft.ThemeMode.LIGHT
+        page.bgcolor = self.palette.canvas
+        self.theme_toggle = ft.IconButton(
+            icon=(ft.Icons.LIGHT_MODE_ROUNDED if dark else ft.Icons.DARK_MODE_ROUNDED),
+            tooltip="Switch between light and dark mode",
+            on_click=self._on_toggle_theme,
+        )
+        self._root: ft.Control | None = None
+        self.picker = ft.FilePicker(on_upload=self._on_upload_progress)
+        self.clipboard = ft.Clipboard()
+        # FilePicker and Clipboard are Services, not Controls, in Flet 0.86:
+        # registering them in `page.overlay` makes the client reject them with
+        # "Unknown control" the moment the page renders.
+        page.services.append(self.picker)
+        page.services.append(self.clipboard)
+
+    def _init_watch_and_overlay(self, page: ft.Page) -> None:
+        """Construct the watch strip and the anomaly-overlay toolbar state.
+
+        The watch panel's accessors are deliberately lazy lambdas: the
+        activation inspector and trace panel they reach are constructed
+        after this call, and are only dereferenced at event time.
+        """
+        self.overlay_mode: str = "off"
+        # Per-operator anomaly severity: node id -> (rank, tint color). A
+        # semantic glyph tints by the worst rank among its members.
+        self._overlay_node_severity: dict[str, tuple[int, str]] = {}
+        self.overlay_button = ft.TextButton(
+            content=_OVERLAY_LABELS["off"],
+            icon=ft.Icons.GRADIENT_ROUNDED,
+            tooltip=(
+                "Tint glyphs by numeric anomalies in the active trace's "
+                "computed statistics — press to cycle Off, Non-finite, "
+                "Magnitude"
+            ),
+            style=ft.ButtonStyle(color=self.palette.ink),
+            on_click=self._on_cycle_overlay,
+        )
+        self.overlay_legend = ft.Text(
+            "",
+            size=10,
+            color=self.palette.muted,
+            visible=False,
+        )
+        self.watch = WatchPanel(
+            page=page,
+            palette=self.palette,
+            session=lambda: self.session,
+            active_trace_id=lambda: self.trace.active_trace_id,
+            statistics=lambda: self.activations.activation_statistics,
+            statistics_loading=lambda: self.activations.activation_loading,
+            on_statistics_ready=self._on_statistics_landed,
+            on_status=self._set_status,
+            on_error=self._show_error,
+        )
+
+    # -- anomaly overlay ---------------------------------------------------
+
+    def _on_cycle_overlay(self, event: ft.Event[ft.TextButton] | None = None) -> None:
+        """Advance the anomaly overlay: Off -> Non-finite -> Magnitude."""
+        position = _OVERLAY_MODES.index(self.overlay_mode)
+        self.overlay_mode = _OVERLAY_MODES[(position + 1) % len(_OVERLAY_MODES)]
+        self._refresh_overlay_tint()
+        if self.overlay_mode == "off":
+            self._set_status("Anomaly overlay off")
+        else:
+            self._set_status(
+                f"{_OVERLAY_LABELS[self.overlay_mode]} — only values with "
+                "computed statistics participate; compute more from the "
+                "inspector or the watch list"
+            )
+        self.page.update()
+
+    def _on_statistics_landed(self) -> None:
+        """A statistics job landed: refresh the watch strip and overlay."""
+        self.watch.refresh()
+        if self.overlay_mode != "off":
+            self._refresh_overlay_tint()
+
+    def _refresh_overlay_tint(self) -> None:
+        """Recompute glyph tints from already-computed statistics.
+
+        The overlay never schedules statistics jobs: it renders whatever has
+        landed so far and the legend reports the resulting coverage. The
+        renderer keeps the tint callable across scene rebuilds, so the
+        overlay survives pan, zoom, and detail changes without re-arming.
+        """
+        self._overlay_node_severity = self._overlay_severities()
+        if isinstance(self.renderer, _SupportsGlyphTint):
+            active = self.overlay_mode != "off" and bool(self._overlay_node_severity)
+            self.renderer.set_tint(self._overlay_tint if active else None)
+        self._sync_overlay_controls()
+
+    def _overlay_severities(self) -> dict[str, tuple[int, str]]:
+        """Per-operator severity from the active trace's computed statistics."""
+        trace_id = self.trace.active_trace_id
+        if self.overlay_mode == "off" or self.session is None or trace_id is None:
+            return {}
+        try:
+            result = self.session.trace(trace_id)
+        except (KeyError, ValueError):
+            return {}
+        store = self.activations.activation_statistics
+        magnitudes: dict[str, float] = {}
+        flagged: dict[str, tuple[int, str]] = {}
+        for record in result.records:
+            if record.node_id is None:
+                continue
+            stats = store.get((trace_id, record.value_id))
+            if stats is None:
+                continue
+            if self.overlay_mode == "nonfinite":
+                if stats.nan_count + stats.inf_count > 0:
+                    flagged[record.node_id] = (1, self.palette.danger)
+            else:
+                magnitude = max(
+                    abs(stats.minimum or 0.0),
+                    abs(stats.maximum or 0.0),
+                )
+                magnitudes[record.node_id] = max(
+                    magnitudes.get(record.node_id, 0.0), magnitude
+                )
+        if self.overlay_mode == "nonfinite":
+            return flagged
+        if not magnitudes:
+            return {}
+        # Three tercile steps over the per-node max-|value| distribution,
+        # routed through the palette's accent/warning scale.
+        ordered = sorted(magnitudes.values())
+        steps = (
+            self.palette.accent_soft,
+            self.palette.warning_border,
+            self.palette.warning,
+        )
+        low = ordered[max(0, math.ceil(len(ordered) / 3) - 1)]
+        high = ordered[max(0, math.ceil(2 * len(ordered) / 3) - 1)]
+        severities: dict[str, tuple[int, str]] = {}
+        for node_id, magnitude in magnitudes.items():
+            step = 0 if magnitude <= low else 1 if magnitude <= high else 2
+            severities[node_id] = (step, steps[step])
+        return severities
+
+    def _overlay_tint(self, glyph_id: str) -> str | None:
+        """The override fill for one glyph: its worst member's severity."""
+        severity = self._overlay_node_severity
+        if not severity:
+            return None
+        members: frozenset[str] = frozenset((glyph_id,))
+        if self.current_slice is not None:
+            members = self.current_slice.members_by_glyph.get(glyph_id, members)
+        worst: tuple[int, str] | None = None
+        for member in members:
+            entry = severity.get(member)
+            if entry is not None and (worst is None or entry[0] > worst[0]):
+                worst = entry
+        return None if worst is None else worst[1]
+
+    def _sync_overlay_controls(self) -> None:
+        """Reflect the overlay mode and coverage on the toolbar controls."""
+        self.overlay_button.content = _OVERLAY_LABELS[self.overlay_mode]
+        self.overlay_button.style = ft.ButtonStyle(
+            color=(
+                self.palette.accent if self.overlay_mode != "off" else self.palette.ink
+            )
+        )
+        if self.overlay_mode == "off":
+            self.overlay_legend.value = ""
+            self.overlay_legend.visible = False
+            return
+        scene = self.renderer.scene
+        tinted = 0
+        total = 0
+        if scene is not None:
+            total = scene.node_count
+            tinted = sum(
+                1 for node in scene.nodes if self._overlay_tint(node.id) is not None
+            )
+        self.overlay_legend.value = f"tinted {tinted:,} of {total:,}"
+        self.overlay_legend.visible = True
+
+    def _reset_overlay(self) -> None:
+        """Drop the overlay with its per-trace severity state."""
+        self.overlay_mode = "off"
+        self._overlay_node_severity = {}
+        if isinstance(self.renderer, _SupportsGlyphTint):
+            self.renderer.set_tint(None)
+        self._sync_overlay_controls()
+
+    def _compose_chrome(self) -> None:
+        """(Re)compose the palette-bearing containers around retained controls.
+
+        Runs at construction and again on a theme toggle. Visibility state
+        carries over so a rebuild never reopens a panel the user closed or
+        drops the loading overlay mid-open.
+        """
+        left_visible = self.left_panel.visible if hasattr(self, "left_panel") else True
+        right_visible = (
+            self.right_panel.visible if hasattr(self, "right_panel") else True
+        )
+        empty_visible = (
+            self.empty_state.visible if hasattr(self, "empty_state") else True
+        )
+        loading_visible = (
+            self.loading_overlay.visible if hasattr(self, "loading_overlay") else False
+        )
+        self.left_panel = shell_layout.build_left_panel(
+            palette=self.palette,
+            inspector_title=self.inspector_title,
+            inspector_subtitle=self.inspector_subtitle,
+            open_selection_button=self.open_selection_button,
+            back_to_parent_button=self.back_to_parent_button,
+            inspector=self.inspector,
+            trace_controls=self.trace.control,
+            edit_controls=self._edit_controls,
+            transformation_controls=self._transformation_controls,
+        )
+        self.left_panel.visible = left_visible
+        hierarchy_tools = shell_layout.build_hierarchy_tools(
+            multi_select_field=self.multi_select_field,
+            group_label_field=self.group_label_field,
+            group_button=self.group_button,
+            merge_button=self.merge_button,
+            rename_button=self.rename_button,
+            split_button=self.split_button,
+            lock_button=self.lock_button,
+            reject_button=self.reject_button,
+            reset_groups_button=self.reset_groups_button,
+        )
+        self.right_panel = shell_layout.build_right_panel(
+            palette=self.palette,
+            search_field=self.search_field,
+            search_results=self.search_results,
+            graph_list=self.graph_list,
+            hierarchy_list=self.hierarchy_list,
+            hierarchy_tools=hierarchy_tools,
+            minimap=self.minimap,
+        )
+        self.right_panel.visible = right_visible
+        self._mount_watch_section()
+        self.empty_state = shell_layout.build_empty_state(
+            palette=self.palette,
+            on_open=self._on_open_clicked,
+        )
+        self.empty_state.visible = empty_visible
+        self.loading_overlay = shell_layout.build_loading_overlay(
+            palette=self.palette,
+            title=self.loading_title,
+            stage=self.loading_stage,
+            cancel_button=self.cancel_open_button,
+        )
+        self.loading_overlay.visible = loading_visible
+        self.surface = shell_layout.build_surface(
+            palette=self.palette,
+            renderer_control=self.renderer_control,
+            graph_actions=self.trace.graph_actions,
+            empty_state=self.empty_state,
+            hover_card=self.hover_card,
+            loading_overlay=self.loading_overlay,
+            on_size_change=self._on_surface_size,
+        )
+
+    def _mount_watch_section(self) -> None:
+        """Slot the watch strip into the right panel, above the minimap.
+
+        `shell_layout.build_right_panel` owns the explorer arrangement; the
+        watch strip mounts behind its own collapsible tile so pinned values
+        stay reachable without crowding navigation. The strip control is
+        retained, so a theme rebuild re-wraps the same rows.
+        """
+        column = self.right_panel.content
+        assert isinstance(column, ft.Column)
+        tile = ft.ExpansionTile(
+            data="watch-panel-section",
+            title=ft.Text("Watched activations", size=12, color=self.palette.ink),
+            leading=ft.Icon(
+                ft.Icons.PUSH_PIN_ROUNDED,
+                size=17,
+                color=self.palette.accent,
+            ),
+            controls=[self.watch.control],
+            controls_padding=ft.Padding.only(left=8, right=8, bottom=12),
+            dense=True,
+            maintain_state=True,
+        )
+        # The last two explorer rows are the minimap heading and the minimap
+        # itself; the watch section slots in directly above them.
+        column.controls.insert(len(column.controls) - 2, tile)
 
     def build(self) -> ft.Control:
         top_bar = ft.Row(
@@ -734,6 +1090,7 @@ class Shell:
                 self.device_indicator,
                 self.job_text,
                 self.file_types_button,
+                self.theme_toggle,
                 self.left_toggle,
                 self.right_toggle,
             ],
@@ -747,10 +1104,12 @@ class Shell:
                     ft.Container(expand=True),
                     self.reset_view_button,
                     self.organize_button,
+                    self.overlay_button,
+                    self.overlay_legend,
                     ft.Text(
                         "View",
                         size=10,
-                        color=_MUTED,
+                        color=self.palette.muted,
                         weight=ft.FontWeight.W_700,
                     ),
                     self.detail_segment,
@@ -759,8 +1118,8 @@ class Shell:
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             padding=ft.Padding.symmetric(horizontal=14, vertical=8),
-            bgcolor=_PANEL,
-            border=ft.Border.only(bottom=ft.BorderSide(1, _BORDER)),
+            bgcolor=self.palette.panel,
+            border=ft.Border.only(bottom=ft.BorderSide(1, self.palette.border)),
         )
         graph_workspace = ft.Column(
             controls=[workspace_header, self.surface],
@@ -774,6 +1133,9 @@ class Shell:
             vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
         generator_workspace = self.input_generator.control
+        selected_tab = (
+            self.workspace_tabs.selected_index if hasattr(self, "workspace_tabs") else 0
+        )
         self.workspace_tabs = ft.Tabs(
             content=ft.Column(
                 controls=[
@@ -789,9 +1151,9 @@ class Shell:
                             ),
                         ],
                         scrollable=False,
-                        indicator_color=_ACCENT,
-                        label_color=_ACCENT,
-                        unselected_label_color=_MUTED,
+                        indicator_color=self.palette.accent,
+                        label_color=self.palette.accent,
+                        unselected_label_color=self.palette.muted,
                     ),
                     ft.TabBarView(
                         controls=[model_workspace, generator_workspace],
@@ -802,16 +1164,16 @@ class Shell:
                 spacing=0,
             ),
             length=2,
-            selected_index=0,
+            selected_index=selected_tab,
             expand=True,
         )
-        return ft.Column(
+        root = ft.Column(
             controls=[
                 ft.Container(
                     content=top_bar,
                     padding=ft.Padding.symmetric(horizontal=14, vertical=9),
-                    bgcolor=_PANEL,
-                    border=ft.Border.only(bottom=ft.BorderSide(1, _BORDER)),
+                    bgcolor=self.palette.panel,
+                    border=ft.Border.only(bottom=ft.BorderSide(1, self.palette.border)),
                 ),
                 self.error_banner,
                 self.workspace_tabs,
@@ -821,7 +1183,7 @@ class Shell:
                             ft.Container(
                                 width=7,
                                 height=7,
-                                bgcolor="#12B76A",
+                                bgcolor=self.palette.success,
                                 border_radius=4,
                             ),
                             self.status_text,
@@ -829,13 +1191,15 @@ class Shell:
                         spacing=7,
                     ),
                     padding=ft.Padding.symmetric(horizontal=14, vertical=7),
-                    bgcolor=_PANEL,
-                    border=ft.Border.only(top=ft.BorderSide(1, _BORDER)),
+                    bgcolor=self.palette.panel,
+                    border=ft.Border.only(top=ft.BorderSide(1, self.palette.border)),
                 ),
             ],
             expand=True,
             spacing=0,
         )
+        self._root = root
+        return root
 
     def apply_layout_for_width(self, width: float) -> None:
         """Collapse the side panels on narrow windows, reversibly.
@@ -870,6 +1234,74 @@ class Shell:
         self.right_panel.visible = self.right_panel_override
         self._refresh_panel_toggles()
         self.page.update()
+
+    def _on_toggle_theme(self, event: ft.Event[ft.IconButton] | None = None) -> None:
+        self._set_theme(dark=self.palette is not shell_layout.DARK_SHELL_PALETTE)
+
+    def _set_theme(self, *, dark: bool) -> None:
+        """Switch the palette and rebuild the chrome around the live state.
+
+        The canvas, panels, status bar, and inspector chrome all recolor in
+        place; the trace and test-input panels keep their constructed colors
+        until the next model open, which the status line discloses.
+        """
+        self.palette = shell_layout.DARK_SHELL_PALETTE if dark else SHELL_PALETTE
+        self.page.theme_mode = ft.ThemeMode.DARK if dark else ft.ThemeMode.LIGHT
+        self.page.bgcolor = self.palette.canvas
+        self.theme_toggle.icon = (
+            ft.Icons.LIGHT_MODE_ROUNDED if dark else ft.Icons.DARK_MODE_ROUNDED
+        )
+        # These panels re-render from `self.palette` on their next refresh.
+        self.activations.palette = self.palette
+        self.trace.palette = self.palette
+        self.input_generator.palette = self.palette
+        self.watch.palette = self.palette
+        self._apply_palette_to_controls()
+        old_root = self._root
+        self._compose_chrome()
+        new_root = self.build()
+        controls = getattr(self.page, "controls", None)
+        if controls is not None and old_root in controls:
+            controls[controls.index(old_root)] = new_root
+        if self.session is not None:
+            # Dynamic rows bake colors at render time; re-render them all so
+            # the open model recolors live rather than on the next click.
+            self._refresh_graph_list()
+            self._refresh_hierarchy()
+            self._refresh_breadcrumbs()
+            self._refresh_inspector(self._inspected_ids)
+            self._rebuild_minimap()
+            self.watch.refresh()
+            if self.overlay_mode != "off":
+                # Severity colors were baked from the previous palette.
+                self._refresh_overlay_tint()
+        self._set_status(
+            f"Switched to {'dark' if dark else 'light'} mode; trace and "
+            "test-input panels adopt it fully when a model is next opened"
+        )
+        self.page.update()
+
+    def _apply_palette_to_controls(self) -> None:
+        """Recolor the retained stateful controls the chrome rebuild reuses."""
+        palette = self.palette
+        self.title_text.color = palette.ink
+        self.model_subtitle.color = palette.muted
+        self.job_text.color = palette.muted
+        self.status_text.color = palette.muted
+        self.inspector_title.color = palette.ink
+        self.inspector_subtitle.color = palette.muted
+        self.loading_title.color = palette.ink
+        self.loading_stage.color = palette.muted
+        self.hover_title.color = palette.ink
+        self.hover_summary.color = palette.muted
+        self.hover_card.bgcolor = palette.panel
+        self.hover_card.border = ft.Border.all(1, palette.border)
+        self.error_banner.bgcolor = palette.danger
+        self.device_indicator.bgcolor = palette.canvas
+        self.overlay_legend.color = palette.muted
+        self.overlay_button.style = ft.ButtonStyle(
+            color=palette.accent if self.overlay_mode != "off" else palette.ink
+        )
 
     def _on_register_file_types(
         self,
@@ -946,7 +1378,7 @@ class Shell:
 
     # -- event handlers ----------------------------------------------------
 
-    async def _on_open_clicked(self, event: ft.Event[ft.Button]) -> None:
+    async def _on_open_clicked(self, event: ft.Event[ft.Button] | None = None) -> None:
         if self.open_job is not None and not self.open_job.state.is_terminal:
             return
         if self._pending_web_upload is not None:
@@ -1096,6 +1528,9 @@ class Shell:
         self.pending_transformation = None
         self.pending_target = None
         self.trace.reset()
+        # Pins and overlay severities are per-session state.
+        self.watch.reset()
+        self._reset_overlay()
         self.search_field.value = ""
         self.search_results.controls = []
         self.graph_list.controls = []
@@ -1136,16 +1571,19 @@ class Shell:
         delta_y = event.scroll_delta.y if event.scroll_delta is not None else 0.0
         if delta_y == 0.0:
             return
-        old_scale = self.view["scale"]
         position = event.local_position
-        anchor_x = self.view["x"] + position.x / old_scale
-        anchor_y = self.view["y"] + position.y / old_scale
-        factor = 0.9 if delta_y > 0 else 1.1
+        self._zoom_at(position.x, position.y, 0.9 if delta_y > 0 else 1.1)
+
+    def _zoom_at(self, screen_x: float, screen_y: float, factor: float) -> None:
+        """Zoom about a screen anchor, advancing auto-detail when due."""
+        old_scale = self.view["scale"]
+        anchor_x = self.view["x"] + screen_x / old_scale
+        anchor_y = self.view["y"] + screen_y / old_scale
         new_scale = max(0.02, min(4.0, old_scale * factor))
         self.view = {
             "scale": new_scale,
-            "x": anchor_x - position.x / new_scale,
-            "y": anchor_y - position.y / new_scale,
+            "x": anchor_x - screen_x / new_scale,
+            "y": anchor_y - screen_y / new_scale,
         }
         if self.auto_detail:
             resolved = detail_for_scale(new_scale)
@@ -1153,7 +1591,48 @@ class Shell:
                 self.current_detail = resolved
                 self._replace_current_representation(fit=False)
                 return
+            if factor > 1.0 and self._drill_through_at(anchor_x, anchor_y, new_scale):
+                return
         self._request_viewport_apply()
+
+    def _drill_through_at(
+        self,
+        world_x: float,
+        world_y: float,
+        scale: float,
+    ) -> bool:
+        """Advance the representation when zooming into a dominant group glyph.
+
+        The absolute ``detail_for_scale`` thresholds never fire on huge models
+        whose architecture fit sits at the minimum scale, so a group glyph
+        under the cursor that already covers most of the surface is the
+        relative signal that the user is zooming *into* it. The transition
+        itself reuses the existing auto-detail mechanics (rebuild in place,
+        cursor anchor preserved).
+        """
+        if self.current_detail not in (DetailLevel.ARCHITECTURE, DetailLevel.BLOCK):
+            return False
+        scene = self.renderer.scene
+        if scene is None:
+            return False
+        hit = self.renderer.hit_test(world_x, world_y)
+        if hit is None or scene.has_edge(hit):
+            return False
+        glyph = scene.node(hit)
+        if glyph.kind != "group":
+            return False
+        width, height = self.surface_size
+        coverage = glyph_screen_coverage(
+            glyph.width, glyph.height, scale, width, height
+        )
+        if coverage < _DRILL_COVERAGE:
+            return False
+        advanced = next_detail_level(self.current_detail)
+        if advanced is None:
+            return False
+        self.current_detail = advanced
+        self._replace_current_representation(fit=False)
+        return True
 
     def _request_viewport_apply(self) -> None:
         """Apply the current viewport, coalescing gesture bursts.
@@ -1182,7 +1661,7 @@ class Shell:
             # before the next apply; they only record coordinates.
             await asyncio.sleep(0)
 
-    def _on_reset_view(self, event: ft.Event[ft.TextButton]) -> None:
+    def _on_reset_view(self, event: ft.Event[ft.TextButton] | None = None) -> None:
         """Refit the current context without changing navigation or selection."""
         if self.session is None or self.current_slice is None:
             return
@@ -1638,6 +2117,9 @@ class Shell:
         self._saved_revision_id = None
         self.activations.reset()
         self.trace.reset()
+        # Pins and overlay severities belong to the outgoing session.
+        self.watch.reset()
+        self._reset_overlay()
         self.pending_edit = None
         self.pending_transformation = None
         self.pending_target = None
@@ -1688,9 +2170,13 @@ class Shell:
                     else ft.Icons.SCHEMA_ROUNDED
                 ),
                 style=ft.ButtonStyle(
-                    color=_ACCENT if entry.graph_id == self.current_graph else _INK,
+                    color=(
+                        self.palette.accent
+                        if entry.graph_id == self.current_graph
+                        else self.palette.ink
+                    ),
                     bgcolor=(
-                        _ACCENT_SOFT
+                        self.palette.accent_soft
                         if entry.graph_id == self.current_graph
                         else "#00FFFFFF"
                     ),
@@ -1707,7 +2193,7 @@ class Shell:
                     f"Showing {_MAX_EXPLORER_ROWS} of {len(entries)} graphs. "
                     "Use search to reach the rest.",
                     size=10,
-                    color=_MUTED,
+                    color=self.palette.muted,
                 )
             )
         self.graph_list.controls = rows
@@ -1791,6 +2277,10 @@ class Shell:
         }
         self.renderer.replace_scene(scene, self._current_viewport())
         self.trace.refresh_graph_actions()
+        if self.overlay_mode != "off":
+            # The tint survives the rebuild inside the renderer; only the
+            # legend's glyph counts depend on the replaced scene.
+            self._sync_overlay_controls()
 
     def _redraw_scene(self) -> None:
         """Re-render the current context in place, keeping the viewport."""
@@ -1800,6 +2290,11 @@ class Shell:
             self._display_scene(self.current_slice),
             self._current_viewport(),
         )
+        # A redraw follows trace and comparison changes; the watched rows
+        # and overlay tints derive from exactly that state.
+        self.watch.refresh()
+        if self.overlay_mode != "off":
+            self._refresh_overlay_tint()
 
     def _display_scene(self, layout: GraphSlice) -> Scene:
         """Apply the active trace/comparison view without changing base layout."""
@@ -1846,6 +2341,12 @@ class Shell:
                 self._display_scene(layout), self._current_viewport()
             )
             self.trace.refresh_graph_actions()
+            if self.overlay_mode != "off":
+                self._sync_overlay_controls()
+            # A kept viewport can land outside the replacement layout's
+            # populated area; recover here because this path never goes
+            # through _apply_viewport.
+            self._recover_blank_canvas()
         self._restore_logical_selection()
         self._refresh_hierarchy()
         self._refresh_breadcrumbs()
@@ -1971,6 +2472,7 @@ class Shell:
     def _apply_viewport(self) -> None:
         self.renderer.set_viewport(self._current_viewport())
         self.trace.refresh_graph_actions()
+        self._recover_blank_canvas()
         stats = self.renderer.stats
         status = (
             f"{stats.visible_nodes} nodes, {stats.visible_edges} edges visible "
@@ -1991,6 +2493,49 @@ class Shell:
         # mounted control — including thousands of canvas shapes — per event.
         self._update_control(self.status_text)
         self._update_control(self.trace.graph_actions)
+
+    def _culled_scene_is_blank(self) -> bool:
+        scene = self.renderer.scene
+        if scene is None or scene.node_count == 0:
+            return False
+        stats = self.renderer.stats
+        return stats.visible_nodes == 0 and stats.shape_count == 0
+
+    def _recover_blank_canvas(self) -> None:
+        """Never leave the user staring at nothing while the graph has nodes.
+
+        A cursor-anchored zoom deep into inter-glyph space, or a semantic
+        rebuild whose layout populates a different region of world space, can
+        leave the culled viewport empty. One recovery runs per applied
+        viewport: under auto-detail a deeper representation is tried first
+        (anchored in place, the existing transition mechanics), and if the
+        view is still empty the viewport is clamped onto the nearest glyph so
+        at least one stays visible. The flag keeps the recovery's own
+        rebuilds from recursing into further recovery — never a loop.
+        """
+        if self._blank_recovery_active or not self._culled_scene_is_blank():
+            return
+        self._blank_recovery_active = True
+        try:
+            if self.auto_detail:
+                advanced = next_detail_level(self.current_detail)
+                if advanced is not None:
+                    self.current_detail = advanced
+                    self._replace_current_representation(fit=False)
+            if self._culled_scene_is_blank():
+                scene = self.renderer.scene
+                assert scene is not None
+                viewport = self._current_viewport()
+                center_x, center_y = nearest_glyph_center(
+                    scene.nodes,
+                    viewport.x + viewport.width / 2.0,
+                    viewport.y + viewport.height / 2.0,
+                )
+                self.view["x"] = center_x - viewport.width / 2.0
+                self.view["y"] = center_y - viewport.height / 2.0
+                self.renderer.set_viewport(self._current_viewport())
+        finally:
+            self._blank_recovery_active = False
 
     @staticmethod
     def _update_control(control: ft.Control) -> None:
@@ -2065,6 +2610,15 @@ class Shell:
                         role="selection-item-metadata",
                     )
                 )
+                rows.append(
+                    ft.TextButton(
+                        content="Copy as JSON",
+                        icon=ft.Icons.CONTENT_COPY_ROUNDED,
+                        data=f"copy-node-json:{node_id}",
+                        tooltip="Copy this node's metadata to the clipboard",
+                        on_click=self._copy_node_json_handler(node_id),
+                    )
+                )
                 show_tensors = True
             if show_tensors:
                 rows.extend(self.activations.tensor_rows(node_id))
@@ -2084,6 +2638,21 @@ class Shell:
             rows.extend(overview.model_overview_controls(document))
         self.inspector.controls = rows
         self._refresh_edit_actions()
+
+    def _copy_node_json_handler(
+        self, node_id: str
+    ) -> Callable[[ft.Event[ft.TextButton]], None]:
+        def copy(event: ft.Event[ft.TextButton]) -> None:
+            if self.session is None or self.current_graph is None:
+                return
+            details = viewmodel.node_details(
+                self.session.document, self.current_graph, node_id
+            )
+            self._start_async(self.clipboard.set, viewmodel.node_details_json(details))
+            self._set_status("Node metadata copied to the clipboard as JSON")
+            self.page.update()
+
+        return copy
 
     # -- transactional edit UI (Phase 4) ---------------------------------
 
@@ -2201,7 +2770,7 @@ class Shell:
         except Exception as error:
             self.pending_transformation = None
             self.transformation_findings.controls = [
-                ft.Text(f"[error] {error}", size=10, color="#C0392B")
+                ft.Text(f"[error] {error}", size=10, color=self.palette.danger)
             ]
             self._set_status("Transformation preview failed")
         else:
@@ -2214,9 +2783,9 @@ class Shell:
                         f"[{finding.level.value}] {finding.code}: {finding.message}",
                         size=10,
                         color=(
-                            "#C0392B"
+                            self.palette.danger
                             if finding.level.value == "error"
-                            else "#8A5A00"
+                            else self.palette.warning
                             if finding.level.value == "warning"
                             else None
                         ),
@@ -2376,7 +2945,7 @@ class Shell:
         except Exception as error:
             self.pending_edit = None
             self.edit_findings.controls = [
-                ft.Text(f"[error] {error}", size=10, color="#C0392B")
+                ft.Text(f"[error] {error}", size=10, color=self.palette.danger)
             ]
             self._set_status("Edit validation failed")
         else:
@@ -2396,9 +2965,9 @@ class Shell:
                         f"[{finding.level.value}] {finding.code}: {finding.message}",
                         size=10,
                         color=(
-                            "#C0392B"
+                            self.palette.danger
                             if finding.level.value == "error"
-                            else "#8A5A00"
+                            else self.palette.warning
                             if finding.level.value == "warning"
                             else None
                         ),
@@ -2450,7 +3019,7 @@ class Shell:
         self._refresh_edit_actions()
         self.page.update()
 
-    def _on_undo_edit(self, event: ft.Event[ft.TextButton]) -> None:
+    def _on_undo_edit(self, event: ft.Event[ft.TextButton] | None = None) -> None:
         if self.session is None:
             return
         durability_warning: str | None = None
@@ -2471,7 +3040,7 @@ class Shell:
         self._refresh_edit_actions()
         self.page.update()
 
-    def _on_redo_edit(self, event: ft.Event[ft.TextButton]) -> None:
+    def _on_redo_edit(self, event: ft.Event[ft.TextButton] | None = None) -> None:
         if self.session is None:
             return
         durability_warning: str | None = None
@@ -2699,10 +3268,12 @@ class Shell:
                     tooltip=group.explanation,
                     style=ft.ButtonStyle(
                         color=(
-                            _ACCENT if group.id == self.current_root_group else _INK
+                            self.palette.accent
+                            if group.id == self.current_root_group
+                            else self.palette.ink
                         ),
                         bgcolor=(
-                            _ACCENT_SOFT
+                            self.palette.accent_soft
                             if group.id == self.current_root_group
                             else "#00FFFFFF"
                         ),
@@ -2728,7 +3299,7 @@ class Shell:
                     f"{len(hierarchy.groups):,} blocks. Use search or the graph "
                     "to inspect the rest.",
                     size=10,
-                    color=_MUTED,
+                    color=self.palette.muted,
                 )
             )
         self.hierarchy_list.controls = rows
@@ -2754,7 +3325,7 @@ class Shell:
                     ft.Icon(
                         ft.Icons.CHEVRON_RIGHT_ROUNDED,
                         size=15,
-                        color=_MUTED,
+                        color=self.palette.muted,
                     )
                 )
             if crumb.kind == "graph":
@@ -2762,7 +3333,7 @@ class Shell:
                     ft.TextButton(
                         content=crumb.label,
                         icon=ft.Icons.HOME_ROUNDED,
-                        style=ft.ButtonStyle(color=_INK),
+                        style=ft.ButtonStyle(color=self.palette.ink),
                         on_click=self._graph_handler(crumb.id),
                     )
                 )
@@ -2770,7 +3341,7 @@ class Shell:
                 controls.append(
                     ft.TextButton(
                         content=crumb.label,
-                        style=ft.ButtonStyle(color=_INK),
+                        style=ft.ButtonStyle(color=self.palette.ink),
                         on_click=self._group_handler(crumb.id),
                     )
                 )
@@ -2816,7 +3387,7 @@ class Shell:
             width=0.0,
             height=0.0,
             paint=ft.Paint(
-                color=_ACCENT,
+                color=self.palette.accent,
                 style=ft.PaintingStyle.STROKE,
                 stroke_width=1.5,
             ),
@@ -2843,10 +3414,14 @@ class Shell:
         return True
 
     def on_keyboard(self, event: ft.KeyboardEvent) -> None:
-        """Arrow-key navigation over the visible semantic representation."""
+        """Global shortcuts plus arrow-key navigation over the visible scene."""
         if self._text_input_active:
-            # A focused TextField owns the caret; navigating now would tear
-            # the field down mid-keystroke and discard the pending edit.
+            # A focused TextField owns the caret; acting on its keystrokes
+            # would tear the field down mid-edit and discard the pending text.
+            return
+        if self._handle_command_shortcut(event):
+            return
+        if self._handle_view_shortcut(event):
             return
         if (
             self.session is None
@@ -2871,6 +3446,76 @@ class Shell:
             selected = frozenset((target,))
             self.renderer.set_selection(selected)
             self._on_selected(selected)
+
+    def _handle_command_shortcut(self, event: ft.KeyboardEvent) -> bool:
+        """Ctrl-modified application commands; True when one was consumed."""
+        if not event.ctrl or event.alt or event.meta:
+            return False
+        key = (event.key or "").upper()
+        if key == "O":
+            self._start_async(self._on_open_clicked, None)
+            return True
+        if key == "S":
+            if self.save_model_button.visible and not self.save_model_button.disabled:
+                self._start_async(self._export_current_session)
+            return True
+        if key == "Z":
+            if not self.undo_edit_button.disabled:
+                self._on_undo_edit(None)
+            return True
+        if key == "Y":
+            if not self.redo_edit_button.disabled:
+                self._on_redo_edit(None)
+            return True
+        if key == "F":
+            self._start_async(self.search_field.focus)
+            return True
+        return False
+
+    def _handle_view_shortcut(self, event: ft.KeyboardEvent) -> bool:
+        """Unmodified viewport keys; True when one was consumed."""
+        if event.ctrl or event.alt or event.meta:
+            return False
+        key = event.key or ""
+        if key == "Escape":
+            if self.activations.close_overlay():
+                self.page.update()
+            else:
+                self.renderer.set_selection(frozenset())
+                self._on_selected(frozenset())
+            return True
+        if self.session is None:
+            return False
+        if key in {"+", "=", "Numpad Add"}:
+            self._zoom_about_center(1.1)
+            return True
+        if key in {"-", "Numpad Subtract"}:
+            self._zoom_about_center(0.9)
+            return True
+        if key in {"0", "Numpad 0"}:
+            self._on_reset_view(None)
+            return True
+        return False
+
+    def _zoom_about_center(self, factor: float) -> None:
+        width, height = self.surface_size
+        self._zoom_at(width / 2.0, height / 2.0, factor)
+
+    def _start_async(
+        self,
+        action: Callable[..., Coroutine[Any, Any, object]],
+        *args: object,
+    ) -> None:
+        """Start an async control action from a synchronous handler.
+
+        Headless shells (tests) have no event loop, so the action runs
+        inline; a real page schedules it on its own loop.
+        """
+        run_task = getattr(self.page, "run_task", None)
+        if run_task is not None:
+            run_task(action, *args)
+        else:
+            asyncio.run(action(*args))
 
     # -- helpers -----------------------------------------------------------
 
@@ -2903,7 +3548,7 @@ class Shell:
             self.device_text.value = (
                 "Device: unavailable" if unavailable else "Device: idle"
             )
-            color = "#B42318" if unavailable else _MUTED
+            color = self.palette.danger if unavailable else self.palette.muted
             self.device_indicator.tooltip = (
                 "The requested inference device was unavailable."
                 if unavailable
@@ -2911,14 +3556,14 @@ class Shell:
             )
         elif provider == "Unavailable":
             self.device_text.value = f"{device.value.upper()} / unavailable"
-            color = "#B42318"
+            color = self.palette.danger
             self.device_indicator.tooltip = (
                 f"No installed execution provider could run this trace on "
                 f"{device.value.upper()}."
             )
         elif provider == "Selecting provider":
             self.device_text.value = f"{device.value.upper()} / selecting"
-            color = _ACCENT
+            color = self.palette.accent
             self.device_indicator.tooltip = (
                 f"Selecting an installed provider for the requested "
                 f"{device.value.upper()} trace."
@@ -2942,10 +3587,10 @@ class Shell:
             )
             self.device_text.value = f"{device.value.upper()} / {provider_label}"
             color = {
-                TraceDevice.CPU: "#027A48",
-                TraceDevice.GPU: "#175CD3",
+                TraceDevice.CPU: self.palette.success,
+                TraceDevice.GPU: self.palette.info,
                 TraceDevice.NPU: "#6941C6",
-            }.get(device, _ACCENT)
+            }.get(device, self.palette.accent)
             self.device_indicator.tooltip = (
                 f"Last completed trace: {device.value.upper()} via {provider}. "
                 "Captured outputs are copied to host memory."
@@ -2970,14 +3615,14 @@ def main(page: ft.Page, *, launch_path: Path | None = None) -> None:
     page.title = APP_TITLE
     page.window.icon = str(APP_WINDOW_ICON_PATH)
     page.padding = 0
-    page.bgcolor = _CANVAS
-    page.theme_mode = ft.ThemeMode.LIGHT
     page.theme = ft.Theme(
         color_scheme_seed=_ACCENT,
         use_material3=True,
     )
     service = ApplicationService(job_listener=None, state_store=SessionStateStore())
 
+    # The shell picks the initial palette from the platform brightness and
+    # sets page.theme_mode and page.bgcolor itself.
     shell = Shell(page, service)
 
     def on_resize(event: ft.PageResizeEvent) -> None:

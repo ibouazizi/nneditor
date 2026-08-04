@@ -8,7 +8,13 @@ toolkit swap cannot change what the user is told.
 
 from __future__ import annotations
 
+import json
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
 
 from nneditor.analysis.statistics import (
     TensorStatistics,
@@ -28,6 +34,7 @@ from nneditor.transformations.schema import Granularity, PruningMode
 
 __all__ = [
     "GraphEntry",
+    "activation_array",
     "capability_lines",
     "compact_bytes",
     "diagnostic_lines",
@@ -36,6 +43,7 @@ __all__ = [
     "humanize_identifier",
     "model_summary",
     "node_details",
+    "node_details_json",
     "node_tensor_ids",
     "parse_shape_overrides",
     "preview_values_text",
@@ -320,6 +328,53 @@ def node_details(
                     )
                 )
     return tuple(lines)
+
+
+def node_details_json(details: Sequence[tuple[str, str]]) -> str:
+    """Serialize inspector key/value rows as stable JSON for the clipboard.
+
+    Keys can legitimately repeat (a node with several subgraphs emits one
+    ``Subgraph`` row each); repeats collect into a list so no row is silently
+    dropped from the copied payload.
+    """
+    payload: dict[str, str | list[str]] = {}
+    for key, value in details:
+        existing = payload.get(key)
+        if existing is None:
+            payload[key] = value
+        elif isinstance(existing, list):
+            existing.append(value)
+        else:
+            payload[key] = [existing, value]
+    return json.dumps(payload, indent=2)
+
+
+def activation_array(
+    numpy_dtype: str,
+    shape: Sequence[int],
+    raw: bytes,
+) -> tuple[np.ndarray[Any, np.dtype[Any]], bool]:
+    """Rebuild a captured activation tensor from record metadata and bytes.
+
+    Returns the array plus whether it is a truncated reconstruction. A
+    complete capture reshapes to the record's shape; a truncated one keeps
+    the decodable prefix as a flat array (a partial trailing element is
+    dropped) so callers must state the truncation rather than presenting the
+    prefix as the full tensor.
+    """
+    try:
+        dtype = np.dtype(numpy_dtype)
+    except TypeError as error:
+        raise ValueError(
+            f"dtype {numpy_dtype!r} is not reconstructible with numpy: {error}"
+        ) from error
+    usable = len(raw) - len(raw) % dtype.itemsize
+    values = np.frombuffer(raw[:usable], dtype=dtype)
+    dims = tuple(int(dim) for dim in shape)
+    expected = math.prod(dims) if dims else 1
+    if all(dim >= 0 for dim in dims) and values.size == expected:
+        return values.reshape(dims), False
+    return values, True
 
 
 def node_tensor_ids(document: Document, graph_id: str, node_id: str) -> tuple[str, ...]:

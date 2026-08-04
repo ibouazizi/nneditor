@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+
+from nneditor.ir.dtypes import dtype_info
 
 __all__ = [
     "ActivationRecord",
@@ -22,7 +25,32 @@ __all__ = [
     "TraceLimits",
     "TraceRequest",
     "TraceResult",
+    "declared_byte_size",
 ]
+
+
+def declared_byte_size(
+    element_type: str | None,
+    shape: Iterable[object] | None,
+) -> int | None:
+    """Decoded byte size a declared value promises, or ``None`` if unknowable.
+
+    This is the one place the "shape x dtype width" rule lives: the runner's
+    pre-run capture estimate and the worker's fetch batching must agree on it.
+    Any symbolic, negative, or missing dimension — and any element type without
+    a fixed byte width — makes the size unknowable.
+    """
+    if element_type is None or shape is None:
+        return None
+    info = dtype_info(element_type)
+    if info is None or info.byte_width is None:
+        return None
+    total = info.byte_width
+    for dimension in shape:
+        if not isinstance(dimension, int) or dimension < 0:
+            return None
+        total *= dimension
+    return total
 
 
 def _canonical_hash(payload: object, prefix: str) -> str:
@@ -441,6 +469,10 @@ class TraceResult:
     diagnostics: tuple[str, ...] = ()
     execution_device: TraceDevice = TraceDevice.CPU
     execution_provider: str = "CPU"
+    # Advisory context (skipped providers, capture-size warnings). Unlike
+    # diagnostics, notes never mark a result partial: they describe normal
+    # circumstances of the run, not defects in its records.
+    notes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         value_ids = [record.value_id for record in self.records]
@@ -484,6 +516,7 @@ class TraceResult:
             "diagnostics": list(self.diagnostics),
             "execution_device": self.execution_device.value,
             "execution_provider": self.execution_provider,
+            "notes": list(self.notes),
         }
 
     @classmethod
@@ -494,6 +527,10 @@ class TraceResult:
             or not isinstance(raw.get("records"), list)
             or not isinstance(raw.get("diagnostics"), list)
         ):
+            raise ValueError("trace result is malformed")
+        # Manifests written before the notes channel simply omit the key.
+        raw_notes = raw.get("notes", [])
+        if not isinstance(raw_notes, list):
             raise ValueError("trace result is malformed")
         key = raw["key"]
         assert isinstance(key, dict)
@@ -515,6 +552,7 @@ class TraceResult:
                 str(raw.get("execution_device", TraceDevice.CPU.value))
             ),
             execution_provider=str(raw.get("execution_provider", "CPU")),
+            notes=tuple(str(item) for item in raw_notes),
         )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,9 @@ from nneditor.tracing import (
     TraceRequest,
     build_activation_visualizations,
 )
+from nneditor.tracing.preflight import RuntimeStatus
+from nneditor.tracing.runner import estimated_capture_bytes
+from nneditor.ui import viewmodel
 from nneditor.ui.activation_inspector import (
     ActivationInspector,
     _visualization_cost,
@@ -41,7 +45,7 @@ from tests.fixtures.onnx_models import (
     build_optional_output_model,
     build_token_ids_model,
 )
-from tests.unit.test_shell import StubPage, make_shell
+from tests.unit.test_shell import StubPage, make_shell, press_key
 
 
 def test_trace_shell_empty_consent_loading_and_activation_states(
@@ -857,6 +861,24 @@ def _tick_capture_scope(shell: Shell, ticked: bool) -> None:
     cast(Any, shell.trace.capture_selected_only.on_change)(cast(Any, SimpleNamespace()))
 
 
+def _estimate_text(session: ModelSession, value_ids: frozenset[str]) -> str:
+    """The human-compact decoded-bytes estimate the panel shows for a scope."""
+    graph = session.document.main_graph
+    return viewmodel.compact_bytes(
+        estimated_capture_bytes(graph.value(value_id) for value_id in value_ids)
+    )
+
+
+def _boundary_ids(session: ModelSession) -> frozenset[str]:
+    """Named model inputs and outputs, the boundaries-plus-selection floor."""
+    graph = session.document.main_graph
+    candidates = {
+        value_id for value_id in graph.inputs if value_id not in graph.initializers
+    }
+    candidates.update(graph.outputs)
+    return frozenset(value_id for value_id in candidates if graph.value(value_id).name)
+
+
 def test_unticked_capture_scope_still_traces_every_value(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -964,7 +986,7 @@ def test_capture_scope_drops_unnamed_placeholder_outputs(
 
         assert shell.trace.capture_value_ids() == named
         assert _approved_request(shell, page, monkeypatch).value_ids == named
-        assert "Capturing 1 value from 1 selected node." in str(
+        assert "Capturing 1 value from 1 selected node (~" in str(
             shell.trace.capture_scope.value
         )
 
@@ -980,22 +1002,275 @@ def test_capture_scope_summary_tracks_the_box_and_the_selection(
 
         session = service.open_model(path)
         shell.show_session(session)
-        # One model input plus one output per node, none of them unnamed.
-        assert shell.trace.capture_scope.value == "Capturing all 3 values."
+        graph = session.document.main_graph
+        all_ids = {
+            value_id for value_id in graph.inputs if value_id not in graph.initializers
+        }
+        for node in graph.nodes:
+            all_ids.update(node.outputs)
+        all_ids = {value_id for value_id in all_ids if graph.value(value_id).name}
+        full = _estimate_text(session, frozenset(all_ids))
+        # One model input plus one output per node, none of them unnamed; the
+        # summary always states the scope and its estimated decoded bytes.
+        assert shell.trace.capture_scope.value == (f"Capturing all 3 values (~{full}).")
 
         _tick_capture_scope(shell, True)
         assert shell.trace.capture_scope.value == (
-            "No nodes selected; capturing all 3 values."
+            f"No nodes selected; capturing all 3 values (~{full})."
         )
 
-        graph = session.document.main_graph
         _select_operators(shell, session, *(node.id for node in graph.nodes))
+        selected = frozenset(
+            value_id
+            for node in graph.nodes
+            for value_id in node.outputs
+            if graph.value(value_id).name
+        )
         assert shell.trace.capture_scope.value == (
-            "Capturing 2 values from 2 selected nodes."
+            f"Capturing 2 values from 2 selected nodes "
+            f"(~{_estimate_text(session, selected)})."
         )
 
         _tick_capture_scope(shell, False)
-        assert shell.trace.capture_scope.value == "Capturing all 3 values."
+        assert shell.trace.capture_scope.value == (f"Capturing all 3 values (~{full}).")
+
+
+# -- smart capture-scope default, estimates, and preflight -------------------
+
+
+def test_big_model_defaults_to_boundaries_plus_selection_with_widen_choice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    # The declared input and output are 32 B each, so a 32-byte advisory
+    # stands in for the real 1 GiB threshold a multi-GiB capture would trip.
+    monkeypatch.setattr("nneditor.ui.trace_panel._FULL_CAPTURE_ADVISORY_BYTES", 32)
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        trace = shell.trace
+
+        assert trace.capture_scope_choice.visible
+        assert trace.capture_scope_choice.value == "boundaries-plus-selection"
+        assert trace.capture_value_ids() == _boundary_ids(session)
+        summary = str(trace.capture_scope.value)
+        assert "boundaries + selection" in summary
+        assert "(~" in summary
+        widen = next(
+            option
+            for option in trace.capture_scope_choice.options
+            if option.key == "everything"
+        )
+        assert "3 values" in str(widen.text)
+        assert "~" in str(widen.text)
+
+        # The current selection joins the boundary scope, and the approved
+        # request carries exactly that narrowed set.
+        selected = session.document.main_graph.nodes[0]
+        _select_operators(shell, session, selected.id)
+        expected = _boundary_ids(session) | frozenset(selected.outputs)
+        assert trace.capture_value_ids() == expected
+        assert _approved_request(shell, page, monkeypatch).value_ids == expected
+
+
+def test_small_model_keeps_the_capture_everything_default(tmp_path: Path) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        shell.show_session(service.open_model(path))
+
+        assert not shell.trace.capture_scope_choice.visible
+        assert shell.trace.capture_value_ids() == frozenset()
+        assert str(shell.trace.capture_scope.value).startswith(
+            "Capturing all 3 values (~"
+        )
+
+
+def test_explicit_widen_sticks_for_the_session_but_not_the_next_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    monkeypatch.setattr("nneditor.ui.trace_panel._FULL_CAPTURE_ADVISORY_BYTES", 32)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        trace = shell.trace
+        assert trace.capture_scope_choice.value == "boundaries-plus-selection"
+
+        trace.capture_scope_choice.value = "everything"
+        cast(Any, trace.capture_scope_choice.on_select)(cast(Any, SimpleNamespace()))
+        assert trace.capture_value_ids() == frozenset()
+        assert str(trace.capture_scope.value).startswith("Capturing all 3 values (~")
+
+        # Selection churn and later refreshes keep the explicit choice.
+        _select_operators(shell, session, session.document.main_graph.nodes[0].id)
+        trace.refresh_actions()
+        assert trace.capture_scope_choice.value == "everything"
+        assert trace.capture_value_ids() == frozenset()
+
+        # A new session returns to the smart default; the choice was per-session.
+        second_path = tmp_path / "second.onnx"
+        build_embedded_model(second_path, elements=8)
+        second = service.open_model(second_path)
+        shell.show_session(second)
+        assert shell.trace.capture_scope_choice.value == "boundaries-plus-selection"
+        assert shell.trace.capture_value_ids() == _boundary_ids(second)
+
+
+def test_over_half_memory_estimate_warns_inline_before_the_run(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        trace = shell.trace
+
+        assert trace.capture_estimate.visible
+        assert "Estimated decoded activations" in str(trace.capture_estimate.value)
+        assert trace.capture_estimate.color == shell.palette.muted
+
+        trace.memory_mib.value = "0"
+        trace.refresh_capture_scope()
+        warning = str(trace.capture_estimate.value)
+        assert "decodes to an estimated" in warning
+        assert "more than half the approved 0 MiB memory limit" in warning
+        assert "capture fewer values or raise the Memory limit" in warning
+        assert trace.capture_estimate.color == shell.palette.warning
+
+        trace.memory_mib.value = "2048"
+        trace.refresh_capture_scope()
+        assert "Estimated decoded activations" in str(trace.capture_estimate.value)
+        assert trace.capture_estimate.color == shell.palette.muted
+
+
+def test_runtime_preflight_probes_off_thread_and_renders_the_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    statuses = [
+        RuntimeStatus(
+            ("CUDAExecutionProvider", "CPUExecutionProvider"), "1.22.0", None
+        ),
+        RuntimeStatus(
+            (),
+            None,
+            "ONNX Runtime is not installed in this environment; install "
+            "nneditor[runtime] (or an accelerator extra such as "
+            "nneditor[runtime-gpu]) to enable it",
+        ),
+    ]
+    refreshes: list[bool] = []
+
+    def fake_status(
+        timeout_seconds: float = 10.0, *, refresh: bool = False
+    ) -> RuntimeStatus:
+        refreshes.append(refresh)
+        return statuses.pop(0)
+
+    monkeypatch.setattr("nneditor.ui.trace_panel.runtime_status", fake_status)
+    with ApplicationService() as service:
+        shell, page = make_shell(service)
+        assert "Open an artifact" in str(shell.trace.runtime_text.value)
+
+        deferred: list[Any] = []
+        cast(Any, page).run_thread = deferred.append
+        shell.show_session(service.open_model(path))
+
+        # The panel is fully constructed while the probe is still pending: a
+        # quiet placeholder shows and the device dropdown keeps working.
+        assert "Probing ONNX Runtime" in str(shell.trace.runtime_text.value)
+        assert not shell.trace.device.disabled
+        assert not refreshes
+
+        while deferred:
+            deferred.pop(0)()
+        rendered = str(shell.trace.runtime_text.value)
+        assert "CUDAExecutionProvider, CPUExecutionProvider" in rendered
+        assert "1.22.0" in rendered
+        assert refreshes == [False]
+
+        # The refresh icon re-probes; a failure renders the error, which names
+        # the nneditor[runtime] extra, without disturbing the device choice.
+        cast(Any, page).run_thread = lambda target: target()
+        cast(Any, shell.trace.runtime_refresh.on_click)(cast(Any, SimpleNamespace()))
+        assert refreshes == [False, True]
+        assert "nneditor[runtime]" in str(shell.trace.runtime_text.value)
+        assert shell.trace.runtime_text.color == shell.palette.warning
+        assert not shell.trace.device.disabled
+
+
+def test_complete_trace_notes_render_as_info_and_never_read_as_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, _page, _callbacks, trace_id, session = _traced_shell(service, path)
+        base = session.trace(trace_id)
+        assert not base.partial
+
+        noted = dataclasses.replace(
+            base,
+            notes=("CUDAExecutionProvider was skipped: device unavailable",),
+        )
+        monkeypatch.setattr(ModelSession, "trace", lambda self, _trace_id: noted)
+        monkeypatch.setattr(ModelSession, "traces", lambda self: (noted,))
+        shell.trace.refresh_actions()
+
+        assert "Complete trace" in str(shell.trace.status.value)
+        assert "Partial" not in str(shell.trace.status.value)
+        assert shell.trace.result_annotations.visible
+        notes = [
+            control
+            for control in shell.trace.result_annotations.controls
+            if isinstance(control, ft.Container)
+            and isinstance(control.data, str)
+            and control.data.startswith("trace-note:")
+        ]
+        assert len(notes) == 1
+        note_text = cast(ft.Text, notes[0].content)
+        assert "skipped" in str(note_text.value)
+        assert note_text.color == shell.palette.info
+        assert notes[0].bgcolor == shell.palette.info_soft
+        assert not any(
+            isinstance(control.data, str)
+            and control.data.startswith("trace-diagnostic:")
+            for control in shell.trace.result_annotations.controls
+        )
+
+        # Diagnostics stay visually distinct (warning palette) and only they
+        # accompany a partial presentation.
+        flawed = dataclasses.replace(noted, diagnostics=("capture stopped early",))
+        monkeypatch.setattr(ModelSession, "trace", lambda self, _trace_id: flawed)
+        monkeypatch.setattr(ModelSession, "traces", lambda self: (flawed,))
+        shell.trace.refresh_actions()
+
+        assert "Partial trace" in str(shell.trace.status.value)
+        diagnostics = [
+            control
+            for control in shell.trace.result_annotations.controls
+            if isinstance(control, ft.Container)
+            and isinstance(control.data, str)
+            and control.data.startswith("trace-diagnostic:")
+        ]
+        assert len(diagnostics) == 1
+        diagnostic_text = cast(ft.Text, diagnostics[0].content)
+        assert diagnostic_text.color == shell.palette.warning
+        assert diagnostics[0].bgcolor == shell.palette.warning_soft
+        assert diagnostic_text.color != note_text.color
 
 
 def test_activation_plot_adapter_consumes_headless_view_models() -> None:
@@ -1367,3 +1642,251 @@ def test_inflight_view_request_is_not_resubmitted(
         # Resolved views are cached, so a repeat request stays a no-op.
         assert not shell.activations._request_views(trace_id, first.value_id, node_id)
         assert submitted == before
+
+
+# -- export affordances ------------------------------------------------------
+
+
+def test_activation_array_reconstructs_full_and_truncated_captures() -> None:
+    data = np.arange(6, dtype=np.float32).reshape(2, 3)
+
+    full, truncated = viewmodel.activation_array("float32", (2, 3), data.tobytes())
+    assert not truncated
+    assert full.dtype == np.float32
+    np.testing.assert_array_equal(full, data)
+
+    # Nine bytes hold two full elements plus one dangling byte: the prefix
+    # decodes flat and the dangling byte is dropped, flagged as truncated.
+    prefix, truncated = viewmodel.activation_array(
+        "float32", (2, 3), data.tobytes()[:9]
+    )
+    assert truncated
+    assert prefix.shape == (2,)
+    np.testing.assert_array_equal(prefix, data.ravel()[:2])
+
+    with pytest.raises(ValueError, match="not reconstructible"):
+        viewmodel.activation_array("not-a-dtype", (2,), b"\x00")
+
+
+def test_activation_card_saves_the_captured_tensor_as_npy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    destination = tmp_path / "activation.npy"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, _page, callbacks, trace_id, session = _traced_shell(service, path)
+        node_id = session.document.main_graph.nodes[0].id
+        _select_operators(shell, session, node_id)
+        while callbacks:
+            callbacks.pop(0)()
+
+        record = session.node_activations(trace_id, node_id)[0]
+        card = _activation_card(shell, record.value_id)
+        assert card.controls
+        body = cast(ft.Column, card.controls[0])
+        button = next(
+            child
+            for child in body.controls
+            if isinstance(child, ft.TextButton)
+            and child.data == f"activation-save-npy:{record.value_id}"
+        )
+
+        async def save_file(picker: ft.FilePicker, **kwargs: object) -> str:
+            assert kwargs["allowed_extensions"] == ["npy"]
+            return str(destination)
+
+        monkeypatch.setattr(ft.FilePicker, "save_file", save_file)
+        asyncio.run(cast(Any, button.on_click)(cast(Any, SimpleNamespace())))
+
+        saved = np.load(destination, allow_pickle=False)
+        raw = session.activations(trace_id).read(record.value_id)
+        assert saved.dtype == np.dtype(record.numpy_dtype)
+        assert saved.shape == tuple(record.shape)
+        assert saved.tobytes() == raw
+        assert "Saved" in str(shell.status_text.value)
+        assert "truncated" not in str(shell.status_text.value)
+
+
+def test_truncated_activation_save_discloses_the_stored_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    destination = tmp_path / "prefix.npy"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        specification = session.default_trace_inputs()
+        limits = TraceLimits(
+            wall_seconds=10,
+            memory_bytes=1024 * 1024 * 1024,
+            capture_bytes=16,
+            chunk_bytes=4,
+        )
+        result = session.trace_async(
+            TraceRequest(
+                specification,
+                limits,
+                TraceApproval.approve(
+                    session.title,
+                    session.document.source.content_hash,
+                    specification,
+                    limits,
+                ),
+            )
+        ).result(timeout=20)
+        record = next(
+            item for item in result.records if item.state is CaptureState.TRUNCATED
+        )
+
+        async def save_file(picker: ft.FilePicker, **kwargs: object) -> str:
+            return str(destination)
+
+        monkeypatch.setattr(ft.FilePicker, "save_file", save_file)
+        handler = shell.activations._save_activation_handler(result.id, record)
+        asyncio.run(handler(cast(Any, SimpleNamespace())))
+
+        saved = np.load(destination, allow_pickle=False)
+        width = np.dtype(record.numpy_dtype).itemsize
+        assert saved.ndim == 1
+        assert saved.nbytes == record.stored_byte_length - (
+            record.stored_byte_length % width
+        )
+        status = str(shell.status_text.value)
+        assert "truncated" in status
+        assert f"{record.stored_byte_length:,} of {record.full_byte_length:,}" in status
+
+
+def test_save_view_as_png_writes_the_exact_raster_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matrix = np.arange(16, dtype=np.float32).reshape(4, 4)
+    record = ActivationRecord(
+        "matrix",
+        "matrix",
+        "node",
+        "node-output",
+        "float32",
+        "float32",
+        matrix.shape,
+        CaptureState.COMPLETE,
+        matrix.nbytes,
+        matrix.nbytes,
+        "captures/matrix.bin",
+    )
+    heatmap = next(
+        view
+        for view in build_activation_visualizations(record, matrix.tobytes())
+        if view.raster_png
+    )
+    destination = tmp_path / "view.png"
+
+    async def save_file(picker: ft.FilePicker, **kwargs: object) -> str:
+        assert kwargs["allowed_extensions"] == ["png"]
+        return str(destination)
+
+    monkeypatch.setattr(ft.FilePicker, "save_file", save_file)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        handler = shell.activations._save_view_png_handler(heatmap, "matrix")
+        asyncio.run(handler(cast(Any, SimpleNamespace())))
+
+    assert destination.read_bytes() == heatmap.raster_png
+    assert "Saved" in str(shell.status_text.value)
+
+
+def test_raster_views_offer_a_png_save_button_on_the_card(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    matrix = np.arange(16, dtype=np.float32).reshape(4, 4)
+    raster_record = ActivationRecord(
+        "matrix",
+        "matrix",
+        "node",
+        "node-output",
+        "float32",
+        "float32",
+        matrix.shape,
+        CaptureState.COMPLETE,
+        matrix.nbytes,
+        matrix.nbytes,
+        "captures/matrix.bin",
+    )
+    raster_views = tuple(
+        view
+        for view in build_activation_visualizations(raster_record, matrix.tobytes())
+        if view.raster_png
+    )
+    assert raster_views
+    with ApplicationService() as service:
+        shell, _page, _callbacks, trace_id, session = _traced_shell(service, path)
+        node_id = session.document.main_graph.nodes[0].id
+        record = session.node_activations(trace_id, node_id)[0]
+        shell.activations.activation_visualizations.put(
+            (trace_id, record.value_id), raster_views
+        )
+        _select_operators(shell, session, node_id)
+
+        card = _activation_card(shell, record.value_id)
+        assert card.controls
+        body = cast(ft.Column, card.controls[0])
+        assert any(
+            isinstance(child, ft.TextButton)
+            and isinstance(child.data, str)
+            and child.data.startswith(f"activation-save-png:{record.value_id}:")
+            for child in body.controls
+        )
+
+
+def test_escape_closes_the_large_view_overlay_before_clearing_selection(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, page, callbacks, _trace_id, session = _traced_shell(service, path)
+        node_id = session.document.main_graph.nodes[0].id
+        _select_operators(shell, session, node_id)
+        while callbacks:
+            callbacks.pop(0)()
+
+        cards = [
+            control
+            for control in shell.inspector.controls
+            if isinstance(control, ft.ExpansionTile)
+            and isinstance(control.data, str)
+            and control.data.startswith("activation-card:")
+        ]
+        open_button = next(
+            child
+            for card in cards
+            for body in card.controls or []
+            for child in cast(ft.Column, body).controls
+            if isinstance(child, ft.FilledButton) and child.content == "Open large view"
+        )
+        cast(Any, open_button.on_click)(cast(Any, SimpleNamespace()))
+        assert page.dialogs
+        dialog = page.dialogs[-1]
+        assert dialog.open
+        # The overlay itself carries the tensor and raster export affordances.
+        rows = cast(ft.ListView, cast(ft.Container, dialog.content).content).controls
+        assert any(
+            isinstance(row, ft.TextButton)
+            and isinstance(row.data, str)
+            and row.data.startswith("activation-overlay-save-npy:")
+            for row in rows
+        )
+
+        press_key(shell, "Escape")
+        assert not dialog.open
+        assert shell.renderer.selection == frozenset({node_id})
+
+        press_key(shell, "Escape")
+        assert shell.renderer.selection == frozenset()

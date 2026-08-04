@@ -189,6 +189,7 @@ class ActivationStore:
         *,
         execution_device: TraceDevice = TraceDevice.CPU,
         execution_provider: str = "CPU",
+        notes: tuple[str, ...] = (),
     ) -> TraceResult:
         target_staging = staging.resolve()
         if target_staging.parent != self.root or not target_staging.name.startswith(
@@ -275,6 +276,8 @@ class ActivationStore:
                     "runtimes, so its records were discarded and replaced by "
                     f"this {incoming_identity[1]} run",
                 )
+            # Notes describe the circumstances of one run, so a merge keeps
+            # only the incoming run's notes rather than accreting stale ones.
             result = TraceResult(
                 key,
                 tuple(sorted(merged.values(), key=lambda item: item.value_id)),
@@ -282,6 +285,7 @@ class ActivationStore:
                 merged_diagnostics,
                 execution_device,
                 execution_provider,
+                notes,
             )
             self._write_manifest(target_staging, result)
             replaced = target.exists()
@@ -352,6 +356,7 @@ class ActivationStore:
                 (*result.diagnostics, "capture payloads were evicted by budget"),
                 result.execution_device,
                 result.execution_provider,
+                result.notes,
             )
             directory = self._trace_directory(trace_id)
             captures = directory / "captures"

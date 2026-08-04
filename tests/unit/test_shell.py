@@ -26,7 +26,8 @@ from nneditor.rendering import (
     SelectionCallback,
     create_flet_renderer,
 )
-from nneditor.ui.app import Shell
+from nneditor.ui import shell_layout
+from nneditor.ui.app import SHELL_PALETTE, Shell
 from tests.fixtures.onnx_models import build_control_flow_model, build_embedded_model
 
 
@@ -74,6 +75,27 @@ def make_shell(service: ApplicationService) -> tuple[Shell, StubPage]:
     shell = Shell(cast(ft.Page, page), service)
     shell.build()
     return shell, page
+
+
+def press_key(
+    shell: Shell,
+    key: str,
+    *,
+    ctrl: bool = False,
+    shift: bool = False,
+) -> None:
+    """Deliver one global keyboard event to the shell."""
+    shell.on_keyboard(
+        ft.KeyboardEvent(
+            name="keyboard",
+            control=shell.page,
+            key=key,
+            shift=shift,
+            ctrl=ctrl,
+            alt=False,
+            meta=False,
+        )
+    )
 
 
 def test_shell_uses_the_injected_renderer_factory(
@@ -870,3 +892,502 @@ def test_pan_bursts_coalesce_into_one_apply(
     # The drain applied the latest viewport once, not once per event.
     assert applies == 1
     assert shell.view["x"] == pytest.approx(x_before + 150.0 / scale)
+
+
+# -- zoom drill-through and blank-canvas recovery ---------------------------
+
+
+def _scroll_event(
+    shell: Shell, cursor: ft.Offset, delta_y: float
+) -> ft.ScrollEvent[ft.GestureDetector]:
+    detector = shell.renderer.control
+    assert isinstance(detector, ft.GestureDetector)
+    return ft.ScrollEvent(
+        name="scroll",
+        control=detector,
+        local_position=cursor,
+        global_position=cursor,
+        scroll_delta=ft.Offset(0.0, delta_y),
+    )
+
+
+def test_drill_helpers_measure_glyph_screen_coverage() -> None:
+    from nneditor.ui import app as app_module
+
+    assert app_module.next_detail_level(DetailLevel.ARCHITECTURE) is DetailLevel.BLOCK
+    assert app_module.next_detail_level(DetailLevel.BLOCK) is DetailLevel.LAYER
+    assert app_module.next_detail_level(DetailLevel.LAYER) is DetailLevel.OPERATOR
+    assert app_module.next_detail_level(DetailLevel.OPERATOR) is None
+
+    # A 20,000-world-unit region at the huge-model fit floor already covers a
+    # third of the surface although the scale is far below every absolute
+    # detail threshold.
+    coverage = app_module.glyph_screen_coverage(20000.0, 400.0, 0.02, 1200.0, 800.0)
+    assert coverage == pytest.approx(400.0 / 1200.0)
+    assert app_module.glyph_screen_coverage(10.0, 10.0, 1.0, 0.0, 0.0) == 0.0
+
+    from nneditor.rendering.scene import NodeGlyph
+
+    near = NodeGlyph(id="a", x=0.0, y=0.0, width=10.0, height=10.0, kind="n", label="a")
+    far = NodeGlyph(
+        id="b", x=100.0, y=100.0, width=10.0, height=10.0, kind="n", label="b"
+    )
+    assert app_module.nearest_glyph_center((near, far), 8.0, 8.0) == (5.0, 5.0)
+
+
+def _manual_block_shell(
+    tmp_path: Path, service: ApplicationService
+) -> tuple[Shell, str]:
+    """A shell at BLOCK detail with every operator inside one manual group."""
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    session = service.open_model(path)
+    shell.show_session(session)
+    node_ids = frozenset(node.id for node in session.document.main_graph.nodes)
+    shell.renderer.set_selection(node_ids)
+    shell._on_selected(node_ids)
+    shell.group_label_field.value = "Manual block"
+    shell._on_group_selected(cast(Any, None))
+    manual = next(
+        group for group in session.graph_hierarchy().groups if not group.automatic
+    )
+    return shell, manual.id
+
+
+def test_zoom_into_a_dominant_group_glyph_drills_through(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    """A screen-filling group advances the detail level below the absolute
+    scale thresholds, anchored at the cursor."""
+    shell, group_id = _manual_block_shell(tmp_path, service)
+    assert shell.current_detail is DetailLevel.BLOCK
+    shell.auto_detail = True
+    shell._sync_detail_controls()
+    scene = shell.renderer.scene
+    assert scene is not None
+    glyph = scene.node(group_id)
+
+    # A small surface makes the block glyph dominant on screen while the
+    # scale stays far below the absolute LAYER threshold (0.35).
+    shell.surface_size = (64.0, 40.0)
+    scale = 0.2
+    center_x = glyph.x + glyph.width / 2.0
+    center_y = glyph.y + glyph.height / 2.0
+    shell.view = {
+        "scale": scale,
+        "x": center_x - 32.0 / scale,
+        "y": center_y - 20.0 / scale,
+    }
+    shell.renderer.set_viewport(shell._current_viewport())
+    cursor = ft.Offset(32.0, 20.0)
+    anchor = (
+        shell.view["x"] + cursor.x / shell.view["scale"],
+        shell.view["y"] + cursor.y / shell.view["scale"],
+    )
+
+    shell._on_scroll(cast(Any, _scroll_event(shell, cursor, -10.0)))
+
+    # A fresh read defeats mypy's literal narrowing from the setup assert.
+    landed: DetailLevel = shell.current_detail
+    assert landed is DetailLevel.LAYER
+    assert shell.auto_detail
+    assert shell.view["scale"] == pytest.approx(scale * 1.1)
+    assert (
+        shell.view["x"] + cursor.x / shell.view["scale"],
+        shell.view["y"] + cursor.y / shell.view["scale"],
+    ) == pytest.approx(anchor)
+
+
+def test_zoom_over_empty_space_does_not_drill(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    shell, group_id = _manual_block_shell(tmp_path, service)
+    shell.auto_detail = True
+    shell._sync_detail_controls()
+    scene = shell.renderer.scene
+    assert scene is not None
+    glyph = scene.node(group_id)
+
+    shell.surface_size = (64.0, 40.0)
+    scale = 0.2
+    # Anchor just above the glyph: the cursor hits nothing, but the glyph
+    # stays inside the viewport so no blank-canvas recovery fires either.
+    anchor_x = glyph.x + glyph.width / 2.0
+    anchor_y = glyph.y - 30.0
+    shell.view = {
+        "scale": scale,
+        "x": anchor_x - 32.0 / scale,
+        "y": anchor_y - 20.0 / scale,
+    }
+    shell.renderer.set_viewport(shell._current_viewport())
+
+    shell._on_scroll(cast(Any, _scroll_event(shell, ft.Offset(32.0, 20.0), -10.0)))
+
+    assert shell.current_detail is DetailLevel.BLOCK
+    assert shell.view["scale"] == pytest.approx(scale * 1.1)
+
+
+def test_blank_viewport_recenters_on_the_nearest_glyph(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    shell.show_session(service.open_model(path))
+    shell.auto_detail = False
+
+    shell.view = {"scale": 1.0, "x": 500000.0, "y": 500000.0}
+    shell._apply_viewport()
+
+    assert shell.current_detail is DetailLevel.ARCHITECTURE
+    assert shell.renderer.stats.visible_nodes > 0
+    assert shell.view["x"] < 500000.0
+
+
+def test_blank_viewport_advances_detail_once_under_auto(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    """One recovery per gesture: a deeper level is tried, then the viewport
+    is clamped onto a glyph; the recovery never loops down to OPERATOR."""
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    shell.show_session(service.open_model(path))
+    shell.auto_detail = True
+    assert shell.current_detail is DetailLevel.ARCHITECTURE
+
+    shell.view = {"scale": 0.05, "x": 500000.0, "y": 500000.0}
+    shell._apply_viewport()
+
+    recovered: DetailLevel = shell.current_detail
+    assert recovered is DetailLevel.BLOCK
+    assert shell.auto_detail
+    assert shell.renderer.stats.visible_nodes > 0
+
+
+def test_recovery_ignores_an_intentionally_empty_scene(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    shell.show_session(service.open_model(path))
+    shell._on_close_model(cast(Any, None))
+
+    shell._apply_viewport()
+
+    assert shell.renderer.stats.visible_nodes == 0
+
+
+# -- keyboard shortcuts ------------------------------------------------------
+
+
+def test_ctrl_o_opens_the_model_picker(
+    service: ApplicationService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shell, _page = make_shell(service)
+    calls: list[dict[str, Any]] = []
+
+    async def pick_files(*args: Any, **kwargs: Any) -> list[ft.FilePickerFile]:
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(type(shell.picker), "pick_files", pick_files)
+    press_key(shell, "O", ctrl=True)
+
+    assert len(calls) == 1
+
+
+def _commit_rename(shell: Shell, session: Any, name: str) -> Any:
+    from nneditor.editing.validation import RenameNodeRequest
+
+    node = session.document.main_graph.nodes[0]
+    shell.renderer.set_selection(frozenset({node.id}))
+    shell.pending_edit = session.prepare_edit(
+        RenameNodeRequest(session.document.entry_graph, node.id, name)
+    )
+    shell.pending_target = node.id
+    shell._on_commit_edit(cast(Any, None))
+    return node
+
+
+def test_ctrl_s_saves_only_when_the_action_is_enabled(
+    tmp_path: Path, service: ApplicationService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "model.onnx"
+    destination = tmp_path / "saved.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    session = service.open_model(path)
+    shell.show_session(session)
+
+    async def choose_destination(*args: Any, **kwargs: Any) -> Path:
+        return destination
+
+    monkeypatch.setattr(type(shell.picker), "save_file", choose_destination)
+
+    # No unsaved revision: the Save action is hidden, so Ctrl+S must not export.
+    press_key(shell, "S", ctrl=True)
+    assert not destination.exists()
+
+    _commit_rename(shell, session, "renamed by shortcut")
+    assert shell.save_model_button.visible
+
+    press_key(shell, "S", ctrl=True)
+    assert destination.is_file()
+    assert "Exported" in (shell.status_text.value or "")
+
+
+def test_ctrl_z_and_ctrl_y_undo_and_redo(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    session = service.open_model(path)
+    shell.show_session(session)
+    node = _commit_rename(shell, session, "renamed")
+    assert session.document.main_graph.node(node.id).source_name == "renamed"
+
+    press_key(shell, "Z", ctrl=True)
+    assert session.document.main_graph.node(node.id).source_name == "scale"
+
+    press_key(shell, "Y", ctrl=True)
+    assert session.document.main_graph.node(node.id).source_name == "renamed"
+
+
+def test_ctrl_f_focuses_the_search_field(
+    service: ApplicationService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shell, _page = make_shell(service)
+    focused: list[bool] = []
+
+    async def focus() -> None:
+        focused.append(True)
+
+    monkeypatch.setattr(shell.search_field, "focus", focus)
+    press_key(shell, "F", ctrl=True)
+
+    assert focused == [True]
+
+
+def test_escape_clears_the_selection_when_no_overlay_is_open(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    shell.show_session(service.open_model(path))
+    scene = shell.renderer.scene
+    assert scene is not None
+    shell.renderer.set_selection(frozenset({scene.nodes[0].id}))
+
+    press_key(shell, "Escape")
+
+    assert shell.renderer.selection == frozenset()
+
+
+def test_plus_and_minus_zoom_about_the_viewport_center(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    shell.show_session(service.open_model(path))
+    width, height = shell.surface_size
+    scale = shell.view["scale"]
+    center = (
+        shell.view["x"] + (width / 2.0) / scale,
+        shell.view["y"] + (height / 2.0) / scale,
+    )
+
+    press_key(shell, "+")
+    assert shell.view["scale"] == pytest.approx(scale * 1.1)
+    assert (
+        shell.view["x"] + (width / 2.0) / shell.view["scale"],
+        shell.view["y"] + (height / 2.0) / shell.view["scale"],
+    ) == pytest.approx(center)
+
+    press_key(shell, "-")
+    assert shell.view["scale"] == pytest.approx(scale * 1.1 * 0.9)
+
+
+def test_zero_fits_the_graph(tmp_path: Path, service: ApplicationService) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    shell.show_session(service.open_model(path))
+    fitted_view = dict(shell.view)
+
+    shell.view = {"scale": 3.5, "x": 750.0, "y": -240.0}
+    shell.renderer.set_viewport(shell._current_viewport())
+    press_key(shell, "0")
+
+    assert shell.view == pytest.approx(fitted_view)
+
+
+def test_shortcuts_yield_to_a_focused_text_field(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    session = service.open_model(path)
+    shell.show_session(session)
+    node = _commit_rename(shell, session, "renamed")
+    scale = shell.view["scale"]
+    shell._text_input_active = True
+
+    press_key(shell, "Z", ctrl=True)
+    press_key(shell, "+")
+
+    assert session.document.main_graph.node(node.id).source_name == "renamed"
+    assert shell.view["scale"] == pytest.approx(scale)
+
+
+# -- dark mode ---------------------------------------------------------------
+
+
+def test_dark_palette_provides_a_distinct_counterpart_for_every_color() -> None:
+    import dataclasses
+
+    dark = shell_layout.DARK_SHELL_PALETTE
+    for field in dataclasses.fields(shell_layout.ShellPalette):
+        light_value = getattr(SHELL_PALETTE, field.name)
+        dark_value = getattr(dark, field.name)
+        if not isinstance(light_value, str):
+            assert dark_value == light_value
+            continue
+        assert dark_value.startswith("#")
+        assert dark_value != light_value, field.name
+    # The core readability pairing holds: dark ink on a dark panel would be
+    # unreadable, so ink must be a light tone and the panel a dark one.
+    assert int(dark.ink.removeprefix("#"), 16) > int(dark.panel.removeprefix("#"), 16)
+
+
+def test_theme_toggle_switches_palette_and_rebuilds_the_chrome(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, page = make_shell(service)
+    shell.show_session(service.open_model(path))
+    # An untyped view of the stub defeats both attr-defined noise and the
+    # literal narrowing that would make later `is` checks non-overlapping.
+    stub = cast(Any, page)
+    assert shell.palette is SHELL_PALETTE
+    assert stub.theme_mode is ft.ThemeMode.LIGHT
+
+    shell._on_toggle_theme(None)
+
+    dark = shell_layout.DARK_SHELL_PALETTE
+    assert shell.palette is dark
+    # A second untyped view: mypy pins member narrowing to the first `stub`
+    # even across the toggle call.
+    toggled = cast(Any, page)
+    assert toggled.theme_mode is ft.ThemeMode.DARK
+    assert toggled.bgcolor == dark.canvas
+    assert shell.left_panel.bgcolor == dark.panel
+    assert shell.right_panel.bgcolor == dark.panel
+    assert shell.surface.bgcolor == dark.canvas
+    assert shell.title_text.color == dark.ink
+    assert shell.status_text.color == dark.muted
+    assert shell.inspector_title.color == dark.ink
+    assert shell.activations.palette is dark
+    assert shell.trace.palette is dark
+    # The open model stayed live through the rebuild.
+    assert not shell.empty_state.visible
+    assert shell.renderer.scene is not None
+    assert shell.hierarchy_list.controls
+    assert "dark mode" in (shell.status_text.value or "")
+
+    shell._on_toggle_theme(None)
+    assert shell.palette is SHELL_PALETTE
+    assert stub.theme_mode is ft.ThemeMode.LIGHT
+    assert shell.left_panel.bgcolor == SHELL_PALETTE.panel
+
+
+def test_theme_toggle_preserves_panel_visibility_choices(
+    service: ApplicationService,
+) -> None:
+    shell, _page = make_shell(service)
+    shell._on_toggle_left_panel(cast(Any, None))
+    assert not shell.left_panel.visible
+
+    shell._on_toggle_theme(None)
+
+    assert not shell.left_panel.visible, "the rebuild honors the user's choice"
+    assert shell.right_panel.visible
+
+
+def test_initial_theme_follows_the_platform_brightness(
+    service: ApplicationService,
+) -> None:
+    from nneditor.ui.app import resolve_initial_palette
+
+    assert resolve_initial_palette(None) is SHELL_PALETTE
+    assert (
+        resolve_initial_palette(ft.Brightness.DARK) is shell_layout.DARK_SHELL_PALETTE
+    )
+    assert resolve_initial_palette(ft.Brightness.LIGHT) is SHELL_PALETTE
+
+    page = StubPage()
+    page.platform_brightness = ft.Brightness.DARK  # type: ignore[attr-defined]
+    shell = Shell(cast(ft.Page, page), service)
+    assert shell.palette is shell_layout.DARK_SHELL_PALETTE
+    assert page.theme_mode is ft.ThemeMode.DARK  # type: ignore[attr-defined]
+
+
+def test_node_details_json_collects_repeated_keys() -> None:
+    import json
+
+    from nneditor.ui import viewmodel
+
+    payload = json.loads(
+        viewmodel.node_details_json(
+            (
+                ("Operator", "Add"),
+                ("Subgraph", "g:one"),
+                ("Subgraph", "g:two"),
+            )
+        )
+    )
+    assert payload == {"Operator": "Add", "Subgraph": ["g:one", "g:two"]}
+
+
+def test_copy_as_json_puts_node_metadata_on_the_clipboard(
+    tmp_path: Path, service: ApplicationService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=16)
+    shell, _page = make_shell(service)
+    session = service.open_model(path)
+    shell.show_session(session)
+    node = session.document.main_graph.nodes[0]
+    shell.current_detail = DetailLevel.OPERATOR
+    shell._show_graph(session.document.entry_graph)
+    shell.renderer.set_selection(frozenset({node.id}))
+    shell._refresh_inspector(frozenset({node.id}))
+
+    button = next(
+        control
+        for control in shell.inspector.controls
+        if isinstance(control, ft.TextButton)
+        and control.data == f"copy-node-json:{node.id}"
+    )
+    copied: list[str] = []
+
+    async def set_clipboard(clipboard: Any, value: str) -> None:
+        copied.append(value)
+
+    monkeypatch.setattr(ft.Clipboard, "set", set_clipboard)
+    cast(Any, button.on_click)(cast(Any, SimpleNamespace()))
+
+    assert len(copied) == 1
+    payload = json.loads(copied[0])
+    assert payload["Operator"] == node.qualified_op_type
+    assert payload["Node id"] == node.id
+    assert "copied" in (shell.status_text.value or "")

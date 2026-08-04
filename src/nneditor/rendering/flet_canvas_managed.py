@@ -29,7 +29,7 @@ import flet as ft
 import flet.canvas as cv
 
 from nneditor.rendering.contract import RenderStats, SelectionCallback
-from nneditor.rendering.flet_shapes import CULL_MARGIN, build_shapes
+from nneditor.rendering.flet_shapes import CULL_MARGIN, TintFunction, build_shapes
 from nneditor.rendering.hit_testing import hit_test_glyph
 from nneditor.rendering.scene import Bounds, Scene, ScenePatch, Viewport
 from nneditor.rendering.spatial import SpatialIndex, scene_indexes
@@ -60,6 +60,7 @@ class ManagedCanvasRenderer:
         "_selection",
         "_shape_moves",
         "_stats",
+        "_tint",
         "_viewport",
     )
 
@@ -87,6 +88,10 @@ class ManagedCanvasRenderer:
         self._built_scale = 0.0
         self._rebuilds = 0
         self._shape_moves = 0
+        # Optional analysis overlay: node glyph id -> override fill color.
+        # Applied on every rebuild; pans mutate the already-tinted shapes in
+        # place, so the overlay survives the fast path untouched.
+        self._tint: TintFunction | None = None
 
     # -- contract properties ----------------------------------------------
 
@@ -209,6 +214,20 @@ class ManagedCanvasRenderer:
 
     # -- extras the shell uses --------------------------------------------
 
+    def set_tint(self, tint: TintFunction | None) -> None:
+        """Install or clear the per-glyph fill override, then redraw.
+
+        A non-None callable always triggers a rebuild — even when the same
+        callable is passed again — because the data behind it (freshly landed
+        statistics) may have changed what it returns. Clearing an already
+        clear tint stays a no-op so idle callers never pay a rebuild.
+        """
+        if tint is None and self._tint is None:
+            return
+        self._tint = tint
+        if self._scene is not None:
+            self._rebuild()
+
     def viewport_focused_on(
         self, node_id: str, *, width: float, height: float, scale: float | None = None
     ) -> Viewport:
@@ -289,6 +308,7 @@ class ManagedCanvasRenderer:
             self._node_order,
             self._selection,
             max_shapes=MAX_SHAPES,
+            tint=self._tint,
         )
         self._canvas.shapes = built.shapes
         self._built_origin = (viewport.x, viewport.y)

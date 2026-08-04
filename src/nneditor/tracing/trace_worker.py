@@ -16,10 +16,23 @@ import numpy as np
 import onnx
 from onnx.reference import ReferenceEvaluator
 
-from nneditor.tracing.contracts import TraceBackend, TraceDevice
+from nneditor.tracing.contracts import TraceBackend, TraceDevice, declared_byte_size
 from nneditor.tracing.scan import AxisAwareScan, normalize_scan_axes
 
 EvaluatorFactory = Callable[[onnx.ModelProto], Any]
+
+# Callers that predate the budget-aware staging (tests driving _open_backend
+# directly) get a budget that stages every requested value, matching the old
+# behavior exactly.
+_DEFAULT_CAPTURE_BUDGET = 1 << 62
+
+# Ceiling on the estimated decoded bytes one ONNX Runtime fetch may return.
+# Fetching every requested output in a single session.run pins the whole
+# activation set in memory at once — about 8 GiB on a 2,199-node model — and
+# kills the worker under its memory cap, so a full-graph trace is served in
+# bounded batches instead. 256 MiB keeps a few large attention tensors per
+# fetch while staying far below any practical worker memory limit.
+_ORT_BATCH_BYTES = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +278,7 @@ class CaptureSource:
         "_producer_by_output",
         "_whole",
         "diagnostics",
+        "notes",
     )
 
     def __init__(
@@ -285,12 +299,17 @@ class CaptureSource:
         self._frontier_reason = frontier_reason
         self._exhausted: str | None = None
         self.diagnostics = diagnostics
+        self.notes: list[str] = []
         self._producer_by_output = {
             output: index
             for index, node in enumerate(model.graph.node)
             for output in node.output
             if output
         }
+
+    # Values are computed one at a time, so an equal budget share costs no
+    # more than a whole value would: breadth is free here.
+    greedy_budgets = False
 
     def take(
         self, target: dict[str, object]
@@ -353,6 +372,11 @@ class CaptureSource:
             self.diagnostics.append(f"value {name!r} was {reason}")
             return None, reason
 
+    def skip(self, target: dict[str, object]) -> None:
+        """Release a value that will not be taken; nothing is computed."""
+        if self._whole is not None:
+            self._whole.pop(str(target["value_id"]), None)
+
     def size_hint(self, target: dict[str, object]) -> int | None:
         """Return an already-materialized capture size without producing it."""
         name = str(target["value_name"])
@@ -362,6 +386,9 @@ class CaptureSource:
             return None
         captured = self._whole.get(str(target["value_id"]))
         return None if captured is None else int(captured.nbytes)
+
+    def close(self) -> None:
+        """Reference capture holds no runtime session or staged file."""
 
 
 def open_captures(
@@ -524,14 +551,264 @@ def _stage_capture_model(model_path: Path, output_names: list[str]) -> Path:
     return capture_path
 
 
+def _estimated_target_bytes(target: dict[str, object]) -> int | None:
+    """Decoded size a target's declared shape and dtype promise, if knowable."""
+    raw_shape = target.get("shape")
+    return declared_byte_size(
+        str(target.get("element_type")),
+        raw_shape if isinstance(raw_shape, list) else None,
+    )
+
+
+def _capture_order(
+    runtime_targets: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Targets in the exact order the worker's run loop consumes them.
+
+    Batches must be planned over this order so budget exhaustion drops the
+    same trailing values it would have dropped under a single fetch.
+    """
+
+    def prioritized(target: dict[str, object]) -> bool:
+        return target.get("role") == "graph-input" or bool(target.get("graph_output"))
+
+    return [target for target in runtime_targets if prioritized(target)] + [
+        target for target in runtime_targets if not prioritized(target)
+    ]
+
+
+def _fetch_worthy(
+    runtime_targets: list[dict[str, object]],
+    budget: int,
+) -> list[dict[str, object]]:
+    """The prefix of the capture order a greedy budget can ever store.
+
+    Every staged graph output forces the runtime to materialize that
+    activation for the whole run — no buffer reuse — so declaring outputs
+    the budget must drop unread is what exhausted a 16 GiB worker cap on a
+    2,199-node model. Values with unknowable sizes ride along free, exactly
+    as the run loop's greedy budgeting would fetch them.
+    """
+    chosen: list[dict[str, object]] = []
+    spent = 0
+    for target in _capture_order(runtime_targets):
+        if spent >= budget:
+            break
+        chosen.append(target)
+        size = _estimated_target_bytes(target)
+        if size is not None:
+            spent += size
+    return chosen
+
+
+def _plan_batches(
+    ordered_targets: list[dict[str, object]],
+    ceiling: int,
+) -> list[tuple[dict[str, object], ...]]:
+    """Group consecutive targets into fetches bounded by estimated bytes.
+
+    A target whose size is unknowable (symbolic dimension, undecodable dtype)
+    forms its own batch: it must not be able to blow an otherwise bounded
+    fetch past the ceiling.
+    """
+    batches: list[tuple[dict[str, object], ...]] = []
+    current: list[dict[str, object]] = []
+    current_bytes = 0
+    for target in ordered_targets:
+        size = _estimated_target_bytes(target)
+        if size is None:
+            if current:
+                batches.append(tuple(current))
+                current, current_bytes = [], 0
+            batches.append((target,))
+            continue
+        if current and current_bytes + size > ceiling:
+            batches.append(tuple(current))
+            current, current_bytes = [], 0
+        current.append(target)
+        current_bytes += size
+    if current:
+        batches.append(tuple(current))
+    return batches
+
+
+def _discard_staged_capture(capture_model: Path) -> None:
+    """Best-effort removal; scratch teardown reclaims whatever still maps."""
+    data_path = capture_model.with_name(capture_model.name + ".data")
+    for stale in (capture_model, data_path):
+        with contextlib.suppress(OSError):
+            stale.unlink()
+
+
+class OrtCaptureSource:
+    """Serves ONNX Runtime captures one bounded fetch at a time.
+
+    ``take(target)`` runs the target's batch on first touch, serves later
+    targets of that batch from it, and drops each array as it is taken, so
+    peak memory tracks one batch — the same discipline the reference path
+    keeps per value. A batch whose run fails only marks its own targets;
+    every other batch still serves. Once every batch is spent the session
+    and the staged capture file are released.
+    """
+
+    # Any fetch costs a full runtime pass plus a batch transfer, so equal
+    # budget shares — which touch every batch to keep a sliver of each
+    # value — would make a big model pay for all of its activations to fill
+    # a small capture pool. Whole values in consume order stop fetching the
+    # moment the pool is spent.
+    greedy_budgets = True
+
+    __slots__ = (
+        "_batch_by_value",
+        "_batches",
+        "_capture_model",
+        "_failed",
+        "_feeds",
+        "_materialized",
+        "_remaining",
+        "_session",
+        "diagnostics",
+        "notes",
+    )
+
+    def __init__(
+        self,
+        session: Any,
+        feeds: dict[str, np.ndarray[Any, Any]],
+        batches: list[tuple[dict[str, object], ...]],
+        capture_model: Path,
+    ) -> None:
+        self._session: Any = session
+        self._feeds = feeds
+        self._batches = batches
+        self._capture_model: Path | None = capture_model
+        self._batch_by_value = {
+            str(target["value_id"]): index
+            for index, batch in enumerate(batches)
+            for target in batch
+        }
+        self._materialized: dict[int, dict[str, np.ndarray[Any, Any]]] = {}
+        self._failed: dict[int, str] = {}
+        self._remaining = [
+            {str(target["value_id"]) for target in batch} for batch in batches
+        ]
+        self.diagnostics: list[str] = []
+        self.notes: list[str] = []
+
+    def _run_batch(self, index: int) -> dict[str, np.ndarray[Any, Any]] | None:
+        batch = self._batches[index]
+        names = [str(target["value_name"]) for target in batch]
+        try:
+            values = self._session.run(names, self._feeds)
+        except Exception as error:
+            # One failed fetch must not kill the trace: its targets carry the
+            # reason and every other batch is still attempted independently.
+            reason = f"not captured: {type(error).__name__}: {error}"
+            self._failed[index] = reason
+            self.diagnostics.append(
+                f"ONNX Runtime failed while fetching {len(batch)} value(s) "
+                f"starting at {names[0]!r}: {type(error).__name__}: {error}; "
+                "the other fetches were still attempted"
+            )
+            return None
+        arrays = {
+            str(target["value_id"]): np.asarray(value)
+            for target, value in zip(batch, values, strict=True)
+        }
+        self._materialized[index] = arrays
+        return arrays
+
+    def take(
+        self, target: dict[str, object]
+    ) -> tuple[np.ndarray[Any, Any] | None, str | None]:
+        """Return this target's value, or the reason it has none."""
+        name = str(target["value_name"])
+        if name in self._feeds:
+            return self._feeds[name], None
+        value_id = str(target["value_id"])
+        index = self._batch_by_value.get(value_id)
+        if index is None:
+            return None, "ONNX Runtime was not asked for this value"
+        self._remaining[index].discard(value_id)
+        try:
+            reason = self._failed.get(index)
+            if reason is not None:
+                return None, reason
+            if self._session is None:
+                return None, "the capture session was already released"
+            arrays = self._materialized.get(index)
+            if arrays is None:
+                arrays = self._run_batch(index)
+            if arrays is None:
+                return None, self._failed[index]
+            captured = arrays.pop(value_id, None)
+            if not self._remaining[index]:
+                self._materialized.pop(index, None)
+            if captured is None:
+                return None, "ONNX Runtime produced no value for this target"
+            return captured, None
+        finally:
+            if not any(self._remaining):
+                self.close()
+
+    def skip(self, target: dict[str, object]) -> None:
+        """Release a value that will not be taken without fetching its batch.
+
+        This is what keeps a spent capture budget from paying for the rest
+        of the model: a batch none of whose targets are ever taken is never
+        run, so no runtime pass and no transfer happen for it.
+        """
+        value_id = str(target["value_id"])
+        index = self._batch_by_value.get(value_id)
+        if index is None:
+            return
+        self._remaining[index].discard(value_id)
+        arrays = self._materialized.get(index)
+        if arrays is not None:
+            arrays.pop(value_id, None)
+            if not self._remaining[index]:
+                self._materialized.pop(index, None)
+        if not any(self._remaining):
+            self.close()
+
+    def size_hint(self, target: dict[str, object]) -> int | None:
+        """A capture's size: materialized bytes, else the declared estimate."""
+        name = str(target["value_name"])
+        if name in self._feeds:
+            return int(self._feeds[name].nbytes)
+        value_id = str(target["value_id"])
+        index = self._batch_by_value.get(value_id)
+        if index is not None:
+            captured = self._materialized.get(index, {}).get(value_id)
+            if captured is not None:
+                return int(captured.nbytes)
+        return _estimated_target_bytes(target)
+
+    def close(self) -> None:
+        """Release the runtime session and delete the staged capture file.
+
+        The staged file cannot be removed while a runtime still maps it on
+        Windows, so the session reference is dropped first; anything the
+        best-effort unlink cannot reclaim is swept with the scratch directory.
+        """
+        self._session = None
+        self._materialized.clear()
+        if self._capture_model is None:
+            return
+        capture_model, self._capture_model = self._capture_model, None
+        _discard_staged_capture(capture_model)
+
+
+TraceCaptureSource = CaptureSource | OrtCaptureSource
+
+
 def _onnxruntime_captures(
-    model: onnx.ModelProto,
     capture_model: Path,
     feeds: dict[str, np.ndarray[Any, Any]],
     runtime_targets: list[dict[str, object]],
     candidate: OrtProviderCandidate,
-) -> CaptureSource:
-    """Capture requested values through a staged ONNX Runtime session."""
+) -> OrtCaptureSource:
+    """Open a staged ONNX Runtime session serving lazily batched captures."""
     import onnxruntime as ort  # type: ignore[import-untyped]
 
     options = ort.SessionOptions()
@@ -553,13 +830,8 @@ def _onnxruntime_captures(
         providers=list(candidate.providers),
         provider_options=list(candidate.provider_options),
     )
-    names = [str(target["value_name"]) for target in runtime_targets]
-    values = session.run(names, feeds)
-    whole = {
-        str(target["value_id"]): np.asarray(value)
-        for target, value in zip(runtime_targets, values, strict=True)
-    }
-    return CaptureSource(model, feeds, whole, [], len(model.graph.node), None)
+    batches = _plan_batches(_capture_order(runtime_targets), _ORT_BATCH_BYTES)
+    return OrtCaptureSource(session, feeds, batches, capture_model)
 
 
 def _failed_runtime_source(
@@ -576,7 +848,8 @@ def _open_onnxruntime(
     feeds: dict[str, np.ndarray[Any, Any]],
     targets: list[dict[str, object]],
     device: TraceDevice,
-) -> tuple[CaptureSource, str, TraceDevice, str]:
+    capture_budget: int,
+) -> tuple[TraceCaptureSource, str, TraceDevice, str]:
     try:
         import onnxruntime as ort
     except ImportError as error:
@@ -599,14 +872,19 @@ def _open_onnxruntime(
             f"available providers: {', '.join(available) or 'none'}"
         )
     input_names = set(feeds)
-    runtime_targets = [
-        target for target in targets if str(target["value_name"]) not in input_names
-    ]
+    # Staging outputs the greedy budget can never store would force the
+    # runtime to materialize activations only to drop them unread.
+    runtime_targets = _fetch_worthy(
+        [target for target in targets if str(target["value_name"]) not in input_names],
+        capture_budget,
+    )
     if not runtime_targets:
-        source = CaptureSource(model, feeds, {}, [], len(model.graph.node), None)
+        feeds_only: TraceCaptureSource = CaptureSource(
+            model, feeds, {}, [], len(model.graph.node), None
+        )
         first = candidates[0]
         runtime = f"onnxruntime {ort.__version__} · {first.label}"
-        return source, runtime, first.device, first.provider
+        return feeds_only, runtime, first.device, first.provider
     try:
         capture_model = _stage_capture_model(
             model_path,
@@ -618,51 +896,46 @@ def _open_onnxruntime(
             f"{type(error).__name__}: {error}"
         ) from error
     failures: list[str] = []
-    try:
-        for candidate in candidates:
-            try:
-                source = _onnxruntime_captures(
-                    model,
-                    capture_model,
-                    feeds,
-                    runtime_targets,
-                    candidate,
+    for candidate in candidates:
+        try:
+            source = _onnxruntime_captures(
+                capture_model,
+                feeds,
+                runtime_targets,
+                candidate,
+            )
+        except Exception as error:
+            detail = f"{type(error).__name__}: {error}"
+            # ONNX Runtime words this two ways: "disabled fallback to
+            # the CPU EP" and "fallback to CPU EP has been explicitly
+            # disabled".
+            if "fallback to" in detail and "CPU EP" in detail:
+                # ONNX Runtime reports this generic conflict when a
+                # strict accelerator candidate cannot serve the model —
+                # most often because the provider's native libraries
+                # (CUDA, cuDNN, TensorRT) failed to load.
+                detail += (
+                    " (the provider's native libraries likely failed to"
+                    " load, or the model needs CPU-assigned nodes)"
                 )
-            except Exception as error:
-                detail = f"{type(error).__name__}: {error}"
-                # ONNX Runtime words this two ways: "disabled fallback to
-                # the CPU EP" and "fallback to CPU EP has been explicitly
-                # disabled".
-                if "fallback to" in detail and "CPU EP" in detail:
-                    # ONNX Runtime reports this generic conflict when a
-                    # strict accelerator candidate cannot serve the model —
-                    # most often because the provider's native libraries
-                    # (CUDA, cuDNN, TensorRT) failed to load.
-                    detail += (
-                        " (the provider's native libraries likely failed to"
-                        " load, or the model needs CPU-assigned nodes)"
-                    )
-                failures.append(f"{candidate.label}: {detail}")
-                continue
-            if failures:
-                # A lower-priority provider serving the trace is honest but
-                # surprising; the user must be able to see why the faster
-                # candidates were passed over.
-                source.diagnostics.insert(
-                    0,
-                    "higher-priority execution providers failed and were "
-                    "skipped: " + "; ".join(failures),
-                )
-            runtime = f"onnxruntime {ort.__version__} · {candidate.label}"
-            return source, runtime, candidate.device, candidate.provider
-    finally:
-        # Captures are materialized eagerly, so the staged file is spent by
-        # now. A runtime that still maps it blocks deletion on Windows;
-        # scratch teardown reclaims whatever this best-effort pass cannot.
-        data_path = capture_model.with_name(capture_model.name + ".data")
-        for stale in (capture_model, data_path):
-            with contextlib.suppress(OSError):
-                stale.unlink()
+            failures.append(f"{candidate.label}: {detail}")
+            continue
+        if failures:
+            # A lower-priority provider serving the trace is honest but
+            # surprising; the user must be able to see why the faster
+            # candidates were passed over. It is context, not a defect in
+            # the records, so it travels as a note.
+            source.notes.insert(
+                0,
+                "higher-priority execution providers failed and were "
+                "skipped: " + "; ".join(failures),
+            )
+        # Captures are now fetched lazily, so the session — and the staged
+        # file it maps — outlives this call; the source deletes the file
+        # when its last batch is spent or the worker closes it.
+        runtime = f"onnxruntime {ort.__version__} · {candidate.label}"
+        return source, runtime, candidate.device, candidate.provider
+    _discard_staged_capture(capture_model)
     detail = "; ".join(failures)
     raise RuntimeError(
         f"no usable {device.value.upper()} execution provider accepted the model"
@@ -677,10 +950,13 @@ def _open_backend(
     targets: list[dict[str, object]],
     backend: TraceBackend,
     device: TraceDevice = TraceDevice.AUTO,
-) -> tuple[CaptureSource, str, TraceDevice, str]:
+    capture_budget: int = _DEFAULT_CAPTURE_BUDGET,
+) -> tuple[TraceCaptureSource, str, TraceDevice, str]:
     if backend is TraceBackend.ONNX_RUNTIME:
         try:
-            return _open_onnxruntime(model, model_path, feeds, targets, device)
+            return _open_onnxruntime(
+                model, model_path, feeds, targets, device, capture_budget
+            )
         except Exception as error:
             message = (
                 "ONNX Runtime could not execute the trace: "
@@ -730,7 +1006,9 @@ def _open_backend(
         )
 
     try:
-        return _open_onnxruntime(model, model_path, feeds, targets, device)
+        return _open_onnxruntime(
+            model, model_path, feeds, targets, device, capture_budget
+        )
     except Exception as error:
         if device in {TraceDevice.GPU, TraceDevice.NPU}:
             message = (
@@ -897,7 +1175,14 @@ def run(request_path: Path) -> None:
         targets,
         backend,
         device,
+        int(raw["capture_bytes"]),
     )
+    if isinstance(source, OrtCaptureSource):
+        # The runtime serves captures from its own session; keeping the
+        # parsed proto alive would hold a model-sized block of host memory
+        # against the worker cap for nothing. Only the reference source
+        # still evaluates through it.
+        del model
     diagnostics = source.diagnostics
     output = Path(str(raw["output"]))
     remaining = int(raw["capture_bytes"])
@@ -914,42 +1199,73 @@ def run(request_path: Path) -> None:
     ordinary = [
         index for index in range(len(targets)) if index not in prioritized_indices
     ]
-    for phase in (prioritized, ordinary):
-        sizes = [source.size_hint(targets[index]) for index in phase]
-        exact_budgets = (
-            all(size is not None for size in sizes)
-            and sum(cast(int, size) for size in sizes) <= remaining
-        )
-        for offset, index in enumerate(phase):
-            target = targets[index]
-            # Produce this value only now, and drop it once written, so peak
-            # memory tracks the largest single activation rather than the sum
-            # of every value the trace was asked to capture.
-            capture, failure = source.take(target)
-            # Reserve an equal share for each remaining value in this phase.
-            # Small tensors return their unused share to the pool, while large
-            # tensors keep a useful prefix rather than starving later nodes.
-            # When the even share floors to zero the pool is nearly spent, so
-            # offer what is genuinely left rather than dropping a value while
-            # bytes remain free.
-            if exact_budgets:
-                budget = cast(int, sizes[offset])
-            else:
-                share = remaining // (len(phase) - offset)
-                budget = share if share > 0 else remaining
-            record, unused_budget = _write_capture(
-                output,
-                target,
-                capture,
-                remaining=budget,
-                chunk_bytes=chunk_bytes,
-                reason=failure,
+    try:
+        for phase in (prioritized, ordinary):
+            sizes = [source.size_hint(targets[index]) for index in phase]
+            exact_budgets = (
+                all(size is not None for size in sizes)
+                and sum(cast(int, size) for size in sizes) <= remaining
             )
-            remaining -= budget - unused_budget
-            records_by_index[index] = record
-            # The bytes are on disk now; releasing here is what bounds peak
-            # memory to one activation rather than the whole trace.
-            capture = None
+            for offset, index in enumerate(phase):
+                target = targets[index]
+                # Reserve an equal share for each remaining value in this
+                # phase. Small tensors return their unused share to the pool,
+                # while large tensors keep a useful prefix rather than
+                # starving later nodes. When the even share floors to zero the
+                # pool is nearly spent, so offer what is genuinely left rather
+                # than dropping a value while bytes remain free.
+                if exact_budgets:
+                    budget = cast(int, sizes[offset])
+                elif source.greedy_budgets:
+                    # Batched sources take whole values in consume order:
+                    # once the pool is spent every later value skips, which
+                    # bounds runtime passes by the capture budget instead of
+                    # the model's activation total.
+                    budget = remaining
+                else:
+                    share = remaining // (len(phase) - offset)
+                    budget = share if share > 0 else remaining
+                if budget <= 0:
+                    # The pool is spent: producing this value would cost a
+                    # runtime fetch or a reference evaluation only to drop
+                    # the bytes, so the source releases it unproduced. On a
+                    # large model this is the difference between a trace
+                    # bounded by its capture budget and one that pays for
+                    # every activation it will never keep.
+                    source.skip(target)
+                    record, _ = _write_capture(
+                        output,
+                        target,
+                        None,
+                        remaining=0,
+                        chunk_bytes=chunk_bytes,
+                        reason=("capture byte ceiling was exhausted before this value"),
+                    )
+                    records_by_index[index] = record
+                    continue
+                # Produce this value only now, and drop it once written, so
+                # peak memory tracks the largest single activation (or one
+                # runtime fetch) rather than the sum of every value the trace
+                # was asked to capture.
+                capture, failure = source.take(target)
+                record, unused_budget = _write_capture(
+                    output,
+                    target,
+                    capture,
+                    remaining=budget,
+                    chunk_bytes=chunk_bytes,
+                    reason=failure,
+                )
+                remaining -= budget - unused_budget
+                records_by_index[index] = record
+                # The bytes are on disk now; releasing here is what bounds
+                # peak memory to one activation rather than the whole trace.
+                capture = None
+    finally:
+        # A lazily-fetching source still holds its runtime session and the
+        # staged capture file when the loop ends early; releasing here keeps
+        # the deletion best-effort rather than leaking until scratch teardown.
+        source.close()
     records = [records_by_index[index] for index in range(len(targets))]
     response = {
         "runtime": runtime,
@@ -957,6 +1273,7 @@ def run(request_path: Path) -> None:
         "execution_provider": execution_provider,
         "records": records,
         "diagnostics": diagnostics,
+        "notes": source.notes,
     }
     Path(str(raw["response"])).write_text(
         json.dumps(response, sort_keys=True),

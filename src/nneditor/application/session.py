@@ -18,7 +18,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Self, cast
+from typing import Final, Self, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -57,7 +57,7 @@ from nneditor.application.navigation import (
 from nneditor.application.persistence import SessionStateStore
 from nneditor.application.slices import GraphSlice, GraphSlicer
 from nneditor.application.statistics_store import StatisticsSidecarStore
-from nneditor.cancellation import CancellationToken
+from nneditor.cancellation import CancellationToken, OperationCancelled
 from nneditor.editing.revisions import Revision
 from nneditor.editing.validation import EditRequest, EditTransaction
 from nneditor.ir.capabilities import (
@@ -118,6 +118,16 @@ __all__ = [
 
 class SessionError(ValueError):
     """Raised when a session operation cannot be performed."""
+
+
+_PREWARM_DETAIL_LEVELS: Final = (
+    DetailLevel.BLOCK,
+    DetailLevel.LAYER,
+    DetailLevel.OPERATOR,
+)
+"""Deeper levels warmed in the background after open. Their first interactive
+switch otherwise pays the full base-layout-plus-semantic-slice cost cold —
+hundreds of milliseconds on large models, well past the interaction budget."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +201,7 @@ class ModelSession:
         "_input_store",
         "_jobs",
         "_navigation",
+        "_prewarm_job",
         "_slicer",
         "_source_document",
         "_state_lock",
@@ -227,6 +238,7 @@ class ModelSession:
             self._hierarchy_store = hierarchy_store
             self._navigation = NavigationModel()
             self._jobs = jobs
+            self._prewarm_job: Job[tuple[GraphSlice, ...]] | None = None
             self._activation_store = activation_store
             self._input_store = input_store
             self._stats_sidecar = stats_sidecar
@@ -292,6 +304,60 @@ class ModelSession:
                 root_group=root_group,
                 viewport=viewport,
             )
+
+    def _schedule_layout_prewarm(self) -> None:
+        """Warm the deeper detail levels' shared slicer caches on the pool.
+
+        Walks BLOCK -> LAYER -> OPERATOR for the entry graph (root group
+        ``None``) through the same slicer call :meth:`scene` makes with the
+        same resolved arguments, so the populated ``SliceKey``/base-layout
+        keys are exactly the ones the shell's first detail switch asks for.
+        The shell needs no changes: it keeps calling :meth:`scene` and finds
+        the entries warm.
+        """
+        if self._jobs is None or self._closed:
+            return
+
+        def work(token: CancellationToken) -> tuple[GraphSlice, ...]:
+            # Capture once, briefly. The walk below runs without
+            # _state_lock: holding it across multi-hundred-millisecond
+            # layouts would block UI reads and close().
+            with self._state_lock, self.editing.stable_view():
+                if self._closed:
+                    raise OperationCancelled
+                document = self.editing.document
+                revision_id = self.editing.current_revision_id
+                graph_id = document.entry_graph
+                hierarchy = self.hierarchy.hierarchy(graph_id)
+            warmed: list[GraphSlice] = []
+            for level in _PREWARM_DETAIL_LEVELS:
+                # Checkpoint between levels: closing the session cancels
+                # this job, and the walk stops before its next level.
+                token.raise_if_cancelled()
+                if self._closed:
+                    raise OperationCancelled
+                # Every key ingredient (content hash, editing revision,
+                # hierarchy revision, settings) was captured above, so a
+                # hierarchy edit or organization-mode change mid-walk only
+                # changes *future* keys — entries computed here are at
+                # worst unused until evicted, never served stale, and need
+                # no invalidation.
+                warmed.append(
+                    self._slicer.slice_graph(
+                        document,
+                        graph_id,
+                        revision_id=revision_id,
+                        hierarchy=hierarchy,
+                        detail_level=level,
+                        root_group=None,
+                    )
+                )
+            return tuple(warmed)
+
+        # Best-effort: a service already shutting down skips the warmup
+        # rather than failing the open.
+        with contextlib.suppress(RuntimeError):
+            self._prewarm_job = self._jobs.submit(f"prewarm layouts {self.title}", work)
 
     def search(self, text: str) -> tuple[str, ...]:
         self._ensure_open()
@@ -984,6 +1050,10 @@ class ModelSession:
             if self._closed:
                 return
             self._closed = True
+            if self._prewarm_job is not None:
+                # cancel() only flips the token; the walk stops at its next
+                # between-level checkpoint, so close never waits on it.
+                self._prewarm_job.cancel()
             self.store.close()
 
 
@@ -998,6 +1068,7 @@ class ApplicationService:
         "_hierarchy_store",
         "_input_store",
         "_lock",
+        "_prewarm",
         "_sessions",
         "_slicer",
         "_stats_store",
@@ -1018,8 +1089,10 @@ class ApplicationService:
         adapter_registry: ArtifactAdapterRegistry | None = None,
         activation_store: ActivationStore | None = None,
         input_store: InputSpecificationStore | None = None,
+        prewarm_layouts: bool = True,
     ) -> None:
         self.jobs = JobManager(listener=job_listener)
+        self._prewarm = prewarm_layouts
         self._adapters = adapter_registry or default_artifact_adapter_registry()
         self._slicer = GraphSlicer()
         self._sessions: dict[int, ModelSession] = {}
@@ -1088,6 +1161,10 @@ class ApplicationService:
         )
         with self._lock:
             self._sessions[session.id] = session
+        if self._prewarm:
+            # Scheduled only after the session is registered and fully
+            # constructed, so the job never observes a half-built session.
+            session._schedule_layout_prewarm()
         return session
 
     def open_model_async(self, path: Path | str) -> Job[ModelSession]:
@@ -1186,6 +1263,10 @@ class ApplicationService:
             raise
         with self._lock:
             self._sessions[session.id] = session
+        if self._prewarm:
+            # Scheduled only after the session is registered and fully
+            # constructed, so the job never observes a half-built session.
+            session._schedule_layout_prewarm()
         return session
 
     def stage_upload(

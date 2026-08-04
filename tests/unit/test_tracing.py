@@ -16,6 +16,7 @@ from nneditor.application.session import ApplicationService
 from nneditor.application.slices import GraphSlice
 from nneditor.cancellation import CancellationToken, OperationCancelled
 from nneditor.input_generation import generate_image_tensor
+from nneditor.ir.core import Value
 from nneditor.rendering.scene import NodeGlyph, Scene
 from nneditor.storage.store import TensorUnavailableError
 from nneditor.tracing import (
@@ -43,6 +44,11 @@ from nneditor.tracing import (
     trace_scene_patch,
 )
 from nneditor.tracing.contracts import resolved_file
+from nneditor.tracing.runner import (
+    _capture_pressure_note,
+    _parse_worker_response,
+    estimated_capture_bytes,
+)
 from tests.fixtures.onnx_models import (
     build_embedded_model,
     build_masked_image_model,
@@ -83,6 +89,7 @@ def _commit(
     *,
     state: CaptureState = CaptureState.COMPLETE,
     execution_provider: str | None = None,
+    notes: tuple[str, ...] = (),
 ) -> TraceResult:
     staging = store.begin_staging()
     (staging / "captures").mkdir()
@@ -99,7 +106,9 @@ def _commit(
             )
         )
     if execution_provider is None:
-        return store.commit(key, tuple(records), "test-runtime", (), staging)
+        return store.commit(
+            key, tuple(records), "test-runtime", (), staging, notes=notes
+        )
     return store.commit(
         key,
         tuple(records),
@@ -107,6 +116,7 @@ def _commit(
         (),
         staging,
         execution_provider=execution_provider,
+        notes=notes,
     )
 
 
@@ -1043,3 +1053,142 @@ def test_activation_store_rejects_invalid_paths_ranges_and_payloads(
     reloaded = ActivationStore(store.root)
     assert reloaded.result(result.id) == result
     assert reloaded.results("another-artifact") == ()
+
+
+def test_trace_result_notes_round_trip_and_never_mark_partial() -> None:
+    record = _record("value", np.zeros(2, dtype=np.float32).tobytes())
+    result = TraceResult(
+        TraceKey("artifact", None, "inputs"),
+        (record,),
+        "runtime",
+        notes=("higher-priority execution providers failed and were skipped",),
+    )
+    # Notes are context, never a defect: a complete-records result with
+    # notes and no diagnostics must not claim to be partial.
+    assert result.partial is False
+    assert TraceResult.from_json(result.to_json()) == result
+
+    # Manifests written before the notes channel load with empty notes.
+    legacy_json = result.to_json()
+    legacy_json.pop("notes")
+    legacy = TraceResult.from_json(legacy_json)
+    assert legacy.notes == ()
+    assert legacy.partial is False
+
+
+def test_store_commit_keeps_newest_notes_across_merge_and_cold_reload(
+    tmp_path: Path,
+) -> None:
+    store = ActivationStore(tmp_path / "captures")
+    key = TraceKey("artifact", None, "inputs")
+    _commit(
+        store,
+        key,
+        {"a": np.array([1.0], dtype=np.float32)},
+        notes=("stale first-run note",),
+    )
+    second = _commit(
+        store,
+        key,
+        {"a": np.array([2.0], dtype=np.float32)},
+        notes=("fresh second-run note",),
+    )
+    # A merge keeps only the newest run's notes, and notes leave partial
+    # untouched for a complete result.
+    assert second.notes == ("fresh second-run note",)
+    assert second.partial is False
+
+    reloaded = ActivationStore(store.root)
+    assert reloaded.result(second.id).notes == ("fresh second-run note",)
+    assert reloaded.result(second.id).partial is False
+
+
+def test_eviction_preserves_the_evicted_results_notes(tmp_path: Path) -> None:
+    store = ActivationStore(tmp_path / "captures", byte_budget=6)
+    first = _commit(
+        store,
+        TraceKey("artifact", None, "inputs"),
+        {"a": np.array([1.0], dtype=np.float32)},
+        notes=("first note",),
+    )
+    _commit(
+        store,
+        TraceKey("artifact", "revision", "inputs"),
+        {"b": np.array([2.0], dtype=np.float32)},
+    )
+    evicted = store.result(first.id)
+    assert evicted.record("a").state is CaptureState.EVICTED
+    assert evicted.notes == ("first note",)
+
+
+def test_estimated_capture_bytes_counts_known_shapes_and_isolates_symbolic() -> None:
+    known = Value("v1", "v1", "float32", (2, 3))
+    scalar = Value("v2", "v2", "float16", ())
+    symbolic = Value("v3", "v3", "float32", ("batch", 3))
+    unknown_shape = Value("v4", "v4", "float32", None)
+    unknown_type = Value("v5", "v5", None, (4,))
+    sub_byte = Value("v6", "v6", "int4", (8,))
+
+    assert estimated_capture_bytes([known]) == 24
+    assert estimated_capture_bytes([known, scalar]) == 26
+    # Symbolic, undeclared, and sub-byte values isolate: they contribute
+    # nothing instead of poisoning the whole estimate.
+    assert (
+        estimated_capture_bytes(
+            [known, symbolic, unknown_shape, unknown_type, sub_byte]
+        )
+        == 24
+    )
+    assert estimated_capture_bytes([]) == 0
+
+
+def test_capture_pressure_note_attaches_only_beyond_half_the_memory_limit() -> None:
+    limits = TraceLimits(
+        wall_seconds=1,
+        memory_bytes=1000,
+        capture_bytes=100,
+        chunk_bytes=10,
+    )
+
+    def target(shape: list[int]) -> dict[str, object]:
+        return {"element_type": "float32", "shape": shape}
+
+    # 800 declared bytes against a 1000-byte limit: over half, so the run
+    # gets a note — never a refusal.
+    note = _capture_pressure_note([target([200])], limits)
+    assert note is not None
+    assert "capture fewer values" in note
+    assert "raise the Memory limit" in note
+
+    assert _capture_pressure_note([target([100])], limits) is None
+    # A symbolic dimension makes the size unknowable, so it cannot trigger
+    # the warning on its own.
+    assert _capture_pressure_note([target([-1])], limits) is None
+
+
+def test_worker_response_parsing_carries_notes_and_tolerates_old_workers() -> None:
+    record = _record("value", np.zeros(2, dtype=np.float32).tobytes())
+    payload: dict[str, object] = {
+        "records": [record.to_json()],
+        "runtime": "onnxruntime 0-test",
+        "diagnostics": ["one diagnostic"],
+        "notes": ["one note"],
+        "execution_device": "cpu",
+        "execution_provider": "CPUExecutionProvider",
+    }
+    records, runtime, diagnostics, notes, device, provider = _parse_worker_response(
+        payload
+    )
+    assert records == (record,)
+    assert runtime == "onnxruntime 0-test"
+    assert diagnostics == ("one diagnostic",)
+    assert notes == ("one note",)
+    assert device is TraceDevice.CPU
+    assert provider == "CPUExecutionProvider"
+
+    payload.pop("notes")
+    assert _parse_worker_response(payload)[3] == ()
+
+    payload["notes"] = "not-a-list"
+    with pytest.raises(ValueError, match="malformed"):
+        _parse_worker_response(payload)

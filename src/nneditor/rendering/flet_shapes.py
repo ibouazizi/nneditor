@@ -13,6 +13,7 @@ zoomed-out map.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
 
@@ -32,8 +33,16 @@ __all__ = [
     "LABEL_MIN_SCALE",
     "SELECTION_COLOR",
     "BuiltShapes",
+    "TintFunction",
     "build_shapes",
 ]
+
+TintFunction = Callable[[str], "str | None"]
+"""Overlay seam: node glyph id to an override fill color, or None to keep it.
+
+Analysis overlays (numeric-anomaly tinting) plug in here instead of owning a
+second shape builder; a None callable keeps the built output byte-identical
+to the untinted path."""
 
 KIND_COLORS: Final[dict[str, str]] = {
     "conv": "#DCEBFF",
@@ -107,8 +116,13 @@ def build_shapes(
     selection: frozenset[str],
     *,
     max_shapes: int | None = None,
+    tint: TintFunction | None = None,
 ) -> BuiltShapes:
-    """Build screen-space shapes for everything near the viewport."""
+    """Build screen-space shapes for everything near the viewport.
+
+    ``tint`` may override a node glyph's fill color (analysis overlays); when
+    it is None or returns None the kind-based fill applies unchanged.
+    """
     cull_bounds = viewport.expanded(CULL_MARGIN)
     visible_edges = edge_index.query(cull_bounds)
     visible_nodes = node_index.query(cull_bounds)
@@ -204,6 +218,13 @@ def build_shapes(
         left, top = to_screen(node.x, node.y)
         width = node.width * scale
         height = node.height * scale
+        fill = (
+            _block_fill(node.id)
+            if node.kind == "group"
+            else KIND_COLORS.get(node.kind, DEFAULT_NODE_COLOR)
+        )
+        if tint is not None and (override := tint(node_id)) is not None:
+            fill = override
         shapes.append(
             cv.Rect(
                 x=left,
@@ -212,11 +233,7 @@ def build_shapes(
                 height=height,
                 border_radius=10.0 * scale,
                 paint=ft.Paint(
-                    color=(
-                        _block_fill(node.id)
-                        if node.kind == "group"
-                        else KIND_COLORS.get(node.kind, DEFAULT_NODE_COLOR)
-                    ),
+                    color=fill,
                     style=ft.PaintingStyle.FILL,
                 ),
             )

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import flet as ft
 
 __all__ = [
+    "DARK_SHELL_PALETTE",
     "ShellPalette",
     "build_empty_state",
     "build_hierarchy_tools",
@@ -48,6 +49,38 @@ class ShellPalette:
     warning_border: str = "#FEDF89"
     danger: str = "#B42318"
     danger_soft: str = "#FEF3F2"
+    # The translucent wash behind the modal loading card; canvas-tinted so
+    # the workspace stays recognizable underneath it.
+    scrim: str = "#A6F6F7FB"
+
+
+DARK_SHELL_PALETTE = ShellPalette(
+    panel="#1B2130",
+    border="#2E3A50",
+    accent="#8E8FF2",
+    accent_soft="#2B2D55",
+    ink="#E6EAF2",
+    muted="#98A2B3",
+    canvas="#10131C",
+    sidebar_width=304,
+    subtle="#232B3D",
+    info="#7CB3F5",
+    info_soft="#17293F",
+    success="#4CC38A",
+    success_soft="#12291E",
+    warning="#F0B25C",
+    warning_soft="#33270F",
+    warning_border="#6B5320",
+    danger="#F97066",
+    danger_soft="#3A1A18",
+    scrim="#A610131C",
+)
+"""Dark counterparts for every palette field.
+
+The semantic states swap roles with their soft variants relative to light
+mode: the text colors are the light tints (readable on dark panels) and the
+soft backgrounds are deep washes of the same hue, keeping the same
+foreground-on-soft pairings legible in both themes."""
 
 
 def build_left_panel(
@@ -332,7 +365,7 @@ def build_loading_overlay(
             ),
         ),
         alignment=ft.Alignment.CENTER,
-        bgcolor="#A6F6F7FB",
+        bgcolor=palette.scrim,
         expand=True,
         visible=False,
     )

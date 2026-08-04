@@ -9,8 +9,9 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 
@@ -28,11 +29,18 @@ from nneditor.tracing.contracts import (
     TraceLimits,
     TraceRequest,
     TraceResult,
+    declared_byte_size,
 )
 from nneditor.tracing.inputs import bind_inputs
 from nneditor.tracing.store import ActivationStore
 
-__all__ = ["TraceError", "recommended_trace_limits", "run_onnx_trace"]
+__all__ = [
+    "DeclaredValue",
+    "TraceError",
+    "estimated_capture_bytes",
+    "recommended_trace_limits",
+    "run_onnx_trace",
+]
 
 ModelBuilder = Callable[[Path, CancellationToken], None]
 _MIB = 1024 * 1024
@@ -46,6 +54,136 @@ class TraceError(RuntimeError):
     """An approved isolated trace could not produce a trustworthy result."""
 
 
+class DeclaredValue(Protocol):
+    """Anything declaring an element type and shape, e.g. ``ir.core.Value``."""
+
+    @property
+    def element_type(self) -> str | None: ...
+
+    @property
+    def shape(self) -> Sequence[int | str | None] | None: ...
+
+
+def estimated_capture_bytes(values: Iterable[DeclaredValue]) -> int:
+    """Estimated decoded bytes of capturing these declared values in full.
+
+    Intended for the UI before any run exists: pass a session's declared
+    graph values (or the subset a capture selection names) to preview how
+    much activation data a trace would materialize. Values with symbolic or
+    unknown dimensions, or element types without a fixed byte width,
+    contribute nothing, so the estimate is a lower bound.
+    """
+    total = 0
+    for value in values:
+        size = declared_byte_size(value.element_type, value.shape)
+        if size is not None:
+            total += size
+    return total
+
+
+def _capture_pressure_note(
+    targets: list[dict[str, object]],
+    limits: TraceLimits,
+) -> str | None:
+    """A pre-run warning — never a refusal — when the capture looks too big.
+
+    Declared shapes are promises, not measurements, so exceeding half the
+    approved worker memory is worth a note while staying well short of
+    grounds to block an explicitly approved trace.
+    """
+    estimated = 0
+    for target in targets:
+        raw_shape = target.get("shape")
+        size = declared_byte_size(
+            str(target.get("element_type")),
+            raw_shape if isinstance(raw_shape, list) else None,
+        )
+        if size is not None:
+            estimated += size
+    if estimated <= limits.memory_bytes // 2:
+        return None
+    estimated_mib = math.ceil(estimated / _MIB)
+    limit_mib = math.ceil(limits.memory_bytes / _MIB)
+    return (
+        f"the selected capture decodes to an estimated {estimated_mib:,} MiB "
+        f"of activations, more than half the approved {limit_mib:,} MiB "
+        "memory limit; a full capture may exhaust it — capture fewer values "
+        "or raise the Memory limit"
+    )
+
+
+def _parse_worker_response(
+    raw: object,
+) -> tuple[
+    tuple[ActivationRecord, ...],
+    str,
+    tuple[str, ...],
+    tuple[str, ...],
+    TraceDevice,
+    str,
+]:
+    """Decode the worker's response JSON into typed result components."""
+    if (
+        not isinstance(raw, dict)
+        or not isinstance(raw.get("records"), list)
+        or not isinstance(raw.get("diagnostics"), list)
+    ):
+        raise ValueError("malformed response")
+    # Workers predating the notes channel simply omit the key.
+    raw_notes = raw.get("notes", [])
+    if not isinstance(raw_notes, list):
+        raise ValueError("malformed response")
+    return (
+        tuple(ActivationRecord.from_json(item) for item in raw["records"]),
+        str(raw["runtime"]),
+        tuple(str(item) for item in raw["diagnostics"]),
+        tuple(str(item) for item in raw_notes),
+        TraceDevice(str(raw["execution_device"])),
+        str(raw["execution_provider"]),
+    )
+
+
+def _spawn_worker(
+    scratch: Path,
+    request_path: Path,
+) -> tuple[subprocess.Popen[str], Path, Path]:
+    """Start the isolated worker with its streams landing in files.
+
+    The caller's poll loop never drains streams, so a pipe would block the
+    child the moment its buffer fills — ONNX Runtime's provider banners
+    alone can do it — and a blocked child is indistinguishable from a
+    wall-clock overrun.
+    """
+    stdout_path = scratch / "worker-stdout.log"
+    stderr_path = scratch / "worker-stderr.log"
+    out_handle = open(stdout_path, "w", encoding="utf-8", errors="replace")
+    err_handle = open(stderr_path, "w", encoding="utf-8", errors="replace")
+    try:
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "nneditor.tracing.trace_worker",
+                    str(request_path),
+                ],
+                cwd=scratch,
+                env=_worker_environment("NNEDITOR_TRACE_WORKER"),
+                stdin=subprocess.DEVNULL,
+                stdout=out_handle,
+                stderr=err_handle,
+                text=True,
+            )
+        except OSError as error:
+            raise TraceError(f"trace worker could not start: {error}") from error
+    finally:
+        # The child owns its stream descriptors from the moment it spawns;
+        # the parent's copies would only pin the log files.
+        out_handle.close()
+        err_handle.close()
+    return process, stdout_path, stderr_path
+
+
 def _next_power_of_two(value: int) -> int:
     return 1 << max(0, value - 1).bit_length()
 
@@ -55,10 +193,13 @@ def recommended_trace_limits(model_bytes: int) -> TraceLimits:
     if model_bytes < 0:
         raise ValueError("model byte size cannot be negative")
     # ONNX first reads the serialized protobuf, then retains parsed tensors,
-    # evaluator state, and live activations. Six model-sized working sets plus
-    # fixed headroom covers attention-heavy inline-weight models such as the
-    # Qwen vision tower while keeping small-model defaults unchanged.
-    estimated_memory = model_bytes * 6 + 512 * _MIB + _DEFAULT_TRACE_CAPTURE_BYTES
+    # evaluator state, and live activations; a GPU runtime adds its own
+    # host-side weight copies and pinned transfer buffers on top. Twelve
+    # model-sized working sets plus headroom is what a measured full-graph
+    # CUDA trace of the 1.33 GB Qwen vision tower actually needed — its
+    # host commit exceeded the previous six-set estimate and the job cap
+    # turned driver allocations into spurious CUDA out-of-memory failures.
+    estimated_memory = model_bytes * 12 + _GIB + _DEFAULT_TRACE_CAPTURE_BYTES
     memory_bytes = max(
         _DEFAULT_TRACE_MEMORY_BYTES,
         _next_power_of_two(estimated_memory),
@@ -194,12 +335,16 @@ def run_onnx_trace(
                 "and approve the trace again"
             )
         np.savez(inputs_path, **feeds)  # type: ignore[arg-type]
+        targets = _targets(document, request.value_ids)
+        # Known pre-launch: warn (as a note, not a refusal) when the declared
+        # capture set alone approaches the approved worker memory.
+        pressure_note = _capture_pressure_note(targets, request.limits)
         payload = {
             "model": str(model_path),
             "inputs": str(inputs_path),
             "output": str(staging),
             "response": str(response_path),
-            "targets": _targets(document, request.value_ids),
+            "targets": targets,
             "backend": request.backend.value,
             "device": request.device.value,
             **request.limits.to_json(),
@@ -208,27 +353,11 @@ def run_onnx_trace(
             json.dumps(payload, sort_keys=True),
             encoding="utf-8",
         )
-        try:
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "nneditor.tracing.trace_worker",
-                    str(request_path),
-                ],
-                cwd=scratch,
-                env=_worker_environment("NNEDITOR_TRACE_WORKER"),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except OSError as error:
-            raise TraceError(f"trace worker could not start: {error}") from error
+        process, stdout_path, stderr_path = _spawn_worker(scratch, request_path)
         job = _cap_worker_process(process, request.limits.memory_bytes)
         if os.name == "nt" and job is None:
             process.kill()
-            process.communicate()
+            process.wait()
             raise TraceError(
                 "trace worker memory ceiling could not be enforced on Windows"
             )
@@ -239,35 +368,34 @@ def run_onnx_trace(
                     token.raise_if_cancelled()
                 except OperationCancelled:
                     process.kill()
-                    process.communicate()
+                    process.wait()
                     raise
                 if time.monotonic() - started > request.limits.wall_seconds:
                     process.kill()
-                    process.communicate()
+                    process.wait()
                     raise TraceError(
                         f"trace worker exceeded {request.limits.wall_seconds:g} seconds"
                     )
                 time.sleep(0.02)
-            stdout, stderr = process.communicate()
         finally:
             _close_job_object(job)
         token.raise_if_cancelled()
         if process.returncode != 0:
+            stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+            stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
             message = stderr.strip() or stdout.strip()
             raise TraceError(f"trace worker failed: {message or process.returncode}")
         try:
-            raw = json.loads(response_path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(raw, dict)
-                or not isinstance(raw.get("records"), list)
-                or not isinstance(raw.get("diagnostics"), list)
-            ):
-                raise ValueError("malformed response")
-            records = tuple(ActivationRecord.from_json(item) for item in raw["records"])
-            runtime = str(raw["runtime"])
-            diagnostics = tuple(str(item) for item in raw["diagnostics"])
-            execution_device = TraceDevice(str(raw["execution_device"]))
-            execution_provider = str(raw["execution_provider"])
+            (
+                records,
+                runtime,
+                diagnostics,
+                notes,
+                execution_device,
+                execution_provider,
+            ) = _parse_worker_response(
+                json.loads(response_path.read_text(encoding="utf-8"))
+            )
         except (
             OSError,
             KeyError,
@@ -278,6 +406,8 @@ def run_onnx_trace(
             raise TraceError(
                 f"trace worker returned an invalid response: {error}"
             ) from error
+        if pressure_note is not None:
+            notes = (*notes, pressure_note)
         token.raise_if_cancelled()
         shutil.rmtree(scratch)
         return store.commit(
@@ -288,6 +418,7 @@ def run_onnx_trace(
             staging,
             execution_device=execution_device,
             execution_provider=execution_provider,
+            notes=notes,
         )
     except BaseException:
         if staging.exists():

@@ -13,6 +13,7 @@ callable.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -34,11 +35,25 @@ from nneditor.tracing.contracts import (
     TraceRequest,
     TraceResult,
 )
+from nneditor.tracing.preflight import RuntimeStatus, runtime_status
+from nneditor.tracing.runner import estimated_capture_bytes
 from nneditor.ui import overview, viewmodel
 from nneditor.ui.shell_layout import ShellPalette
 from nneditor.ui.trace_graph import TraceGraphPresentation
 
 __all__ = ["ActivationRows", "TracePanel", "uses_automatic_mask"]
+
+_MIB = 1024 * 1024
+# One GiB of estimated decoded activations (1024 MiB). Above this, capturing
+# everything is a heavyweight choice a user should make knowingly — a 1.33 GB,
+# 2,199-node model decodes to roughly 8 GiB of activations — so the panel
+# defaults the scope to the graph's boundaries plus the current selection and
+# offers an explicit control to widen back to everything.
+_FULL_CAPTURE_ADVISORY_BYTES = 1024 * _MIB
+
+# Capture-scope choices offered when the full-capture advisory is active.
+_SCOPE_BOUNDARIES = "boundaries-plus-selection"
+_SCOPE_EVERYTHING = "everything"
 
 
 def _plural(count: int, noun: str) -> str:
@@ -119,6 +134,12 @@ class TracePanel:
         self.input_bindings: dict[str, InputBinding] = {}
         self.presentation: TraceGraphPresentation | None = None
         self._preparing = False
+        # The user's explicit capture-scope choice for this session; None means
+        # the smart default (everything, or boundaries + selection once the
+        # full-capture estimate trips the advisory threshold) applies.
+        self._scope_choice: str | None = None
+        self._runtime_probe_started = False
+        self._probing_runtime = False
 
         self.seed = ft.TextField(
             label="Deterministic seed",
@@ -200,11 +221,48 @@ class TracePanel:
             value=False,
             on_change=self._on_capture_scope_changed,
         )
+        # Shown only when the full-capture advisory is active: the explicit
+        # widen/narrow choice between boundaries + selection and everything.
+        self.capture_scope_choice = ft.Dropdown(
+            label="Capture scope",
+            value=_SCOPE_EVERYTHING,
+            dense=True,
+            visible=False,
+            on_select=self._on_capture_choice_changed,
+            options=[
+                ft.DropdownOption(
+                    key=_SCOPE_BOUNDARIES,
+                    text="Boundaries + selection",
+                ),
+                ft.DropdownOption(key=_SCOPE_EVERYTHING, text="Everything"),
+            ],
+        )
+        self.capture_estimate = ft.Text(
+            "",
+            size=10,
+            color=palette.muted,
+            visible=False,
+        )
         self.capture_scope = ft.Text(
             "Open an artifact to see how many values a trace captures.",
             size=10,
             color=palette.muted,
         )
+        self.runtime_text = ft.Text(
+            "Open an artifact to probe the ONNX Runtime.",
+            size=10,
+            color=palette.muted,
+            expand=True,
+        )
+        self.runtime_refresh = ft.IconButton(
+            icon=ft.Icons.REFRESH_ROUNDED,
+            icon_size=14,
+            tooltip="Probe the ONNX Runtime again",
+            on_click=self._on_refresh_runtime,
+        )
+        # A finished trace's informational notes and diagnostics, rendered as
+        # separately styled rows under the status line.
+        self.result_annotations = ft.Column(controls=[], spacing=4, visible=False)
         self.approval_notice = ft.Text(
             "Review the selected inputs and limits. The run button approves "
             "exactly one isolated trace.",
@@ -264,11 +322,17 @@ class TracePanel:
                     spacing=8,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
+                self.result_annotations,
                 self.seed,
                 self.shapes,
                 ft.Row(
                     controls=[self.backend, self.device],
                     spacing=6,
+                ),
+                ft.Row(
+                    controls=[self.runtime_text, self.runtime_refresh],
+                    spacing=2,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
                 ft.Row(
                     controls=[self.wall_seconds, self.memory_mib],
@@ -278,6 +342,8 @@ class TracePanel:
                     controls=[self.capture_mib, self.chunk_kib],
                     spacing=6,
                 ),
+                self.capture_estimate,
+                self.capture_scope_choice,
                 self.capture_selected_only,
                 self.capture_scope,
                 self.approval_notice,
@@ -307,7 +373,57 @@ class TracePanel:
         self.active_comparison = None
         self.input_bindings.clear()
         self.presentation = None
+        # The capture-scope choice persists for one session only; the next
+        # model starts from the smart default again.
+        self._scope_choice = None
+        if self._session() is not None and not self._runtime_probe_started:
+            self._runtime_probe_started = True
+            self._start_runtime_probe()
         self._on_device(None, "Idle")
+
+    # -- runtime preflight -------------------------------------------------
+
+    def _start_runtime_probe(self, *, refresh: bool = False) -> None:
+        """Ask a throwaway interpreter what ONNX Runtime a trace would find.
+
+        The probe never runs on the UI thread and never imports the runtime
+        into this process; the panel shows a quiet placeholder until the
+        answer lands, and the device dropdown keeps working throughout.
+        """
+        if self._probing_runtime:
+            return
+        self._probing_runtime = True
+        self.runtime_text.value = "Probing ONNX Runtime…"
+        self.runtime_text.color = self.palette.muted
+
+        def probe() -> None:
+            try:
+                status = runtime_status(refresh=refresh)
+            finally:
+                self._probing_runtime = False
+            self._render_runtime_status(status)
+            self.page.update()
+
+        self.page.run_thread(probe)
+
+    def _render_runtime_status(self, status: RuntimeStatus) -> None:
+        """Show the probed providers, or the error naming nneditor[runtime]."""
+        if status.error is not None:
+            self.runtime_text.value = f"ONNX Runtime unavailable: {status.error}."
+            self.runtime_text.color = self.palette.warning
+        elif status.available:
+            version = f" {status.version}" if status.version else ""
+            self.runtime_text.value = (
+                f"ONNX Runtime{version} providers: {', '.join(status.available)}."
+            )
+            self.runtime_text.color = self.palette.muted
+        else:
+            self.runtime_text.value = "ONNX Runtime reported no execution providers."
+            self.runtime_text.color = self.palette.warning
+
+    def _on_refresh_runtime(self, event: ft.Event[ft.IconButton]) -> None:
+        self._start_runtime_probe(refresh=True)
+        self.page.update()
 
     # -- traced glyph inspector -------------------------------------------
 
@@ -683,11 +799,47 @@ class TracePanel:
             if graph.value(value_id).name
         )
 
+    def _boundary_capture_value_ids(self) -> frozenset[str]:
+        """Named model inputs and outputs: the always-informative boundary."""
+        session = self._session()
+        if session is None:
+            return frozenset()
+        graph = session.document.main_graph
+        candidates = {
+            value_id for value_id in graph.inputs if value_id not in graph.initializers
+        }
+        candidates.update(graph.outputs)
+        return frozenset(
+            value_id for value_id in candidates if graph.value(value_id).name
+        )
+
+    def _estimated_bytes(self, value_ids: frozenset[str]) -> int:
+        """Lower-bound decoded bytes of capturing these declared values."""
+        session = self._session()
+        if session is None:
+            return 0
+        graph = session.document.main_graph
+        return estimated_capture_bytes(graph.value(value_id) for value_id in value_ids)
+
+    def _effective_scope(self) -> str:
+        """The active scope once the smart default and the user's explicit
+        session choice are reconciled; the explicit choice always wins."""
+        if self._scope_choice is not None:
+            return self._scope_choice
+        estimate = self._estimated_bytes(self._capturable_value_ids())
+        if estimate > _FULL_CAPTURE_ADVISORY_BYTES:
+            return _SCOPE_BOUNDARIES
+        return _SCOPE_EVERYTHING
+
     def capture_value_ids(self) -> frozenset[str]:
         """The values the next trace captures; empty means capture everything."""
-        if not self.capture_selected_only.value:
-            return frozenset()
-        return self._selected_capture_value_ids()
+        if self.capture_selected_only.value:
+            return self._selected_capture_value_ids()
+        if self._effective_scope() == _SCOPE_BOUNDARIES:
+            return (
+                self._boundary_capture_value_ids() | self._selected_capture_value_ids()
+            )
+        return frozenset()
 
     def refresh_capture_scope(self) -> None:
         """Restate how much of the model the next approved trace would read."""
@@ -696,27 +848,96 @@ class TracePanel:
             self.capture_scope.value = (
                 "Open an artifact to see how many values a trace captures."
             )
+            self.capture_scope_choice.visible = False
+            self.capture_estimate.visible = False
             return
-        everything = f"all {_plural(len(self._capturable_value_ids()), 'value')}"
-        if not self.capture_selected_only.value:
-            self.capture_scope.value = f"Capturing {everything}."
-            return
-        nodes = len(self._selected_graph_node_ids())
-        values = len(self._selected_capture_value_ids())
-        if not nodes:
-            self.capture_scope.value = f"No nodes selected; capturing {everything}."
-        elif not values:
+        all_ids = self._capturable_value_ids()
+        full_estimate = self._estimated_bytes(all_ids)
+        self.capture_scope_choice.options = [
+            ft.DropdownOption(
+                key=_SCOPE_BOUNDARIES,
+                text="Boundaries + selection",
+            ),
+            ft.DropdownOption(
+                key=_SCOPE_EVERYTHING,
+                text=(
+                    f"Everything ({_plural(len(all_ids), 'value')}, "
+                    f"~{viewmodel.compact_bytes(full_estimate)})"
+                ),
+            ),
+        ]
+        self.capture_scope_choice.visible = full_estimate > _FULL_CAPTURE_ADVISORY_BYTES
+        self.capture_scope_choice.value = self._effective_scope()
+        scoped_ids = self.capture_value_ids() or all_ids
+        estimate = self._estimated_bytes(scoped_ids)
+        suffix = f" (~{viewmodel.compact_bytes(estimate)})"
+        everything = f"all {_plural(len(all_ids), 'value')}"
+        if self.capture_selected_only.value:
+            nodes = len(self._selected_graph_node_ids())
+            values = len(self._selected_capture_value_ids())
+            if not nodes:
+                self.capture_scope.value = (
+                    f"No nodes selected; capturing {everything}{suffix}."
+                )
+            elif not values:
+                self.capture_scope.value = (
+                    f"No named values in the {_plural(nodes, 'selected node')}; "
+                    f"capturing {everything}{suffix}."
+                )
+            else:
+                self.capture_scope.value = (
+                    f"Capturing {_plural(values, 'value')} from "
+                    f"{_plural(nodes, 'selected node')}{suffix}."
+                )
+        elif self._effective_scope() == _SCOPE_BOUNDARIES:
+            nodes = len(self._selected_graph_node_ids())
+            detail = (
+                f"model inputs and outputs plus {_plural(nodes, 'selected node')}"
+                if nodes
+                else "model inputs and outputs"
+            )
             self.capture_scope.value = (
-                f"No named values in the {_plural(nodes, 'selected node')}; "
-                f"capturing {everything}."
+                f"Capturing boundaries + selection: "
+                f"{_plural(len(scoped_ids), 'value')} ({detail}){suffix}."
             )
         else:
-            self.capture_scope.value = (
-                f"Capturing {_plural(values, 'value')} from "
-                f"{_plural(nodes, 'selected node')}."
+            self.capture_scope.value = f"Capturing {everything}{suffix}."
+        self._refresh_capture_estimate(estimate)
+
+    def _refresh_capture_estimate(self, estimate: int) -> None:
+        """Show the scope's decoded size near the limits, and warn with the
+        runner's own note wording before the run when the estimate exceeds
+        half the approved memory limit."""
+        self.capture_estimate.visible = True
+        try:
+            memory_bytes = int(self.memory_mib.value or "") * _MIB
+        except ValueError:
+            memory_bytes = None
+        if memory_bytes is not None and estimate > memory_bytes // 2:
+            estimated_mib = math.ceil(estimate / _MIB)
+            limit_mib = math.ceil(memory_bytes / _MIB)
+            self.capture_estimate.value = (
+                f"The selected capture decodes to an estimated "
+                f"{estimated_mib:,} MiB of activations, more than half the "
+                f"approved {limit_mib:,} MiB memory limit; a full capture may "
+                "exhaust it — capture fewer values or raise the Memory limit."
             )
+            self.capture_estimate.color = self.palette.warning
+        else:
+            self.capture_estimate.value = (
+                "Estimated decoded activations for this scope: "
+                f"~{viewmodel.compact_bytes(estimate)}."
+            )
+            self.capture_estimate.color = self.palette.muted
 
     def _on_capture_scope_changed(self, event: ft.Event[ft.Checkbox]) -> None:
+        self.refresh_capture_scope()
+        self.page.update()
+
+    def _on_capture_choice_changed(self, event: ft.Event[ft.Dropdown]) -> None:
+        choice = self.capture_scope_choice.value
+        if choice in {_SCOPE_BOUNDARIES, _SCOPE_EVERYTHING}:
+            self._scope_choice = choice
         self.refresh_capture_scope()
         self.page.update()
 
@@ -766,6 +987,7 @@ class TracePanel:
             if session is not None and self.active_trace_id is not None
             else None
         )
+        self._render_result_annotations(active_result)
         if self.active_comparison is not None:
             self.status.value = (
                 f"Compared {len(self.active_comparison.nodes)} node(s); "
@@ -818,6 +1040,7 @@ class TracePanel:
             self.active_trace_id is None or not alternatives or busy
         )
         self.capture_selected_only.disabled = busy
+        self.capture_scope_choice.disabled = busy
         self.backend.disabled = busy
         reference_backend = self.backend.value in {
             TraceBackend.REFERENCE.value,
@@ -825,6 +1048,47 @@ class TracePanel:
         }
         self.device.disabled = busy or reference_backend
         self.refresh_capture_scope()
+
+    def _render_result_annotations(self, result: TraceResult | None) -> None:
+        """Render a finished trace's diagnostics and notes as separate rows.
+
+        Diagnostics describe defects in the captured records and keep their
+        warning styling; notes are advisory provenance for a healthy run
+        (skipped providers, capture pressure) and render in the info palette,
+        so a complete trace with notes never reads as partial.
+        """
+        rows: list[ft.Control] = []
+        if result is not None:
+            for index, message in enumerate(result.diagnostics):
+                rows.append(
+                    ft.Container(
+                        data=f"trace-diagnostic:{index}",
+                        content=ft.Text(
+                            message,
+                            size=10,
+                            color=self.palette.warning,
+                        ),
+                        padding=8,
+                        bgcolor=self.palette.warning_soft,
+                        border_radius=8,
+                    )
+                )
+            for index, message in enumerate(result.notes):
+                rows.append(
+                    ft.Container(
+                        data=f"trace-note:{index}",
+                        content=ft.Text(
+                            f"Note: {message}",
+                            size=10,
+                            color=self.palette.info,
+                        ),
+                        padding=8,
+                        bgcolor=self.palette.info_soft,
+                        border_radius=8,
+                    )
+                )
+        self.result_annotations.controls = rows
+        self.result_annotations.visible = bool(rows)
 
     def run(self, event: ft.Event[ft.Button]) -> None:
         """Approve and start exactly one isolated trace of the open model."""

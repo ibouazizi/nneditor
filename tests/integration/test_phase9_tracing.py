@@ -49,6 +49,9 @@ def test_approved_trace_captures_inputs_and_intermediates_out_of_process(
         session = service.open_model(path)
         result = session.trace_async(_request(session)).result(timeout=20)
         assert result.partial is False
+        # The notes channel survives the worker → runner → store round trip;
+        # a clean CPU run has nothing to note.
+        assert result.notes == ()
         assert {record.value_name for record in result.records} == {
             "input",
             "scaled",
@@ -233,8 +236,47 @@ def test_model_load_memory_is_rejected_before_worker_launch(tmp_path: Path) -> N
 def test_large_inline_onnx_model_gets_practical_trace_defaults() -> None:
     limits = recommended_trace_limits(1_326_283_019)
 
-    assert limits.memory_bytes == 16384 * 1024 * 1024
+    # Twelve model-sized sets: a measured full-graph CUDA trace of this
+    # 1.33 GB model needed more host commit than the previous 16 GiB cap.
+    assert limits.memory_bytes == 32768 * 1024 * 1024
     assert limits.wall_seconds == 300
+
+
+def test_worker_streams_are_files_never_undrained_pipes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The poll loop never drains pipes, so pipes would deadlock the worker.
+
+    A worker whose stderr outgrew the OS pipe buffer blocked mid-write and
+    was killed as a wall-clock overrun on a real 1.33 GB full-graph trace.
+    """
+    import subprocess
+
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    spawns: list[dict[str, object]] = []
+    original_popen = subprocess.Popen
+
+    def recording_popen(*args: object, **kwargs: object) -> object:
+        spawns.append(kwargs)
+        return original_popen(*args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    with ApplicationService() as service:
+        session = service.open_model(path)
+        result = session.trace_async(_request(session)).result(timeout=20)
+
+    assert result.partial is False
+    worker_spawns = [
+        kwargs
+        for kwargs in spawns
+        if "trace_worker" in str(kwargs.get("cwd", "")) or kwargs.get("stdout")
+    ]
+    assert worker_spawns
+    for kwargs in worker_spawns:
+        assert kwargs.get("stdout") is not subprocess.PIPE
+        assert kwargs.get("stderr") is not subprocess.PIPE
 
 
 def test_small_models_get_the_accelerator_warmup_wall_clock_floor() -> None:

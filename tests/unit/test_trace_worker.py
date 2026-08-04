@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -26,6 +27,8 @@ def _target(
     *,
     node_id: str | None = "node",
     graph_output: bool = False,
+    shape: list[int] | None = None,
+    element_type: str = "float32",
 ) -> dict[str, object]:
     return {
         "value_id": value_id,
@@ -33,8 +36,8 @@ def _target(
         "node_id": node_id,
         "role": "node-output" if node_id else "graph-input",
         "graph_output": graph_output,
-        "element_type": "float32",
-        "shape": [4],
+        "element_type": element_type,
+        "shape": [4] if shape is None else shape,
     }
 
 
@@ -107,6 +110,7 @@ def test_worker_run_captures_augmented_outputs_in_bounded_files(
     assert payload["runtime"].startswith("onnxruntime")
     assert payload["execution_device"] == "cpu"
     assert payload["execution_provider"] == "CPUExecutionProvider"
+    assert payload["notes"] == []
     assert [record["state"] for record in payload["records"]] == [
         "complete",
         "complete",
@@ -270,11 +274,13 @@ def test_worker_does_not_truncate_known_captures_when_the_total_fits(
     output.mkdir()
     response = tmp_path / "response.json"
     request = tmp_path / "request.json"
+    # Declared shapes must be truthful: the lazily fetching runtime source
+    # budgets from them before any batch has materialized.
     targets = [
-        _target("input-id", "input", node_id=None),
-        _target("big-id", "big"),
+        _target("input-id", "input", node_id=None, shape=[100]),
+        _target("big-id", "big", shape=[100]),
         *[
-            _target(f"scalar{position}-id", f"scalar{position}")
+            _target(f"scalar{position}-id", f"scalar{position}", shape=[])
             for position in range(20)
         ],
     ]
@@ -873,22 +879,33 @@ def test_onnxruntime_reads_a_staged_capture_file_not_serialized_bytes(
 
     assert observed["staged_exists"] is True
     assert observed["staged_path"].name == "model.onnx.capture.onnx"
-    # The in-graph input is served from feeds, not fetched from the runtime.
-    assert observed["run_names"] == ["scaled", "output"]
     # The staged file was augmented with the intermediate value; the
     # in-memory model and the source artifact were left untouched.
     assert "scaled" in observed["staged_outputs"]
     assert [value.name for value in model.graph.output] == ["output"]
     assert path.read_bytes() == original_bytes
-    # The staged copies do not outlive the runtime phase.
-    assert not observed["staged_path"].exists()
     assert provider == "CPUExecutionProvider"
     assert device is TraceDevice.CPU
     assert "0-test" in runtime
+    # Fetches are lazy: nothing has run yet and the session still maps the
+    # staged file, so it must survive until the captures are spent.
+    assert "run_names" not in observed
+    assert observed["staged_path"].exists()
     array, reason = source.take(targets[1])
     assert reason is None
     assert array is not None
     assert float(array[0]) == 7.0
+    # The batch was fetched in the worker's consumption order — the graph
+    # output ahead of the ordinary intermediate — and the in-graph input is
+    # served from feeds, never fetched from the runtime.
+    assert observed["run_names"] == ["output", "scaled"]
+    assert observed["staged_path"].exists()
+    out_array, out_reason = source.take(targets[2])
+    assert out_reason is None
+    assert out_array is not None
+    # Every batched target was taken, so the staged copies are now spent
+    # and deleted.
+    assert not observed["staged_path"].exists()
 
 
 def _fake_session_options() -> type:
@@ -914,7 +931,9 @@ def test_nvidia_dlls_are_preloaded_and_skipped_providers_disclosed(
 ) -> None:
     """CUDA wheels live in site-packages, so the worker must ask ONNX
     Runtime to preload them; a candidate that still fails must stay
-    visible in the diagnostics of the candidate that finally served."""
+    visible in the notes of the candidate that finally served — as
+    context, not as a diagnostic that would mark a complete trace
+    partial."""
     path = tmp_path / "model.onnx"
     build_embedded_model(path, elements=4)
     model = onnx.load_model(str(path))
@@ -970,7 +989,467 @@ def test_nvidia_dlls_are_preloaded_and_skipped_providers_disclosed(
     assert calls == ["preload"]
     assert provider == "CPUExecutionProvider"
     assert device is TraceDevice.CPU
-    skipped = source.diagnostics[0]
+    # Missing accelerators are the normal state of most machines: the
+    # disclosure must not ride the diagnostics channel, which would make
+    # every complete CPU trace claim to be partial.
+    assert source.diagnostics == []
+    skipped = source.notes[0]
     assert "skipped" in skipped
     assert "CUDA" in skipped
     assert "native libraries likely failed to load" in skipped
+
+
+def test_batches_follow_consumption_order_and_bound_estimated_bytes() -> None:
+    """Fetch planning mirrors the run loop's priority phases exactly."""
+    out = _target("out-id", "out", graph_output=True)
+    a = _target("a-id", "a")
+    b = _target("b-id", "b")
+    c = _target("c-id", "c")
+    sym = _target("sym-id", "sym", shape=[-1])
+    ordered = trace_worker._capture_order([a, b, out, c, sym])
+
+    # The graph output moves ahead of ordinary values; order is stable
+    # within each phase, so budget exhaustion drops the same trailing
+    # values a single fetch would have dropped.
+    assert [target["value_id"] for target in ordered] == [
+        "out-id",
+        "a-id",
+        "b-id",
+        "c-id",
+        "sym-id",
+    ]
+
+    # 16-byte float32 targets against a 32-byte ceiling: two per batch, and
+    # the symbolic-dim target is isolated because its size is unknowable.
+    batches = trace_worker._plan_batches(ordered, 32)
+    assert [[target["value_id"] for target in batch] for batch in batches] == [
+        ["out-id", "a-id"],
+        ["b-id", "c-id"],
+        ["sym-id"],
+    ]
+
+    # A single target beyond the ceiling still forms its own batch, and an
+    # undecodable dtype is isolated like a symbolic dimension.
+    oversized = _target("big-id", "big", shape=[64])
+    unknown = _target("odd-id", "odd", element_type="unknown")
+    assert trace_worker._plan_batches([oversized, a], 32) == [
+        (oversized,),
+        (a,),
+    ]
+    assert trace_worker._plan_batches([a, unknown, b], 64) == [
+        (a,),
+        (unknown,),
+        (b,),
+    ]
+
+
+class _RecordingSession:
+    """A fake ONNX Runtime session that records and answers each fetch."""
+
+    def __init__(self, failing_names: frozenset[str] = frozenset()) -> None:
+        self.calls: list[list[str]] = []
+        self._failing_names = failing_names
+
+    def run(
+        self,
+        names: list[str],
+        feeds: dict[str, Any],
+    ) -> list[Any]:
+        self.calls.append(list(names))
+        if self._failing_names & set(names):
+            raise RuntimeError("bad allocation")
+        return [np.full(4, float(len(name)), dtype=np.float32) for name in names]
+
+
+def _staged_capture(tmp_path: Path) -> Path:
+    capture = tmp_path / "model.onnx.capture.onnx"
+    capture.write_bytes(b"staged")
+    capture.with_name(capture.name + ".data").write_bytes(b"weights")
+    return capture
+
+
+def test_ort_capture_source_fetches_lazily_and_releases_per_batch(
+    tmp_path: Path,
+) -> None:
+    targets = [_target(f"v{index}-id", f"v{index}") for index in range(4)]
+    session = _RecordingSession()
+    capture = _staged_capture(tmp_path)
+    source = trace_worker.OrtCaptureSource(
+        session,
+        {},
+        trace_worker._plan_batches(targets, 32),
+        capture,
+    )
+
+    # Nothing runs until the first take, and a take from the first batch
+    # does not touch the second.
+    assert session.calls == []
+    first, reason = source.take(targets[0])
+    assert reason is None
+    assert first is not None
+    assert session.calls == [["v0", "v1"]]
+
+    # Arrays are dropped as they are taken: once the caller releases its
+    # reference nothing in the source keeps the activation alive.
+    released = weakref.ref(first)
+    del first
+    assert released() is None
+
+    second, _reason = source.take(targets[1])
+    assert second is not None
+    assert 0 not in source._materialized
+
+    source.take(targets[2])
+    assert session.calls == [["v0", "v1"], ["v2", "v3"]]
+    assert capture.exists()
+    source.take(targets[3])
+    # Every batch is spent: the session and the staged copies are released.
+    assert source._session is None
+    assert not capture.exists()
+    assert not capture.with_name(capture.name + ".data").exists()
+
+
+def test_failed_batch_marks_only_its_own_targets(tmp_path: Path) -> None:
+    targets = [_target(f"v{index}-id", f"v{index}") for index in range(4)]
+    session = _RecordingSession(failing_names=frozenset({"v2"}))
+    capture = _staged_capture(tmp_path)
+    source = trace_worker.OrtCaptureSource(
+        session,
+        {},
+        trace_worker._plan_batches(targets, 32),
+        capture,
+    )
+
+    served = [source.take(target) for target in targets[:2]]
+    assert all(array is not None for array, _reason in served)
+
+    # The failed fetch degrades only its own batch, with one diagnostic and
+    # a per-target reason — the trace itself survives.
+    failed = [source.take(target) for target in targets[2:]]
+    assert all(array is None for array, _reason in failed)
+    assert all(
+        reason is not None and "not captured" in reason for _array, reason in failed
+    )
+    assert session.calls == [["v0", "v1"], ["v2", "v3"]]
+    assert len(source.diagnostics) == 1
+    assert "bad allocation" in source.diagnostics[0]
+    assert "other fetches were still attempted" in source.diagnostics[0]
+    # Exhaustion still releases the staged file even after a failure.
+    assert not capture.exists()
+
+
+def test_open_backend_fetches_in_multiple_batches_under_a_small_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=4)
+    model = onnx.load_model(str(path))
+    feeds = {"input": np.ones(4, dtype=np.float32)}
+    targets = [
+        _target("val:input", "input", node_id=None),
+        _target("val:scaled", "scaled"),
+        _target("val:output", "output", graph_output=True),
+    ]
+    calls: list[list[str]] = []
+
+    class FakeInferenceSession:
+        def __init__(
+            self,
+            model_source: object,
+            sess_options: Any = None,
+            providers: Any = None,
+            provider_options: Any = None,
+        ) -> None:
+            pass
+
+        def run(
+            self,
+            names: list[str],
+            run_feeds: dict[str, Any],
+        ) -> list[Any]:
+            calls.append(list(names))
+            return [np.zeros(4, dtype=np.float32) for _ in names]
+
+    fake = SimpleNamespace(
+        SessionOptions=_fake_session_options(),
+        ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL=0),
+        GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_BASIC=1),
+        InferenceSession=FakeInferenceSession,
+        get_available_providers=lambda: ["CPUExecutionProvider"],
+        __version__="0-test",
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", cast(Any, fake))
+    # A ceiling below one 16-byte tensor forces one fetch per target.
+    monkeypatch.setattr(trace_worker, "_ORT_BATCH_BYTES", 8)
+
+    source, _runtime, _device, _provider = trace_worker._open_backend(
+        model,
+        path,
+        feeds,
+        targets,
+        TraceBackend.ONNX_RUNTIME,
+    )
+    for target in (targets[2], targets[1]):
+        array, reason = source.take(target)
+        assert reason is None
+        assert array is not None
+
+    assert calls == [["output"], ["scaled"]]
+
+
+def test_worker_response_moves_skipped_provider_disclosure_to_notes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full worker entry point reports notes beside clean diagnostics."""
+    model_path = tmp_path / "model.onnx"
+    build_embedded_model(model_path, elements=4)
+    inputs = tmp_path / "inputs.npz"
+    np.savez(inputs, input=np.arange(4, dtype=np.float32))
+    output = tmp_path / "output"
+    output.mkdir()
+    response = tmp_path / "response.json"
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "model": str(model_path),
+                "inputs": str(inputs),
+                "output": str(output),
+                "response": str(response),
+                "targets": [
+                    _target("input-id", "input", node_id=None),
+                    _target("scaled-id", "scaled"),
+                    _target("output-id", "output", graph_output=True),
+                ],
+                "backend": "onnxruntime",
+                "wall_seconds": 10,
+                "memory_bytes": 1024 * 1024 * 1024,
+                "capture_bytes": 1024,
+                "chunk_bytes": 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeInferenceSession:
+        def __init__(
+            self,
+            model_source: object,
+            sess_options: Any = None,
+            providers: Any = None,
+            provider_options: Any = None,
+        ) -> None:
+            if "CUDAExecutionProvider" in (providers or []):
+                raise RuntimeError("CUDA libraries could not be loaded")
+
+        def run(
+            self,
+            names: list[str],
+            run_feeds: dict[str, Any],
+        ) -> list[Any]:
+            return [np.arange(4, dtype=np.float32) for _ in names]
+
+    fake = SimpleNamespace(
+        SessionOptions=_fake_session_options(),
+        ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL=0),
+        GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_BASIC=1),
+        InferenceSession=FakeInferenceSession,
+        get_available_providers=lambda: [
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ],
+        __version__="0-test",
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", cast(Any, fake))
+    monkeypatch.setenv("NNEDITOR_TRACE_WORKER", "1")
+    monkeypatch.setattr(trace_worker, "_limit_process", lambda raw: None)
+
+    trace_worker.run(request)
+
+    payload = json.loads(response.read_text(encoding="utf-8"))
+    assert payload["diagnostics"] == []
+    assert len(payload["notes"]) == 1
+    assert "skipped" in payload["notes"][0]
+    assert "CUDA" in payload["notes"][0]
+    assert [record["state"] for record in payload["records"]] == [
+        "complete",
+        "complete",
+        "complete",
+    ]
+    # The worker released the staged capture copies before exiting.
+    assert not model_path.with_name("model.onnx.capture.onnx").exists()
+
+
+def test_spent_capture_budget_skips_runtime_fetches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Values past the byte ceiling are dropped without a runtime pass.
+
+    On a large model the capture budget covers a fraction of the declared
+    activations; fetching the rest anyway is what made a full-graph trace
+    pay for ~8 GB of transfers to keep 256 MiB.
+    """
+    model_path = tmp_path / "model.onnx"
+    build_embedded_model(model_path, elements=4)
+    inputs = tmp_path / "inputs.npz"
+    np.savez(inputs, input=np.arange(4, dtype=np.float32))
+    output = tmp_path / "output"
+    output.mkdir()
+    response = tmp_path / "response.json"
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "model": str(model_path),
+                "inputs": str(inputs),
+                "output": str(output),
+                "response": str(response),
+                "targets": [
+                    _target("input-id", "input", node_id=None),
+                    _target("scaled-id", "scaled"),
+                    _target("output-id", "output", graph_output=True),
+                ],
+                "backend": "onnxruntime",
+                "wall_seconds": 10,
+                "memory_bytes": 1024 * 1024 * 1024,
+                # Exactly the input plus the prioritized output: the pool is
+                # spent before the ordinary 'scaled' value is reached.
+                "capture_bytes": 32,
+                "chunk_bytes": 16,
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    class FakeInferenceSession:
+        def __init__(
+            self,
+            model_source: object,
+            sess_options: Any = None,
+            providers: Any = None,
+            provider_options: Any = None,
+        ) -> None:
+            pass
+
+        def run(
+            self,
+            names: list[str],
+            run_feeds: dict[str, Any],
+        ) -> list[Any]:
+            calls.append(list(names))
+            return [np.arange(4, dtype=np.float32) for _ in names]
+
+    fake = SimpleNamespace(
+        SessionOptions=_fake_session_options(),
+        ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL=0),
+        GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_BASIC=1),
+        InferenceSession=FakeInferenceSession,
+        get_available_providers=lambda: ["CPUExecutionProvider"],
+        __version__="0-test",
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", cast(Any, fake))
+    # One 16-byte tensor per batch, so an unfetched batch is observable.
+    monkeypatch.setattr(trace_worker, "_ORT_BATCH_BYTES", 8)
+    monkeypatch.setenv("NNEDITOR_TRACE_WORKER", "1")
+    monkeypatch.setattr(trace_worker, "_limit_process", lambda raw: None)
+
+    trace_worker.run(request)
+
+    payload = json.loads(response.read_text(encoding="utf-8"))
+    by_name = {record["value_name"]: record for record in payload["records"]}
+    # Only the prioritized output's batch ever reached the runtime.
+    assert calls == [["output"]]
+    assert by_name["input"]["state"] == "complete"
+    assert by_name["output"]["state"] == "complete"
+    assert by_name["scaled"]["state"] == "dropped"
+    assert "exhausted" in by_name["scaled"]["reason"]
+    # Skipping the last batch still released the staged capture copies.
+    assert not model_path.with_name("model.onnx.capture.onnx").exists()
+
+
+def test_batched_budgets_are_greedy_whole_values_not_equal_shares(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batched source spends the pool on whole values in consume order.
+
+    Equal shares would fetch every batch to keep a sliver of each value —
+    on a large model that pays full runtime passes for activations the
+    budget can never hold.
+    """
+    model_path = tmp_path / "model.onnx"
+    build_embedded_model(model_path, elements=4)
+    inputs = tmp_path / "inputs.npz"
+    np.savez(inputs, input=np.arange(4, dtype=np.float32))
+    output = tmp_path / "output"
+    output.mkdir()
+    response = tmp_path / "response.json"
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(
+            {
+                "model": str(model_path),
+                "inputs": str(inputs),
+                "output": str(output),
+                "response": str(response),
+                "targets": [
+                    _target("input-id", "input", node_id=None),
+                    _target("scaled-id", "scaled"),
+                    _target("output-id", "output", graph_output=True),
+                ],
+                "backend": "onnxruntime",
+                "wall_seconds": 10,
+                "memory_bytes": 1024 * 1024 * 1024,
+                # Eight bytes past the boundaries: greedy budgeting gives the
+                # first ordinary value the whole remainder as a prefix.
+                "capture_bytes": 40,
+                "chunk_bytes": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    class FakeInferenceSession:
+        def __init__(
+            self,
+            model_source: object,
+            sess_options: Any = None,
+            providers: Any = None,
+            provider_options: Any = None,
+        ) -> None:
+            pass
+
+        def run(
+            self,
+            names: list[str],
+            run_feeds: dict[str, Any],
+        ) -> list[Any]:
+            calls.append(list(names))
+            return [np.arange(4, dtype=np.float32) for _ in names]
+
+    fake = SimpleNamespace(
+        SessionOptions=_fake_session_options(),
+        ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL=0),
+        GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_BASIC=1),
+        InferenceSession=FakeInferenceSession,
+        get_available_providers=lambda: ["CPUExecutionProvider"],
+        __version__="0-test",
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", cast(Any, fake))
+    monkeypatch.setattr(trace_worker, "_ORT_BATCH_BYTES", 8)
+    monkeypatch.setenv("NNEDITOR_TRACE_WORKER", "1")
+    monkeypatch.setattr(trace_worker, "_limit_process", lambda raw: None)
+
+    trace_worker.run(request)
+
+    payload = json.loads(response.read_text(encoding="utf-8"))
+    by_name = {record["value_name"]: record for record in payload["records"]}
+    assert calls == [["output"], ["scaled"]]
+    assert by_name["output"]["state"] == "complete"
+    assert by_name["scaled"]["state"] == "truncated"
+    assert by_name["scaled"]["stored_byte_length"] == 8
