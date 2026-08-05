@@ -28,6 +28,7 @@ from nneditor.rendering.contract import InteractiveGraphRenderer
 from nneditor.tracing.comparison import TraceComparison
 from nneditor.tracing.contracts import (
     CaptureState,
+    CaptureStatus,
     InputBinding,
     TraceApproval,
     TraceBackend,
@@ -74,6 +75,15 @@ _SCOPE_PREVIEW = "preview-everything"
 # Fallback for the per-value preview estimate while the capture-limit field
 # holds unparseable text; matches the field's initial value of 256 MiB.
 _DEFAULT_CAPTURE_LIMIT_BYTES = 256 * _MIB
+
+# The finished-trace status line's leading word. "Partial" is reserved for
+# missing requested data; a trace whose every value kept a readable (if
+# truncated) share is a preview, and a whole capture is complete.
+_STATUS_WORDS = {
+    CaptureStatus.PARTIAL: "Partial",
+    CaptureStatus.PREVIEW: "Preview",
+    CaptureStatus.COMPLETE: "Complete",
+}
 
 
 def _plural(count: int, noun: str) -> str:
@@ -1120,7 +1130,9 @@ class TracePanel:
                 "or keep automatic all-valid masks and deterministic random data."
             )
         elif session is not None and active_result is not None:
-            state = "Partial" if active_result.partial else "Complete"
+            # Three-way wording: "Partial" only when requested data is
+            # missing; a truncated-but-all-readable capture reads "Preview".
+            state = _STATUS_WORDS[active_result.capture_status]
             revision = active_result.key.revision_id or "base"
             stale = (
                 " • not current revision"
@@ -1332,10 +1344,9 @@ class TracePanel:
                         result.execution_provider,
                     )
                     self._clear_error()
-                    state = "partial" if result.partial else "complete"
                     self._on_status(
-                        f"Trace {state}: {len(result.captured_value_ids)} "
-                        "readable activation(s)"
+                        f"Trace {result.capture_status.value}: "
+                        f"{len(result.captured_value_ids)} readable activation(s)"
                     )
                     if self._current_slice() is not None:
                         self._redraw_scene()

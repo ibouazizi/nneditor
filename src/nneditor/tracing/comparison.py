@@ -5,13 +5,13 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Final, Protocol
 
 import numpy as np
 
 from nneditor.cancellation import CancellationToken
 from nneditor.rendering.scene import Scene, ScenePatch
-from nneditor.tracing.contracts import TraceResult
+from nneditor.tracing.contracts import CaptureStatus, TraceResult
 from nneditor.tracing.store import ActivationStore
 
 __all__ = [
@@ -290,20 +290,35 @@ def compare_traces(
     )
 
 
+# The short status marker a traced glyph carries after its own identity.
+# "partial" is reserved for genuinely missing data; a preview trace whose
+# every value kept a readable prefix is deliberate breadth, not a failure.
+_CAPTURE_SUFFIXES: Final[Mapping[CaptureStatus, str]] = {
+    CaptureStatus.PARTIAL: "activation partial",
+    CaptureStatus.PREVIEW: "activation preview",
+    CaptureStatus.COMPLETE: "activation captured",
+}
+
+
 def trace_scene_patch(graph_slice: _GraphSlice, result: TraceResult) -> ScenePatch:
-    """Mark every visible glyph containing a node with a captured value."""
+    """Mark every visible glyph containing a node with a captured value.
+
+    The capture status is additive metadata: the glyph's own identity — its
+    semantic type, or its label when it has no type — always leads, so a
+    renderer that truncates long labels drops the status marker, never the
+    name, and no glyph ever reads as a bare status string.
+    """
     captured_nodes = frozenset(
         record.node_id
         for record in result.records
         if record.node_id and record.readable
     )
     changed = []
-    suffix = "activation partial" if result.partial else "activation captured"
+    suffix = _CAPTURE_SUFFIXES[result.capture_status]
     for glyph in graph_slice.scene.nodes:
         if graph_slice.members_by_glyph.get(glyph.id, frozenset()) & captured_nodes:
-            changed.append(
-                replace(glyph, type_label=f"{glyph.display_type} • {suffix}")
-            )
+            identity = glyph.display_type.strip() or glyph.label
+            changed.append(replace(glyph, type_label=f"{identity} • {suffix}"))
     return ScenePatch(upsert_nodes=tuple(changed))
 
 

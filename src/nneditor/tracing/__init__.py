@@ -25,6 +25,9 @@ from nneditor.tracing.contracts import (
     CaptureState as CaptureState,
 )
 from nneditor.tracing.contracts import (
+    CaptureStatus as CaptureStatus,
+)
+from nneditor.tracing.contracts import (
     InputBinding as InputBinding,
 )
 from nneditor.tracing.contracts import (
@@ -114,6 +117,7 @@ __all__ = [
     "ActivationVisualization",
     "AxisAwareScan",
     "CaptureState",
+    "CaptureStatus",
     "InputBinding",
     "InputSource",
     "InputSpecification",

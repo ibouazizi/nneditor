@@ -23,6 +23,7 @@ from nneditor.tracing import (
     ActivationRecord,
     ActivationStore,
     CaptureState,
+    CaptureStatus,
     InputBinding,
     InputSource,
     InputSpecification,
@@ -64,6 +65,7 @@ def _record(
     state: CaptureState = CaptureState.COMPLETE,
     shape: tuple[int, ...] = (2,),
 ) -> ActivationRecord:
+    readable = state in {CaptureState.COMPLETE, CaptureState.TRUNCATED}
     return ActivationRecord(
         value_id=value_id,
         value_name=value_id,
@@ -76,9 +78,15 @@ def _record(
         full_byte_length=(
             len(payload) * 2 if state is CaptureState.TRUNCATED else len(payload)
         ),
-        stored_byte_length=len(payload),
-        file_name=f"captures/{value_id}.bin",
-        reason=("capture was truncated" if state is CaptureState.TRUNCATED else None),
+        stored_byte_length=len(payload) if readable else 0,
+        file_name=f"captures/{value_id}.bin" if readable else None,
+        reason=(
+            "capture was truncated"
+            if state is CaptureState.TRUNCATED
+            else None
+            if readable
+            else "capture byte ceiling"
+        ),
     )
 
 
@@ -736,9 +744,86 @@ def test_comparison_metrics_and_scene_overlays(tmp_path: Path) -> None:
         {"glyph": frozenset({"node"})},
     )
     traced_scene = scene.apply(trace_scene_patch(graph_slice, left))
-    assert "activation captured" in traced_scene.node("glyph").type_label
+    assert traced_scene.node("glyph").type_label == "Op • activation captured"
     compared_scene = scene.apply(comparison_scene_patch(graph_slice, comparison))
     assert "Δmax 2" in compared_scene.node("glyph").type_label
+
+
+def test_trace_scene_patch_grades_capture_and_keeps_identity_first() -> None:
+    scene = Scene(
+        [
+            NodeGlyph(
+                "block",
+                0,
+                0,
+                10,
+                10,
+                "group",
+                "block.0 (12)",
+                type_label="Transformer Block",
+            ),
+            NodeGlyph("plain", 0, 20, 10, 10, "", "Gemm_7"),
+        ]
+    )
+    graph_slice = GraphSlice(
+        scene,
+        (("block", "plain"),),
+        (),
+        DetailLevel.OPERATOR,
+        "hierarchy",
+        None,
+        {"block": frozenset({"node"}), "plain": frozenset({"node"})},
+    )
+    key = TraceKey("artifact", None, "inputs")
+    payload = np.zeros(2, dtype=np.float32).tobytes()
+
+    complete = TraceResult(key, (_record("value", payload),), "test-runtime")
+    assert complete.capture_status is CaptureStatus.COMPLETE
+    patched = scene.apply(trace_scene_patch(graph_slice, complete))
+    assert patched.node("block").type_label == "Transformer Block • activation captured"
+    # A glyph without a semantic type leads with its own label — never a
+    # bare "• status" string.
+    assert patched.node("plain").type_label == "Gemm_7 • activation captured"
+
+    # Every value readable but some truncated: a preview, not a failure.
+    preview = TraceResult(
+        key,
+        (
+            _record("value", payload),
+            _record("sliver", payload, state=CaptureState.TRUNCATED),
+        ),
+        "test-runtime",
+    )
+    assert preview.capture_status is CaptureStatus.PREVIEW
+    patched = scene.apply(trace_scene_patch(graph_slice, preview))
+    assert patched.node("block").type_label == "Transformer Block • activation preview"
+
+    # A dropped value means requested data is genuinely missing.
+    partial = TraceResult(
+        key,
+        (
+            _record("value", payload),
+            _record("missing", payload, state=CaptureState.DROPPED),
+        ),
+        "test-runtime",
+    )
+    assert partial.capture_status is CaptureStatus.PARTIAL
+    patched = scene.apply(trace_scene_patch(graph_slice, partial))
+    label = patched.node("block").type_label
+    assert label == "Transformer Block • activation partial"
+    # Identity first: a renderer that truncates long labels drops the
+    # status marker, never the name.
+    assert label.startswith("Transformer Block")
+
+    # Diagnostics always name a defect in the records, so they read partial
+    # even when every stored record is complete.
+    diagnosed = TraceResult(
+        key,
+        (_record("value", payload),),
+        "test-runtime",
+        diagnostics=("capture stopped early",),
+    )
+    assert diagnosed.capture_status is CaptureStatus.PARTIAL
 
 
 def test_comparison_refuses_different_input_specifications(tmp_path: Path) -> None:

@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import functools
 import math
+import re
 import sys
 import tempfile
 import uuid
@@ -30,6 +31,7 @@ from typing import Any, Final, Protocol, runtime_checkable
 import flet as ft
 import flet.canvas as cv
 
+from nneditor.analysis.hierarchy import Group, Hierarchy
 from nneditor.analysis.lod import DetailLevel, detail_for_scale
 from nneditor.application.editing import SidecarPersistenceError
 from nneditor.application.hierarchy import OrganizationMode
@@ -97,6 +99,11 @@ _PANEL = "#FFFFFF"
 _CANVAS = "#F6F7FB"
 _SIDEBAR_WIDTH = 304
 _MAX_EXPLORER_ROWS = 200
+# Hierarchies nested deeper than this are almost certainly corrupt sidecar
+# data; the Blocks walk stops there instead of recursing without bound.
+_MAX_HIERARCHY_DEPTH = 32
+_EXPLORER_INDENT = 14.0
+"""Pixels of indentation per hierarchy depth in the Blocks pane."""
 SHELL_PALETTE = shell_layout.ShellPalette(
     panel=_PANEL,
     border=_BORDER,
@@ -212,6 +219,19 @@ def nearest_glyph_center(
     return (nearest.x + nearest.width / 2.0, nearest.y + nearest.height / 2.0)
 
 
+def _natural_key(text: str) -> tuple[tuple[int, int, str], ...]:
+    """A case-insensitive, numeric-aware ordering key: "2" before "10".
+
+    Each chunk is a uniformly typed triple so tuples always compare cleanly:
+    digit runs order numerically before text at the same position.
+    """
+    return tuple(
+        (0, int(chunk), "") if chunk.isdigit() else (1, 0, chunk)
+        for chunk in re.split(r"(\d+)", text.casefold())
+        if chunk
+    )
+
+
 def resolve_initial_palette(brightness: object) -> shell_layout.ShellPalette:
     """Follow the platform brightness when Flet exposes it; default to light."""
     value = getattr(brightness, "value", brightness)
@@ -251,6 +271,13 @@ class Shell:
         self.view = {"scale": 1.0, "x": 0.0, "y": 0.0}
         self.current_graph: str | None = None
         self.current_root_group: str | None = None
+        # Blocks-pane expansion state (group id -> expanded), per session.
+        # Unlisted groups default to expanded roots and collapsed subtrees.
+        self._hierarchy_expanded: dict[str, bool] = {}
+        # Group ids the Blocks pane currently highlights for the renderer
+        # selection; compared before rebuilding so reselecting the same
+        # glyph never pays for a full tree rebuild.
+        self._hierarchy_highlight: frozenset[str] = frozenset()
         self.current_detail = DetailLevel.ARCHITECTURE
         self.auto_detail = False
         self.current_slice: GraphSlice | None = None
@@ -1735,6 +1762,8 @@ class Shell:
         self._saved_revision_id = None
         self.current_graph = None
         self.current_root_group = None
+        self._hierarchy_expanded.clear()
+        self._hierarchy_highlight = frozenset()
         self.current_slice = None
         self.logical_selection = frozenset()
         self.minimap_model = None
@@ -1988,6 +2017,7 @@ class Shell:
             )
         self.activations.autoload_views(ids)
         self._refresh_inspector(ids)
+        self._sync_hierarchy_selection()
         self.trace.refresh_capture_scope()
         self._record_view()
         self.page.update()
@@ -2348,6 +2378,8 @@ class Shell:
         self.search_results.controls = []
         self.current_graph = session.document.entry_graph
         self.current_root_group = None
+        # Expansion state describes the outgoing model's groups.
+        self._hierarchy_expanded.clear()
         self.current_detail = DetailLevel.ARCHITECTURE
         self.auto_detail = False
         self._sync_detail_controls()
@@ -2473,6 +2505,7 @@ class Shell:
         self.current_slice = layout
         self._replace_scene_fitted(layout)
         self._restore_logical_selection()
+        self._sync_hierarchy_selection()
         self._refresh_breadcrumbs()
         self._rebuild_minimap()
 
@@ -3489,59 +3522,168 @@ class Shell:
         )
         self.close_model_button.visible = session is not None
 
+    def _hierarchy_selection_ids(self, hierarchy: Hierarchy) -> frozenset[str]:
+        """The deepest group per branch the renderer selection maps into.
+
+        A selected group glyph names its group directly; a selected node
+        highlights its most specific containing group. Ancestors of another
+        highlighted group are pruned so exactly one row lights up per branch.
+        """
+        highlighted: set[str] = set()
+        for item in self.renderer.selection:
+            if hierarchy.has_group(item):
+                highlighted.add(item)
+                continue
+            containers = hierarchy.groups_for_node(item)
+            if containers:
+                highlighted.add(containers[0].id)
+        ancestors: set[str] = set()
+        for group_id in highlighted:
+            ancestors.update(item.id for item in hierarchy.breadcrumbs(group_id)[:-1])
+        return frozenset(highlighted - ancestors)
+
+    def _sync_hierarchy_selection(self) -> None:
+        """Rebuild the Blocks pane only when its highlight actually changed."""
+        if self.session is None or self.current_graph is None:
+            return
+        hierarchy = self.session.graph_hierarchy(self.current_graph)
+        if self._hierarchy_selection_ids(hierarchy) != self._hierarchy_highlight:
+            self._refresh_hierarchy()
+
     def _refresh_hierarchy(self) -> None:
         if self.session is None or self.current_graph is None:
             return
         hierarchy = self.session.graph_hierarchy(self.current_graph)
+        highlight = self._hierarchy_selection_ids(hierarchy)
+        if highlight != self._hierarchy_highlight:
+            # Ancestors open only when the highlight itself moves, so the
+            # highlighted row is visible yet a user can still collapse the
+            # branch above it afterwards.
+            for group_id in highlight:
+                for ancestor in hierarchy.breadcrumbs(group_id)[:-1]:
+                    self._hierarchy_expanded[ancestor.id] = True
+            self._hierarchy_highlight = highlight
+        graph = self.session.document.graphs.get(self.current_graph)
+        node_order: dict[str, int] = (
+            {node.id: index for index, node in enumerate(graph.nodes)}
+            if graph is not None
+            else {}
+        )
+        unknown = len(node_order)
+
+        def sort_key(group: Group) -> tuple[int, tuple[tuple[int, int, str], ...]]:
+            # Graph position first — the group's earliest member in the
+            # serialized node order — then a numeric-aware label so equally
+            # placed blocks still read "2" before "10".
+            position = min(
+                (node_order.get(member, unknown) for member in group.members),
+                default=unknown,
+            )
+            return (position, _natural_key(group.label))
+
         rows: list[ft.Control] = []
+        visible = 0
 
         def add(group_id: str, depth: int) -> None:
-            if len(rows) >= _MAX_EXPLORER_ROWS:
-                return
+            nonlocal visible
             group = hierarchy.group(group_id)
-            rows.append(
-                ft.TextButton(
-                    content=("  " * depth)
-                    + f"{group.label}  ·  {len(group.members)} ops",
-                    icon=ft.Icons.GRID_VIEW_ROUNDED,
-                    tooltip=group.explanation,
-                    style=ft.ButtonStyle(
-                        color=(
-                            self.palette.accent
-                            if group.id == self.current_root_group
-                            else self.palette.ink
-                        ),
-                        bgcolor=(
-                            self.palette.accent_soft
-                            if group.id == self.current_root_group
-                            else "#00FFFFFF"
-                        ),
-                        shape=ft.RoundedRectangleBorder(radius=9),
-                        alignment=ft.Alignment.CENTER_LEFT,
-                    ),
-                    on_click=self._group_handler(group.id),
-                )
+            children = (
+                sorted(hierarchy.children(group.id), key=sort_key)
+                if depth + 1 < _MAX_HIERARCHY_DEPTH
+                else []
             )
-            for child in hierarchy.children(group.id):
-                add(child.id, depth + 1)
+            visible += 1
+            if visible <= _MAX_EXPLORER_ROWS:
+                rows.append(self._hierarchy_row(group, depth, bool(children)))
+            if children and self._hierarchy_expanded.get(group.id, depth == 0):
+                for child in children:
+                    add(child.id, depth + 1)
 
-        for root in hierarchy.roots:
+        for root in sorted(hierarchy.roots, key=sort_key):
             add(root.id, 0)
-            if len(rows) >= _MAX_EXPLORER_ROWS:
-                break
         if not rows:
             rows.append(ft.Text("No groups detected", size=11))
-        elif len(hierarchy.groups) > _MAX_EXPLORER_ROWS:
+        elif visible > _MAX_EXPLORER_ROWS:
             rows.append(
                 ft.Text(
-                    f"Showing {_MAX_EXPLORER_ROWS} of "
-                    f"{len(hierarchy.groups):,} blocks. Use search or the graph "
-                    "to inspect the rest.",
+                    f"{visible - _MAX_EXPLORER_ROWS:,} more… Use search or "
+                    "the graph to inspect the rest.",
                     size=10,
                     color=self.palette.muted,
                 )
             )
         self.hierarchy_list.controls = rows
+
+    def _hierarchy_row(
+        self, group: Group, depth: int, has_children: bool
+    ) -> ft.Control:
+        """One Blocks-pane row: an optional chevron plus the select button."""
+        selected = group.id in self._hierarchy_highlight
+        active = group.id == self.current_root_group
+        label = ft.TextButton(
+            content=f"{group.label}  ·  {len(group.members)} ops",
+            icon=ft.Icons.GRID_VIEW_ROUNDED,
+            tooltip=group.explanation,
+            data=f"hierarchy-row:{group.id}",
+            style=ft.ButtonStyle(
+                color=(self.palette.accent if selected or active else self.palette.ink),
+                bgcolor=(
+                    self.palette.accent_soft if active and not selected else "#00FFFFFF"
+                ),
+                shape=ft.RoundedRectangleBorder(radius=9),
+                alignment=ft.Alignment.CENTER_LEFT,
+            ),
+            on_click=self._group_handler(group.id),
+        )
+        row: ft.Control = label
+        if has_children or depth:
+            controls: list[ft.Control] = []
+            if depth:
+                controls.append(ft.Container(width=depth * _EXPLORER_INDENT))
+            if has_children:
+                expanded = self._hierarchy_expanded.get(group.id, depth == 0)
+                controls.append(
+                    ft.IconButton(
+                        icon=(
+                            ft.Icons.EXPAND_MORE_ROUNDED
+                            if expanded
+                            else ft.Icons.CHEVRON_RIGHT_ROUNDED
+                        ),
+                        icon_size=16,
+                        icon_color=self.palette.muted,
+                        tooltip="Collapse" if expanded else "Expand",
+                        data=f"hierarchy-toggle:{group.id}",
+                        on_click=self._hierarchy_toggle_handler(group.id, depth),
+                    )
+                )
+            controls.append(label)
+            row = ft.Row(
+                controls=controls,
+                spacing=0,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+        if not selected:
+            return row
+        # The selection wash covers the whole row, indent and chevron
+        # included, which keeps it distinct from the drilled-in root's
+        # button-only chip; when a row is both, the selection look wins.
+        return ft.Container(
+            content=row,
+            bgcolor=self.palette.accent_soft,
+            border_radius=9,
+            data=f"hierarchy-selected:{group.id}",
+        )
+
+    def _hierarchy_toggle_handler(
+        self, group_id: str, depth: int
+    ) -> Callable[[ft.Event[ft.IconButton]], None]:
+        def toggle(event: ft.Event[ft.IconButton]) -> None:
+            expanded = self._hierarchy_expanded.get(group_id, depth == 0)
+            self._hierarchy_expanded[group_id] = not expanded
+            self._refresh_hierarchy()
+            self.page.update()
+
+        return toggle
 
     def _group_handler(
         self, group_id: str

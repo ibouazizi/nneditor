@@ -16,6 +16,7 @@ __all__ = [
     "CAPTURE_POLICIES",
     "ActivationRecord",
     "CaptureState",
+    "CaptureStatus",
     "InputBinding",
     "InputSource",
     "InputSpecification",
@@ -85,6 +86,21 @@ class CaptureState(StrEnum):
     TRUNCATED = "truncated"
     DROPPED = "dropped"
     EVICTED = "evicted"
+
+
+class CaptureStatus(StrEnum):
+    """Three-way health of a finished trace's captured records.
+
+    PARTIAL means the trace is missing requested data: a diagnostic named a
+    defect, or some value was dropped or evicted. PREVIEW means every
+    requested value is readable but at least one holds only a truncated
+    prefix — the deliberate breadth of the preview capture policy, not a
+    failure. COMPLETE means every requested value was captured whole.
+    """
+
+    PARTIAL = "partial"
+    PREVIEW = "preview"
+    COMPLETE = "complete"
 
 
 class TraceBackend(StrEnum):
@@ -504,9 +520,26 @@ class TraceResult:
 
     @property
     def partial(self) -> bool:
-        return bool(self.diagnostics) or any(
-            record.state is not CaptureState.COMPLETE for record in self.records
-        )
+        return self.capture_status is not CaptureStatus.COMPLETE
+
+    @property
+    def capture_status(self) -> CaptureStatus:
+        """Three-way capture health derived from the records' states.
+
+        Dropped or evicted values — and any diagnostic, which always names a
+        defect in the records — mean requested data is missing (PARTIAL).
+        Truncated-only records mean everything requested is readable but some
+        payloads keep just a prefix (PREVIEW). Otherwise the capture is whole
+        (COMPLETE).
+        """
+        if self.diagnostics or any(
+            record.state in {CaptureState.DROPPED, CaptureState.EVICTED}
+            for record in self.records
+        ):
+            return CaptureStatus.PARTIAL
+        if any(record.state is CaptureState.TRUNCATED for record in self.records):
+            return CaptureStatus.PREVIEW
+        return CaptureStatus.COMPLETE
 
     @property
     def captured_value_ids(self) -> frozenset[str]:

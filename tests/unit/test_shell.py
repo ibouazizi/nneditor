@@ -16,10 +16,13 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import flet as ft
+import onnx
 import pytest
+from onnx import TensorProto, helper
 
 from nneditor.analysis.lod import DetailLevel
-from nneditor.application.session import ApplicationService
+from nneditor.application.hierarchy import OrganizationMode
+from nneditor.application.session import ApplicationService, ModelSession
 from nneditor.artifact_formats import MODEL_FILE_EXTENSIONS
 from nneditor.rendering import (
     InteractiveGraphRenderer,
@@ -1598,3 +1601,258 @@ def test_copy_as_json_puts_node_metadata_on_the_clipboard(
     assert payload["Operator"] == node.qualified_op_type
     assert payload["Node id"] == node.id
     assert "copied" in (shell.status_text.value or "")
+
+
+# -- ordered, collapsible blocks tree ---------------------------------------
+
+
+def _build_identity_chain_model(path: Path, *, count: int = 8) -> None:
+    """A flat chain of unscoped Identity ops.
+
+    No detector finds structure in unscoped Identity nodes under SOURCE
+    organization, so the Blocks pane shows exactly the manual groups a test
+    creates.
+    """
+    nodes = [
+        helper.make_node("Identity", [f"v{index}"], [f"v{index + 1}"], name=f"n{index}")
+        for index in range(count)
+    ]
+    graph = helper.make_graph(
+        nodes=nodes,
+        name="chain",
+        inputs=[helper.make_tensor_value_info("v0", TensorProto.FLOAT, [4])],
+        outputs=[helper.make_tensor_value_info(f"v{count}", TensorProto.FLOAT, [4])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    onnx.save_model(model, path)
+
+
+def _chain_shell(
+    tmp_path: Path, service: ApplicationService
+) -> tuple[Shell, ModelSession]:
+    path = tmp_path / "chain.onnx"
+    _build_identity_chain_model(path)
+    shell, _page = make_shell(service)
+    session = service.open_model(path)
+    shell.show_session(session)
+    session.hierarchy.set_mode(OrganizationMode.SOURCE)
+    return shell, session
+
+
+def _row_button(control: ft.Control) -> ft.TextButton | None:
+    """The select button of a Blocks row, whether plain or chevroned."""
+    if isinstance(control, ft.Container) and control.content is not None:
+        # Highlighted rows are wrapped in a selection-wash container.
+        control = control.content
+    if isinstance(control, ft.TextButton):
+        return control
+    if isinstance(control, ft.Row):
+        return next(
+            (item for item in control.controls if isinstance(item, ft.TextButton)),
+            None,
+        )
+    return None
+
+
+def _selected_markers(shell: Shell) -> list[str]:
+    """The hierarchy-selected data markers carried by highlighted rows."""
+    return [
+        control.data
+        for control in shell.hierarchy_list.controls
+        if isinstance(control, ft.Container)
+        and isinstance(control.data, str)
+        and control.data.startswith("hierarchy-selected:")
+    ]
+
+
+def _row_labels(shell: Shell) -> list[str]:
+    labels: list[str] = []
+    for control in shell.hierarchy_list.controls:
+        button = _row_button(control)
+        if button is not None:
+            labels.append(str(button.content).split("  ·  ")[0])
+    return labels
+
+
+def _row_toggle(shell: Shell, label: str) -> ft.IconButton:
+    for control in shell.hierarchy_list.controls:
+        button = _row_button(control)
+        if button is None or str(button.content).split("  ·  ")[0] != label:
+            continue
+        assert isinstance(control, ft.Row), f"row {label!r} has no chevron"
+        return next(
+            item for item in control.controls if isinstance(item, ft.IconButton)
+        )
+    raise AssertionError(f"no Blocks row labelled {label!r}")
+
+
+def test_blocks_pane_orders_siblings_by_graph_position(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    from nneditor.ui import app as app_module
+
+    shell, session = _chain_shell(tmp_path, service)
+    graph = session.document.main_graph
+    pairs = [
+        frozenset({graph.nodes[index].id, graph.nodes[index + 1].id})
+        for index in range(0, 8, 2)
+    ]
+    # Created in a deliberately shuffled order. Member counts tie and both
+    # insertion and lexicographic id order would put "block 10" before
+    # "block 2", so only the graph position can produce the expected rows.
+    session.hierarchy.group(graph.id, "block 10", pairs[3])
+    session.hierarchy.group(graph.id, "block 2", pairs[1])
+    session.hierarchy.group(graph.id, "block 1", pairs[0])
+    session.hierarchy.group(graph.id, "block 3", pairs[2])
+
+    shell._refresh_hierarchy()
+
+    assert _row_labels(shell) == ["block 1", "block 2", "block 3", "block 10"]
+    # The label tiebreak is numeric-aware, not lexicographic.
+    assert app_module._natural_key("block 2") < app_module._natural_key("block 10")
+
+
+def test_blocks_tree_collapses_deeper_levels_until_toggled(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    shell, session = _chain_shell(tmp_path, service)
+    graph = session.document.main_graph
+    ids = [node.id for node in graph.nodes]
+    session.hierarchy.group(graph.id, "Stage", frozenset(ids))
+    session.hierarchy.group(graph.id, "Front", frozenset(ids[:4]))
+    session.hierarchy.group(graph.id, "Core", frozenset(ids[:2]))
+
+    shell._refresh_hierarchy()
+
+    # Roots are expanded by default; deeper levels start collapsed.
+    assert _row_labels(shell) == ["Stage", "Front"]
+    toggle = _row_toggle(shell, "Front")
+    assert toggle.icon == ft.Icons.CHEVRON_RIGHT_ROUNDED
+
+    cast(Any, toggle.on_click)(cast(Any, None))
+
+    assert _row_labels(shell) == ["Stage", "Front", "Core"]
+    assert _row_toggle(shell, "Front").icon == ft.Icons.EXPAND_MORE_ROUNDED
+
+    # Expansion survives inspector refreshes and a theme toggle.
+    shell._refresh_inspector(frozenset())
+    shell._on_toggle_theme(None)
+    assert _row_labels(shell) == ["Stage", "Front", "Core"]
+
+    # Closing the model clears the per-session expansion state.
+    shell._on_close_model(cast(Any, None))
+    assert shell._hierarchy_expanded == {}
+    assert shell.hierarchy_list.controls == []
+
+
+def test_blocks_row_cap_counts_only_visible_rows(
+    tmp_path: Path,
+    service: ApplicationService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nneditor.ui import app as app_module
+
+    shell, session = _chain_shell(tmp_path, service)
+    graph = session.document.main_graph
+    ids = [node.id for node in graph.nodes]
+    session.hierarchy.group(graph.id, "Stage", frozenset(ids))
+    session.hierarchy.group(graph.id, "Front", frozenset(ids[:4]))
+    session.hierarchy.group(graph.id, "Back", frozenset(ids[4:]))
+    session.hierarchy.group(graph.id, "Front head", frozenset(ids[:2]))
+    session.hierarchy.group(graph.id, "Front tail", frozenset(ids[2:4]))
+    monkeypatch.setattr(app_module, "_MAX_EXPLORER_ROWS", 3)
+
+    shell._refresh_hierarchy()
+
+    # Five groups exist but only three rows are visible, so the cap is not
+    # reached and no truncation note appears.
+    assert _row_labels(shell) == ["Stage", "Front", "Back"]
+    assert not any(
+        isinstance(control, ft.Text) for control in shell.hierarchy_list.controls
+    )
+
+    cast(Any, _row_toggle(shell, "Front").on_click)(cast(Any, None))
+
+    # Expanding Front makes five rows visible; the cap trims the list and
+    # notes the remainder.
+    assert _row_labels(shell) == ["Stage", "Front", "Front head"]
+    note = shell.hierarchy_list.controls[-1]
+    assert isinstance(note, ft.Text)
+    assert "2 more…" in str(note.value)
+
+
+def test_blocks_tree_highlights_deepest_group_for_selection(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    shell, session = _chain_shell(tmp_path, service)
+    graph = session.document.main_graph
+    ids = [node.id for node in graph.nodes]
+    session.hierarchy.group(graph.id, "Stage", frozenset(ids))
+    front = session.hierarchy.group(graph.id, "Front", frozenset(ids[:4]))
+    core = session.hierarchy.group(graph.id, "Core", frozenset(ids[:2]))
+    shell.detail_segment.selected = [DetailLevel.OPERATOR.value]
+    shell._on_detail_segment_changed(cast(Any, None))
+    assert _row_labels(shell) == ["Stage", "Front"]
+
+    shell.renderer.set_selection(frozenset({ids[0]}))
+    shell._on_selected(frozenset({ids[0]}))
+
+    # The deepest containing group lights up; its collapsed ancestors were
+    # opened so the highlighted row is visible, but stay unhighlighted.
+    assert _row_labels(shell) == ["Stage", "Front", "Core"]
+    assert shell._hierarchy_expanded[front.id] is True
+    assert _selected_markers(shell) == [f"hierarchy-selected:{core.id}"]
+    core_button = _row_button(shell.hierarchy_list.controls[2])
+    assert core_button is not None
+    assert core_button.style is not None
+    assert core_button.style.color == shell.palette.accent
+
+    # Selecting another node of the same deepest group keeps the highlight
+    # unchanged and must not rebuild the rows.
+    row_before = shell.hierarchy_list.controls[2]
+    shell.renderer.set_selection(frozenset({ids[1]}))
+    shell._on_selected(frozenset({ids[1]}))
+    assert shell.hierarchy_list.controls[2] is row_before
+
+    # Clearing the selection removes the highlight; expansion persists.
+    shell.renderer.set_selection(frozenset())
+    shell._on_selected(frozenset())
+    assert _selected_markers(shell) == []
+    assert shell._hierarchy_highlight == frozenset()
+    assert _row_labels(shell) == ["Stage", "Front", "Core"]
+
+
+def test_blocks_tree_highlights_selected_group_glyph(
+    tmp_path: Path, service: ApplicationService
+) -> None:
+    shell, session = _chain_shell(tmp_path, service)
+    graph = session.document.main_graph
+    ids = [node.id for node in graph.nodes]
+    session.hierarchy.group(graph.id, "Stage", frozenset(ids))
+    front = session.hierarchy.group(graph.id, "Front", frozenset(ids[:4]))
+    shell.detail_segment.selected = [DetailLevel.BLOCK.value]
+    shell._on_detail_segment_changed(cast(Any, None))
+    scene = shell.renderer.scene
+    assert scene is not None and scene.has_node(front.id)
+
+    shell.renderer.set_selection(frozenset({front.id}))
+    shell._on_selected(frozenset({front.id}))
+
+    assert _row_labels(shell) == ["Stage", "Front"]
+    assert _selected_markers(shell) == [f"hierarchy-selected:{front.id}"]
+    wash = shell.hierarchy_list.controls[1]
+    assert isinstance(wash, ft.Container)
+    assert wash.bgcolor == shell.palette.accent_soft
+
+    # The highlight recolors from the live palette on a theme switch.
+    shell._on_toggle_theme(None)
+    assert shell.palette is shell_layout.DARK_SHELL_PALETTE
+    wash = shell.hierarchy_list.controls[1]
+    assert isinstance(wash, ft.Container)
+    assert wash.bgcolor == shell_layout.DARK_SHELL_PALETTE.accent_soft
+    assert _selected_markers(shell) == [f"hierarchy-selected:{front.id}"]
+
+    # Closing the model clears the highlight with the rest of the tree state.
+    shell._on_close_model(cast(Any, None))
+    assert shell._hierarchy_highlight == frozenset()
+    assert shell.hierarchy_list.controls == []

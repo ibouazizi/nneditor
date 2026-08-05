@@ -11,6 +11,34 @@ from nneditor.tracing.visualization import ActivationVisualization
 
 __all__ = ["ActivationLayerViewer", "build_activation_layer_viewer"]
 
+_ZOOM_STEP = 1.25
+_MIN_ZOOM = 0.4
+_MAX_ZOOM = 4.0
+
+# Perspective focal depth in logical pixels: each plane matrix sets entry
+# (3, 2) to 1 / _FOCAL_DEPTH, so a transformed point keeps a positive
+# homogeneous w — stays in front of the camera and visible — while the
+# magnitude of its effective z stays below _FOCAL_DEPTH.
+_FOCAL_DEPTH = 2800.0
+
+# tracing/visualization.py caps a layer stack at 16 planes
+# (``max_feature_maps``); the spacing invariant below is sized against it.
+_MAX_LAYERS = 16
+
+# Depth invariant. The deepest translate ``_apply_view`` ever issues is
+# ``spacing * (count + 1)`` (the selected plane pulled clear of the stack),
+# rotation never grows a translate's z beyond its own magnitude, and the
+# uniform zoom multiplies effective z by at most _MAX_ZOOM. Capping the
+# per-layer spacing so that
+#
+#     _MAX_ZOOM * spacing * (count + 1) <= _DEPTH_SAFETY * _FOCAL_DEPTH
+#
+# for every count up to _MAX_LAYERS keeps the whole stack within 40% of the
+# focal depth at full zoom; the remaining 60% is headroom for the planes' own
+# rotated extents, so no pitch/yaw/zoom combination can drive w to zero and
+# make a plane vanish.
+_DEPTH_SAFETY = 0.4
+
 
 class ActivationLayerViewer:
     """A rotatable stack whose selected tensor layer is painted in front."""
@@ -42,7 +70,18 @@ class ActivationLayerViewer:
         self._muted_color = muted_color
         self.pitch = -0.52
         self.yaw = 0.58
+        self.scale = 1.0
         self.selected = 0
+        self.focal_depth = _FOCAL_DEPTH
+        count = len(view.layer_pngs)
+        # Aesthetic spacing, capped by the depth budget derived from the
+        # invariant on _DEPTH_SAFETY so the stack can never reach the focal
+        # depth even at _MAX_ZOOM with extreme pitch/yaw.
+        self.layer_spacing = min(
+            34.0,
+            max(12.0, 150.0 / count),
+            _DEPTH_SAFETY * _FOCAL_DEPTH / (_MAX_ZOOM * (count + 1)),
+        )
         self._scene_height = max(120.0, height - 42.0)
         rows, columns = view.layer_shape
         available_width = max(60.0, width * 0.68)
@@ -123,6 +162,18 @@ class ActivationLayerViewer:
             on_click=self._step_handler(1),
             disabled=len(self.planes) < 2,
         )
+        zoom_out = ft.IconButton(
+            data="layer-zoom-out",
+            icon=ft.Icons.ZOOM_OUT_ROUNDED,
+            tooltip="Zoom out",
+            on_click=self._zoom_out_handler,
+        )
+        zoom_in = ft.IconButton(
+            data="layer-zoom-in",
+            icon=ft.Icons.ZOOM_IN_ROUNDED,
+            tooltip="Zoom in",
+            on_click=self._zoom_in_handler,
+        )
         reset = ft.IconButton(
             data="activation-layer-reset",
             icon=ft.Icons.THREED_ROTATION_ROUNDED,
@@ -135,7 +186,14 @@ class ActivationLayerViewer:
                 controls=[
                     self.gesture,
                     ft.Row(
-                        controls=[previous, self.selection_text, following, reset],
+                        controls=[
+                            previous,
+                            self.selection_text,
+                            following,
+                            zoom_out,
+                            zoom_in,
+                            reset,
+                        ],
                         spacing=2,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
@@ -149,6 +207,9 @@ class ActivationLayerViewer:
             bgcolor=panel_color,
             border=ft.Border.all(1, border_color),
             border_radius=8,
+            # A rounded Container clips at ANTI_ALIAS by default, which would
+            # crop planes swinging outside the body during rotation/zoom.
+            clip_behavior=ft.ClipBehavior.NONE,
         )
         self.control.activation_layer_viewer = self  # type: ignore[attr-defined]
         self._apply_view()
@@ -184,6 +245,23 @@ class ActivationLayerViewer:
         self._apply_view()
         self._update()
 
+    def zoom_in(self) -> None:
+        self._set_scale(self.scale * _ZOOM_STEP)
+
+    def zoom_out(self) -> None:
+        self._set_scale(self.scale / _ZOOM_STEP)
+
+    def _set_scale(self, value: float) -> None:
+        self.scale = max(_MIN_ZOOM, min(_MAX_ZOOM, value))
+        self._apply_view()
+        self._update()
+
+    def _zoom_in_handler(self, _event: ft.Event[ft.IconButton]) -> None:
+        self.zoom_in()
+
+    def _zoom_out_handler(self, _event: ft.Event[ft.IconButton]) -> None:
+        self.zoom_out()
+
     def _on_pan_update(
         self,
         event: ft.DragUpdateEvent[ft.GestureDetector],
@@ -206,7 +284,7 @@ class ActivationLayerViewer:
         ]
         order.append(self.selected)
         self.scene.controls = [self.planes[position] for position in order]
-        spacing = min(34.0, max(12.0, 150.0 / max(len(self.planes), 1)))
+        spacing = self.layer_spacing
         for rank, position in enumerate(order):
             plane = self.planes[position]
             selected = position == self.selected
@@ -216,7 +294,8 @@ class ActivationLayerViewer:
                 else spacing * (rank - (len(order) - 1) / 2)
             )
             matrix = ft.Matrix4.identity()
-            matrix.set_entry(3, 2, 0.0018)
+            matrix.set_entry(3, 2, 1.0 / self.focal_depth)
+            matrix.scale(self.scale)
             matrix.rotate_x(self.pitch)
             matrix.rotate_y(self.yaw)
             matrix.translate(0, 0, depth)

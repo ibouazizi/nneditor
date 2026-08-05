@@ -33,7 +33,7 @@ from nneditor.tracing import (
 )
 from nneditor.tracing.preflight import RuntimeStatus
 from nneditor.tracing.runner import estimated_capture_bytes
-from nneditor.ui import viewmodel
+from nneditor.ui import activation_layers, viewmodel
 from nneditor.ui.activation_inspector import (
     ActivationInspector,
     _visualization_cost,
@@ -98,10 +98,16 @@ def test_trace_shell_empty_consent_loading_and_activation_states(
             and control.data.startswith("activation-card:")
         ]
         assert cards
-        assert any(
-            "activation captured" in node.type_label
+        marked = [
+            node.type_label
             for node in shell.renderer.scene.nodes
-        )
+            if "activation captured" in node.type_label
+        ]
+        assert marked
+        # The capture status is a suffix after the glyph's own identity, so
+        # a renderer that truncates long labels drops the status, not the
+        # name — no glyph ever reads as a bare "• status" string.
+        assert all(label.split("•")[0].strip() for label in marked)
 
 
 def test_open_model_applies_model_aware_trace_defaults(
@@ -940,6 +946,43 @@ def test_trace_shell_discloses_partial_capture(tmp_path: Path) -> None:
         assert "Partial trace" in str(shell.trace.status.value)
 
 
+def test_trace_shell_reads_truncated_but_readable_capture_as_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.onnx"
+    build_embedded_model(path, elements=8)
+    with ApplicationService() as service:
+        shell, _page, _callbacks, trace_id, session = _traced_shell(service, path)
+        base = session.trace(trace_id)
+        assert not base.partial
+
+        # Equal-share preview budgeting: every requested value keeps a
+        # readable prefix. Nothing was dropped, so the status must read
+        # "Preview trace", not flag the run as partial.
+        previewed = dataclasses.replace(
+            base,
+            records=tuple(
+                dataclasses.replace(
+                    record,
+                    state=CaptureState.TRUNCATED,
+                    stored_byte_length=record.full_byte_length // 2,
+                    reason="preview share",
+                )
+                for record in base.records
+            ),
+        )
+        assert previewed.partial
+        monkeypatch.setattr(ModelSession, "trace", lambda self, _trace_id: previewed)
+        monkeypatch.setattr(ModelSession, "traces", lambda self: (previewed,))
+        shell.trace.refresh_actions()
+
+        status = str(shell.trace.status.value)
+        assert "Preview trace" in status
+        assert "Partial" not in status
+        assert "most values were not captured" not in status
+
+
 def _select_operators(shell: Shell, session: ModelSession, *node_ids: str) -> None:
     """Show the operator graph and select those nodes, as a click would."""
     shell.current_detail = DetailLevel.OPERATOR
@@ -1733,6 +1776,137 @@ def test_tensor_layer_viewer_rotates_and_brings_selected_plane_forward() -> None
     assert controller.planes[1].opacity == 1.0
     assert controller.planes[0].opacity < 1.0
     assert "source 1" in str(controller.selection_text.value)
+
+
+def test_tensor_layer_viewer_zoom_steps_clamps_and_survives_rotation() -> None:
+    tensor = np.arange(3 * 18 * 47, dtype=np.float32).reshape(3, 18, 47)
+    record = ActivationRecord(
+        "layers",
+        "layers",
+        "node",
+        "node-output",
+        "float32",
+        "float32",
+        tensor.shape,
+        CaptureState.COMPLETE,
+        tensor.nbytes,
+        tensor.nbytes,
+        "captures/layers.bin",
+    )
+    stack = next(
+        view
+        for view in build_activation_visualizations(record, tensor.tobytes())
+        if view.kind.value == "tensor-layer-stack"
+    )
+    control = cast(
+        ft.Container,
+        build_activation_plot(stack, palette=SHELL_PALETTE, width=780, height=420),
+    )
+    controller = cast(Any, control).activation_layer_viewer
+
+    assert controller.scale == pytest.approx(1.0)
+    controller.zoom_in()
+    assert controller.scale == pytest.approx(1.25)
+    controller.zoom_out()
+    assert controller.scale == pytest.approx(1.0)
+
+    for _ in range(12):
+        controller.zoom_in()
+    assert controller.scale == pytest.approx(4.0)
+    for _ in range(24):
+        controller.zoom_out()
+    assert controller.scale == pytest.approx(0.4)
+
+    row = cast(ft.Row, cast(ft.Column, control.content).controls[1])
+    buttons = {
+        button.data: button
+        for button in row.controls
+        if isinstance(button, ft.IconButton)
+    }
+    zoom_in_button = buttons["layer-zoom-in"]
+    zoom_out_button = buttons["layer-zoom-out"]
+    assert zoom_in_button.tooltip == "Zoom in"
+    assert zoom_out_button.tooltip == "Zoom out"
+    event = cast("ft.Event[ft.IconButton]", cast(Any, SimpleNamespace()))
+    assert zoom_in_button.on_click is not None
+    assert zoom_out_button.on_click is not None
+    cast(Any, zoom_in_button.on_click)(event)
+    assert controller.scale == pytest.approx(0.5)
+    cast(Any, zoom_out_button.on_click)(event)
+    assert controller.scale == pytest.approx(0.4)
+
+    cast(Any, zoom_in_button.on_click)(event)
+    zoomed = controller.scale
+    controller.rotate(12, -8)
+    controller.select(1)
+    assert controller.scale == pytest.approx(zoomed)
+    assert controller.selected == 1
+    matrix = controller.planes[1].transform.matrix
+    scale_ops = [op for op in matrix.ops if op.name == "scale"]
+    assert scale_ops and scale_ops[0].args == [pytest.approx(zoomed)]
+
+
+def test_tensor_layer_viewer_keeps_stack_inside_perspective_focal_depth() -> None:
+    tensor = np.arange(16 * 18 * 47, dtype=np.float32).reshape(16, 18, 47)
+    record = ActivationRecord(
+        "layers",
+        "layers",
+        "node",
+        "node-output",
+        "float32",
+        "float32",
+        tensor.shape,
+        CaptureState.COMPLETE,
+        tensor.nbytes,
+        tensor.nbytes,
+        "captures/layers.bin",
+    )
+    stack = next(
+        view
+        for view in build_activation_visualizations(record, tensor.tobytes())
+        if view.kind.value == "tensor-layer-stack"
+    )
+    assert len(stack.layer_pngs) == 16
+    control = cast(
+        ft.Container,
+        build_activation_plot(stack, palette=SHELL_PALETTE, width=780, height=420),
+    )
+    controller = cast(Any, control).activation_layer_viewer
+
+    # Worst case for the perspective divisor: maximum zoom, pitch pinned to
+    # its clamp, arbitrary yaw, and the selected plane pulled clear of the
+    # stack (the deepest translate the viewer ever issues).
+    for _ in range(12):
+        controller.zoom_in()
+    assert controller.scale == pytest.approx(4.0)
+    controller.rotate(131.0, -1000.0)
+    assert controller.pitch == pytest.approx(1.35)
+    controller.select(15)
+
+    budget = activation_layers._DEPTH_SAFETY * controller.focal_depth
+    # The documented invariant: even the deepest translate, zoomed to the
+    # 4.0 maximum, stays within the safety fraction of the focal depth.
+    deepest = controller.layer_spacing * (len(controller.planes) + 1)
+    assert deepest * 4.0 <= budget
+
+    for plane in controller.planes:
+        matrix = plane.transform.matrix
+        entry = next(op for op in matrix.ops if op.name == "set_entry")
+        assert entry.args == [3, 2, pytest.approx(1.0 / controller.focal_depth)]
+        translate = next(op for op in matrix.ops if op.name == "translate")
+        # Rotation never grows a translate's z beyond its own magnitude and
+        # the uniform zoom multiplies it by at most the current scale, so
+        # this bounds the plane's effective z. Staying under the safety
+        # fraction keeps homogeneous w positive: the plane cannot flip
+        # behind the camera and vanish.
+        effective = abs(float(translate.args[2])) * controller.scale
+        assert effective <= budget
+        assert effective < controller.focal_depth
+
+    # Neither the scene stack nor the viewer body may crop planes swinging
+    # outside the box while rotating.
+    assert controller.scene.clip_behavior is ft.ClipBehavior.NONE
+    assert control.clip_behavior is ft.ClipBehavior.NONE
 
 
 def _traced_shell(
