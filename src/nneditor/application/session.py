@@ -14,7 +14,7 @@ import contextlib
 import shutil
 import tempfile
 import threading
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -29,7 +29,8 @@ from nneditor.adapters.onnx import (
 )
 from nneditor.adapters.pytorch.safetensors import (
     SafetensorsError,
-    write_safetensors,
+    SafetensorSource,
+    write_safetensors_stream,
 )
 from nneditor.adapters.registry import (
     ArtifactAdapterError,
@@ -918,33 +919,42 @@ class ModelSession:
         worse than an incomplete, honestly reported export.
         """
         self._ensure_open()
-        payload: list[tuple[str, str, tuple[int, ...], bytes]] = []
+
+        def range_reader(value_id: str) -> Callable[[int, int], bytes]:
+            def read(offset: int, length: int) -> bytes:
+                return self.editing.read(value_id, offset=offset, length=length)
+
+            return read
+
+        sources: list[SafetensorSource] = []
         for tensor_id, tensor in self.document.tensors.items():
             if token is not None:
                 token.raise_if_cancelled()
             if tensor.storage is Storage.ABSENT:
                 continue
             name = tensor_id.split("#", 1)[-1]
-            payload.append(
-                (
-                    name,
-                    tensor.element_type,
-                    tensor.dims,
-                    self.editing.read(tensor_id),
+            sources.append(
+                SafetensorSource(
+                    name=name,
+                    element_type=tensor.element_type,
+                    dims=tensor.dims,
+                    byte_length=self.editing.byte_length(tensor_id),
+                    read=range_reader(tensor_id),
                 )
             )
-        if not payload:
+        if not sources:
             raise SessionError("this artifact holds no readable tensors to export")
         try:
-            return write_safetensors(
+            return write_safetensors_stream(
                 destination,
-                payload,
+                sources,
                 metadata={
                     "producer": "nneditor",
                     "source_hash": self.document.source.content_hash,
                     "source_kind": self.document.artifact_kind.value,
                     "fidelity": "weights only",
                 },
+                token=token,
             )
         except SafetensorsError as error:
             raise SessionError(str(error)) from error

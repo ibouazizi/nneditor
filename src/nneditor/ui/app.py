@@ -19,7 +19,6 @@ import argparse
 import asyncio
 import functools
 import math
-import re
 import sys
 import tempfile
 import uuid
@@ -47,20 +46,9 @@ from nneditor.desktop import (
     register_file_associations,
     unregister_file_associations,
 )
-from nneditor.editing.validation import (
-    EditRequest,
-    EditTransaction,
-    InsertUnaryRequest,
-    ReconnectInputRequest,
-    RemoveUnaryRequest,
-    RenameNodeRequest,
-    ReplaceOperatorRequest,
-    SetAttributeRequest,
-    parse_attribute_value,
-)
+from nneditor.editing.validation import EditRequest, EditTransaction
 from nneditor.input_generation import GeneratedTensor
 from nneditor.ir.capabilities import ArtifactKind
-from nneditor.ir.core import AttrKind
 from nneditor.rendering import create_flet_renderer
 from nneditor.rendering.contract import InteractiveGraphRenderer, RendererFactory
 from nneditor.rendering.scene import NodeGlyph, Scene, Viewport
@@ -70,11 +58,13 @@ from nneditor.transformations.engine import (
     TransformationProposal,
     TransformationRequest,
 )
-from nneditor.transformations.schema import Granularity
 from nneditor.ui import input_workspace, overview, shell_layout, viewmodel
 from nneditor.ui.activation_inspector import ActivationInspector
+from nneditor.ui.edit_panel import EditPanel
+from nneditor.ui.hierarchy_panel import HierarchyPanel, natural_key
 from nneditor.ui.trace_graph import build_trace_graph
 from nneditor.ui.trace_panel import TracePanel, uses_automatic_mask
+from nneditor.ui.transformation_panel import TransformationPanel
 from nneditor.ui.watch_panel import WatchPanel
 
 APP_TITLE = "NNEditor"
@@ -83,6 +73,10 @@ APP_ICON_PATH = APP_ASSETS_DIRECTORY / "nneditor.png"
 APP_WINDOW_ICON_PATH = APP_ASSETS_DIRECTORY / "nneditor.ico"
 _WEB_UPLOAD_TEMP = tempfile.TemporaryDirectory(prefix="nneditor-web-upload-")
 _WEB_UPLOAD_DIRECTORY = Path(_WEB_UPLOAD_TEMP.name)
+
+# Compatibility alias for callers that historically imported this helper from
+# the shell module. The hierarchy component now owns the implementation.
+_natural_key = natural_key
 
 _SURFACE_FALLBACK = (1200.0, 800.0)
 _NARROW_BREAKPOINT = 1280.0
@@ -219,19 +213,6 @@ def nearest_glyph_center(
     return (nearest.x + nearest.width / 2.0, nearest.y + nearest.height / 2.0)
 
 
-def _natural_key(text: str) -> tuple[tuple[int, int, str], ...]:
-    """A case-insensitive, numeric-aware ordering key: "2" before "10".
-
-    Each chunk is a uniformly typed triple so tuples always compare cleanly:
-    digit runs order numerically before text at the same position.
-    """
-    return tuple(
-        (0, int(chunk), "") if chunk.isdigit() else (1, 0, chunk)
-        for chunk in re.split(r"(\d+)", text.casefold())
-        if chunk
-    )
-
-
 def resolve_initial_palette(brightness: object) -> shell_layout.ShellPalette:
     """Follow the platform brightness when Flet exposes it; default to light."""
     value = getattr(brightness, "value", brightness)
@@ -271,13 +252,6 @@ class Shell:
         self.view = {"scale": 1.0, "x": 0.0, "y": 0.0}
         self.current_graph: str | None = None
         self.current_root_group: str | None = None
-        # Blocks-pane expansion state (group id -> expanded), per session.
-        # Unlisted groups default to expanded roots and collapsed subtrees.
-        self._hierarchy_expanded: dict[str, bool] = {}
-        # Group ids the Blocks pane currently highlights for the renderer
-        # selection; compared before rebuilding so reselecting the same
-        # glyph never pays for a full tree rebuild.
-        self._hierarchy_highlight: frozenset[str] = frozenset()
         self.current_detail = DetailLevel.ARCHITECTURE
         self.auto_detail = False
         self.current_slice: GraphSlice | None = None
@@ -409,36 +383,32 @@ class Shell:
             visible=False,
         )
         self.graph_list = ft.ListView(expand=True, spacing=4)
-        self.hierarchy_list = ft.ListView(expand=True, spacing=4)
-        self.multi_select_field = ft.Checkbox(
-            label="Multi-select",
-            on_change=self._on_multi_select_changed,
+        self.hierarchy_panel = HierarchyPanel(
+            palette=self.palette,
+            on_multi_select=self._on_multi_select_changed,
+            on_group=self._on_group_selected,
+            on_merge=self._on_merge_selected,
+            on_rename=self._on_rename_selected,
+            on_split=self._on_split_selected,
+            on_lock=self._on_lock_selected,
+            on_reject=self._on_reject_selected,
+            on_reset=self._on_reset_groups,
+            on_navigate=self._navigate_hierarchy_group,
+            refresh=self._refresh_hierarchy,
+            update=page.update,
         )
-        self.group_label_field = ft.TextField(
-            label="Group label",
-            dense=True,
-        )
-        self.group_button = ft.TextButton(
-            content="Group", on_click=self._on_group_selected
-        )
-        self.merge_button = ft.TextButton(
-            content="Merge", on_click=self._on_merge_selected
-        )
-        self.rename_button = ft.TextButton(
-            content="Rename", on_click=self._on_rename_selected
-        )
-        self.split_button = ft.TextButton(
-            content="Split", on_click=self._on_split_selected
-        )
-        self.lock_button = ft.TextButton(
-            content="Lock/unlock", on_click=self._on_lock_selected
-        )
-        self.reject_button = ft.TextButton(
-            content="Reject", on_click=self._on_reject_selected
-        )
-        self.reset_groups_button = ft.TextButton(
-            content="Reset", on_click=self._on_reset_groups
-        )
+        # Compatibility aliases keep the shell's existing public test and
+        # plugin-facing surface while the component owns these controls.
+        self.hierarchy_list = self.hierarchy_panel.list
+        self.multi_select_field = self.hierarchy_panel.multi_select
+        self.group_label_field = self.hierarchy_panel.label
+        self.group_button = self.hierarchy_panel.group_button
+        self.merge_button = self.hierarchy_panel.merge_button
+        self.rename_button = self.hierarchy_panel.rename_button
+        self.split_button = self.hierarchy_panel.split_button
+        self.lock_button = self.hierarchy_panel.lock_button
+        self.reject_button = self.hierarchy_panel.reject_button
+        self.reset_groups_button = self.hierarchy_panel.reset_button
         self.breadcrumbs_row = ft.Row(
             spacing=0,
             scroll=ft.ScrollMode.AUTO,
@@ -547,129 +517,39 @@ class Shell:
             top=16,
         )
         self._hovered_id: str | None = None
-        self.edit_kind = ft.Dropdown(
-            value="rename",
-            label="Edit command",
-            dense=True,
-            options=[
-                ft.DropdownOption(key="rename", text="Rename node"),
-                ft.DropdownOption(key="attribute", text="Set attribute"),
-                ft.DropdownOption(key="operator", text="Replace operator"),
-                ft.DropdownOption(key="insert", text="Insert unary"),
-                ft.DropdownOption(key="remove", text="Remove unary"),
-                ft.DropdownOption(key="reconnect", text="Reconnect input"),
-            ],
+        self.edit_panel = EditPanel(
+            on_validate=self._on_validate_edit,
+            on_commit=self._on_commit_edit,
+            on_reject=self._on_reject_edit,
+            on_undo=self._on_undo_edit,
+            on_redo=self._on_redo_edit,
+            on_export=self._on_export_clicked,
         )
-        self.edit_primary = ft.TextField(label="Name / operator / value ID", dense=True)
-        self.edit_secondary = ft.TextField(label="Value / domain", dense=True)
-        self.edit_attribute_kind = ft.Dropdown(
-            value=AttrKind.STRING.value,
-            label="Attribute type",
-            dense=True,
-            options=[
-                ft.DropdownOption(key=kind.value, text=kind.value)
-                for kind in (
-                    AttrKind.INT,
-                    AttrKind.FLOAT,
-                    AttrKind.STRING,
-                    AttrKind.INTS,
-                    AttrKind.FLOATS,
-                    AttrKind.STRINGS,
-                )
-            ],
+        self.edit_kind = self.edit_panel.kind
+        self.edit_primary = self.edit_panel.primary
+        self.edit_secondary = self.edit_panel.secondary
+        self.edit_attribute_kind = self.edit_panel.attribute_kind
+        self.edit_port = self.edit_panel.port
+        self.validate_edit_button = self.edit_panel.validate_button
+        self.commit_edit_button = self.edit_panel.commit_button
+        self.reject_edit_button = self.edit_panel.reject_button
+        self.undo_edit_button = self.edit_panel.undo_button
+        self.redo_edit_button = self.edit_panel.redo_button
+        self.export_button = self.edit_panel.export_button
+        self.edit_findings = self.edit_panel.findings
+        self.transformation_panel = TransformationPanel(
+            on_preview=self._on_preview_transformation,
+            on_commit=self._on_commit_transformation,
+            on_reject=self._on_reject_transformation,
         )
-        self.edit_port = ft.TextField(label="Input port", value="0", dense=True)
-        self.validate_edit_button = ft.FilledButton(
-            content="Validate",
-            on_click=self._on_validate_edit,
-            disabled=True,
-        )
-        self.commit_edit_button = ft.FilledButton(
-            content="Commit",
-            on_click=self._on_commit_edit,
-            disabled=True,
-        )
-        self.reject_edit_button = ft.TextButton(
-            content="Reject",
-            on_click=self._on_reject_edit,
-            disabled=True,
-        )
-        self.undo_edit_button = ft.TextButton(
-            content="Undo",
-            on_click=self._on_undo_edit,
-            disabled=True,
-        )
-        self.redo_edit_button = ft.TextButton(
-            content="Redo",
-            on_click=self._on_redo_edit,
-            disabled=True,
-        )
-        self.export_button = ft.TextButton(
-            content="Export…",
-            on_click=self._on_export_clicked,
-            disabled=True,
-        )
-        self.edit_findings = ft.ListView(height=90, spacing=1)
-        self.transformation_kind = ft.Dropdown(
-            value="weight-quantization",
-            label="Transformation",
-            dense=True,
-            options=[
-                ft.DropdownOption(
-                    key="weight-quantization",
-                    text="8-bit dequantized weight",
-                ),
-                ft.DropdownOption(key="graph-quantization", text="ONNX Q/DQ"),
-                ft.DropdownOption(key="threshold-pruning", text="Threshold pruning"),
-                ft.DropdownOption(key="mask-pruning", text="Explicit mask pruning"),
-                ft.DropdownOption(key="nm-pruning", text="2:4 logical pruning"),
-                ft.DropdownOption(
-                    key="structured-pruning",
-                    text="Terminal MatMul channels",
-                ),
-            ],
-        )
-        self.transformation_granularity = ft.Dropdown(
-            value=Granularity.PER_TENSOR.value,
-            label="Quantization granularity",
-            dense=True,
-            options=[
-                ft.DropdownOption(
-                    key=Granularity.PER_TENSOR.value,
-                    text="Per tensor",
-                ),
-                ft.DropdownOption(
-                    key=Granularity.PER_CHANNEL.value,
-                    text="Per channel",
-                ),
-            ],
-        )
-        self.transformation_axis = ft.TextField(
-            label="Channel axis",
-            value="0",
-            dense=True,
-        )
-        self.transformation_parameter = ft.TextField(
-            label="Threshold / mask / kept channels",
-            value="0.1",
-            dense=True,
-        )
-        self.preview_transformation_button = ft.FilledButton(
-            content="Preview",
-            on_click=self._on_preview_transformation,
-            disabled=True,
-        )
-        self.commit_transformation_button = ft.FilledButton(
-            content="Apply",
-            on_click=self._on_commit_transformation,
-            disabled=True,
-        )
-        self.reject_transformation_button = ft.TextButton(
-            content="Reject",
-            on_click=self._on_reject_transformation,
-            disabled=True,
-        )
-        self.transformation_findings = ft.ListView(height=125, spacing=1)
+        self.transformation_kind = self.transformation_panel.kind
+        self.transformation_granularity = self.transformation_panel.granularity
+        self.transformation_axis = self.transformation_panel.axis
+        self.transformation_parameter = self.transformation_panel.parameter
+        self.preview_transformation_button = self.transformation_panel.preview_button
+        self.commit_transformation_button = self.transformation_panel.commit_button
+        self.reject_transformation_button = self.transformation_panel.reject_button
+        self.transformation_findings = self.transformation_panel.findings
         self.file_types_button = ft.TextButton(
             content="File types",
             icon=ft.Icons.SETTINGS_APPLICATIONS_ROUNDED,
@@ -683,6 +563,7 @@ class Shell:
             picker=self.picker,
             palette=self.palette,
             assign=self._assign_generated_input,
+            assign_many=self._assign_generated_inputs,
             on_error=self._show_error,
             on_status=self._set_status,
             clear_error=self._clear_error,
@@ -735,61 +616,8 @@ class Shell:
             watch_text_focus=self._watch_text_focus,
         )
 
-        self._edit_controls = ft.Column(
-            controls=[
-                self.edit_kind,
-                self.edit_primary,
-                self.edit_secondary,
-                ft.Row(
-                    controls=[self.edit_attribute_kind, self.edit_port],
-                    spacing=6,
-                ),
-                ft.Row(
-                    controls=[
-                        self.validate_edit_button,
-                        self.commit_edit_button,
-                        self.reject_edit_button,
-                    ],
-                    wrap=True,
-                    spacing=4,
-                ),
-                ft.Row(
-                    controls=[
-                        self.undo_edit_button,
-                        self.redo_edit_button,
-                        self.export_button,
-                    ],
-                    wrap=True,
-                    spacing=2,
-                ),
-                self.edit_findings,
-            ],
-            spacing=8,
-        )
-        self._transformation_controls = ft.Column(
-            controls=[
-                self.transformation_kind,
-                self.transformation_granularity,
-                ft.Row(
-                    controls=[
-                        self.transformation_axis,
-                        self.transformation_parameter,
-                    ],
-                    spacing=6,
-                ),
-                ft.Row(
-                    controls=[
-                        self.preview_transformation_button,
-                        self.commit_transformation_button,
-                        self.reject_transformation_button,
-                    ],
-                    wrap=True,
-                    spacing=4,
-                ),
-                self.transformation_findings,
-            ],
-            spacing=8,
-        )
+        self._edit_controls = self.edit_panel.control
+        self._transformation_controls = self.transformation_panel.control
         self.loading_title = ft.Text(
             "Preparing model",
             size=18,
@@ -810,11 +638,8 @@ class Shell:
         for text_field in (
             self.group_label_field,
             self.search_field,
-            self.edit_primary,
-            self.edit_secondary,
-            self.edit_port,
-            self.transformation_axis,
-            self.transformation_parameter,
+            *self.edit_panel.text_fields,
+            *self.transformation_panel.text_fields,
         ):
             self._watch_text_focus(text_field)
 
@@ -1243,24 +1068,13 @@ class Shell:
             activations_section=activations_section,
         )
         self.left_panel.visible = left_visible
-        hierarchy_tools = shell_layout.build_hierarchy_tools(
-            multi_select_field=self.multi_select_field,
-            group_label_field=self.group_label_field,
-            group_button=self.group_button,
-            merge_button=self.merge_button,
-            rename_button=self.rename_button,
-            split_button=self.split_button,
-            lock_button=self.lock_button,
-            reject_button=self.reject_button,
-            reset_groups_button=self.reset_groups_button,
-        )
         self.right_panel = shell_layout.build_right_panel(
             palette=self.palette,
             search_field=self.search_field,
             search_results=self.search_results,
             graph_list=self.graph_list,
             hierarchy_list=self.hierarchy_list,
-            hierarchy_tools=hierarchy_tools,
+            hierarchy_tools=self.hierarchy_panel.tools,
             minimap=self.minimap,
         )
         self.right_panel.visible = right_visible
@@ -1496,6 +1310,7 @@ class Shell:
         self.trace.palette = self.palette
         self.input_generator.palette = self.palette
         self.watch.palette = self.palette
+        self.hierarchy_panel.set_palette(self.palette)
         self._apply_palette_to_controls()
         old_root = self._root
         self._compose_chrome()
@@ -1569,18 +1384,35 @@ class Shell:
         input_name: str,
         generated: GeneratedTensor,
     ) -> None:
+        self._assign_generated_inputs(((input_name, generated),))
+
+    def _assign_generated_inputs(
+        self,
+        generated_inputs: Sequence[tuple[str, GeneratedTensor]],
+    ) -> None:
+        """Validate a complete generated set before mutating trace bindings."""
         if self.session is None:
             raise ValueError("the model was closed before assignment")
-        binding = self.session.trace_tensor_input(input_name, generated.path)
-        self.trace.bind_tensor(input_name, binding)
+        if not generated_inputs:
+            raise ValueError("no generated model inputs were supplied")
+        bindings = tuple(
+            (
+                input_name,
+                self.session.trace_tensor_input(input_name, generated.path),
+            )
+            for input_name, generated in generated_inputs
+        )
+        for input_name, binding in bindings:
+            self.trace.bind_tensor(input_name, binding)
         self.trace.refresh_graph_actions()
         self.trace.refresh_actions()
         graph = self.session.document.main_graph
+        last_input_name = bindings[-1][0]
         value_id = next(
             value_id
             for value_id in graph.inputs
             if value_id not in graph.initializers
-            and (graph.value(value_id).name or value_id) == input_name
+            and (graph.value(value_id).name or value_id) == last_input_name
         )
         if self.current_graph != self.session.document.entry_graph:
             self._show_graph(self.session.document.entry_graph)
@@ -1762,8 +1594,7 @@ class Shell:
         self._saved_revision_id = None
         self.current_graph = None
         self.current_root_group = None
-        self._hierarchy_expanded.clear()
-        self._hierarchy_highlight = frozenset()
+        self.hierarchy_panel.clear()
         self.current_slice = None
         self.logical_selection = frozenset()
         self.minimap_model = None
@@ -1780,7 +1611,6 @@ class Shell:
         self.search_field.value = ""
         self.search_results.controls = []
         self.graph_list.controls = []
-        self.hierarchy_list.controls = []
         self.breadcrumbs_row.controls = []
         self.trace.graph_actions.controls = []
         self.minimap_canvas.shapes = []
@@ -2379,7 +2209,7 @@ class Shell:
         self.current_graph = session.document.entry_graph
         self.current_root_group = None
         # Expansion state describes the outgoing model's groups.
-        self._hierarchy_expanded.clear()
+        self.hierarchy_panel.reset_expansion()
         self.current_detail = DetailLevel.ARCHITECTURE
         self.auto_detail = False
         self._sync_detail_controls()
@@ -3015,22 +2845,18 @@ class Shell:
 
     def _transformation_request(self) -> TransformationRequest:
         assert self.session is not None and self.current_graph is not None
-        kind = self.transformation_kind.value or "weight-quantization"
         node_id = self._selected_operator_id()
         if node_id is None:
             raise ValueError("select exactly one operator before transforming")
-        parameter = (self.transformation_parameter.value or "").strip()
-        tensor_id = None if kind == "structured-pruning" else self._selected_weight_id()
-        return viewmodel.transformation_request(
-            kind=kind,
+        tensor_id = (
+            None
+            if self.transformation_panel.selected_kind == "structured-pruning"
+            else self._selected_weight_id()
+        )
+        return self.transformation_panel.request(
             graph_id=self.current_graph,
             node_id=node_id,
             tensor_id=tensor_id,
-            granularity_value=(
-                self.transformation_granularity.value or Granularity.PER_TENSOR.value
-            ),
-            axis_value=self.transformation_axis.value or "0",
-            parameter=parameter,
         )
 
     def _on_preview_transformation(self, event: ft.Event[ft.Button]) -> None:
@@ -3168,46 +2994,7 @@ class Shell:
         node_id = self._selected_operator_id()
         if node_id is None:
             raise ValueError("select exactly one operator before editing")
-        kind = self.edit_kind.value or "rename"
-        primary = (self.edit_primary.value or "").strip()
-        secondary = self.edit_secondary.value or ""
-        port = int(self.edit_port.value or "0")
-        if kind == "rename":
-            return RenameNodeRequest(self.current_graph, node_id, primary)
-        if kind == "attribute":
-            attribute_kind = AttrKind(
-                self.edit_attribute_kind.value or AttrKind.STRING.value
-            )
-            return SetAttributeRequest(
-                self.current_graph,
-                node_id,
-                primary,
-                attribute_kind,
-                parse_attribute_value(attribute_kind, secondary),
-            )
-        if kind == "operator":
-            return ReplaceOperatorRequest(
-                self.current_graph,
-                node_id,
-                primary,
-                secondary.strip(),
-            )
-        if kind == "insert":
-            return InsertUnaryRequest(
-                self.current_graph,
-                node_id,
-                port,
-                primary,
-                secondary.strip(),
-            )
-        if kind == "remove":
-            return RemoveUnaryRequest(self.current_graph, node_id)
-        return ReconnectInputRequest(
-            self.current_graph,
-            node_id,
-            port,
-            primary,
-        )
+        return self.edit_panel.request(self.current_graph, node_id)
 
     def _on_validate_edit(self, event: ft.Event[ft.Button]) -> None:
         assert self.session is not None
@@ -3522,178 +3309,72 @@ class Shell:
         )
         self.close_model_button.visible = session is not None
 
-    def _hierarchy_selection_ids(self, hierarchy: Hierarchy) -> frozenset[str]:
-        """The deepest group per branch the renderer selection maps into.
+    @property
+    def _hierarchy_expanded(self) -> dict[str, bool]:
+        """Compatibility view of hierarchy expansion state."""
+        return self.hierarchy_panel.expanded
 
-        A selected group glyph names its group directly; a selected node
-        highlights its most specific containing group. Ancestors of another
-        highlighted group are pruned so exactly one row lights up per branch.
-        """
-        highlighted: set[str] = set()
-        for item in self.renderer.selection:
-            if hierarchy.has_group(item):
-                highlighted.add(item)
-                continue
-            containers = hierarchy.groups_for_node(item)
-            if containers:
-                highlighted.add(containers[0].id)
-        ancestors: set[str] = set()
-        for group_id in highlighted:
-            ancestors.update(item.id for item in hierarchy.breadcrumbs(group_id)[:-1])
-        return frozenset(highlighted - ancestors)
+    @property
+    def _hierarchy_highlight(self) -> frozenset[str]:
+        """Compatibility view of hierarchy highlight state."""
+        return self.hierarchy_panel.highlight
+
+    def _hierarchy_selection_ids(self, hierarchy: Hierarchy) -> frozenset[str]:
+        return self.hierarchy_panel.selection_ids(hierarchy, self.renderer.selection)
 
     def _sync_hierarchy_selection(self) -> None:
         """Rebuild the Blocks pane only when its highlight actually changed."""
         if self.session is None or self.current_graph is None:
             return
         hierarchy = self.session.graph_hierarchy(self.current_graph)
-        if self._hierarchy_selection_ids(hierarchy) != self._hierarchy_highlight:
+        if self._hierarchy_selection_ids(hierarchy) != self.hierarchy_panel.highlight:
             self._refresh_hierarchy()
 
     def _refresh_hierarchy(self) -> None:
         if self.session is None or self.current_graph is None:
             return
         hierarchy = self.session.graph_hierarchy(self.current_graph)
-        highlight = self._hierarchy_selection_ids(hierarchy)
-        if highlight != self._hierarchy_highlight:
-            # Ancestors open only when the highlight itself moves, so the
-            # highlighted row is visible yet a user can still collapse the
-            # branch above it afterwards.
-            for group_id in highlight:
-                for ancestor in hierarchy.breadcrumbs(group_id)[:-1]:
-                    self._hierarchy_expanded[ancestor.id] = True
-            self._hierarchy_highlight = highlight
         graph = self.session.document.graphs.get(self.current_graph)
         node_order: dict[str, int] = (
             {node.id: index for index, node in enumerate(graph.nodes)}
             if graph is not None
             else {}
         )
-        unknown = len(node_order)
-
-        def sort_key(group: Group) -> tuple[int, tuple[tuple[int, int, str], ...]]:
-            # Graph position first — the group's earliest member in the
-            # serialized node order — then a numeric-aware label so equally
-            # placed blocks still read "2" before "10".
-            position = min(
-                (node_order.get(member, unknown) for member in group.members),
-                default=unknown,
-            )
-            return (position, _natural_key(group.label))
-
-        rows: list[ft.Control] = []
-        visible = 0
-
-        def add(group_id: str, depth: int) -> None:
-            nonlocal visible
-            group = hierarchy.group(group_id)
-            children = (
-                sorted(hierarchy.children(group.id), key=sort_key)
-                if depth + 1 < _MAX_HIERARCHY_DEPTH
-                else []
-            )
-            visible += 1
-            if visible <= _MAX_EXPLORER_ROWS:
-                rows.append(self._hierarchy_row(group, depth, bool(children)))
-            if children and self._hierarchy_expanded.get(group.id, depth == 0):
-                for child in children:
-                    add(child.id, depth + 1)
-
-        for root in sorted(hierarchy.roots, key=sort_key):
-            add(root.id, 0)
-        if not rows:
-            rows.append(ft.Text("No groups detected", size=11))
-        elif visible > _MAX_EXPLORER_ROWS:
-            rows.append(
-                ft.Text(
-                    f"{visible - _MAX_EXPLORER_ROWS:,} more… Use search or "
-                    "the graph to inspect the rest.",
-                    size=10,
-                    color=self.palette.muted,
-                )
-            )
-        self.hierarchy_list.controls = rows
+        self.hierarchy_panel.refresh(
+            hierarchy=hierarchy,
+            node_order=node_order,
+            selection=self.renderer.selection,
+            current_root_group=self.current_root_group,
+            max_rows=_MAX_EXPLORER_ROWS,
+            max_depth=_MAX_HIERARCHY_DEPTH,
+            indent=_EXPLORER_INDENT,
+        )
 
     def _hierarchy_row(
         self, group: Group, depth: int, has_children: bool
     ) -> ft.Control:
-        """One Blocks-pane row: an optional chevron plus the select button."""
-        selected = group.id in self._hierarchy_highlight
-        active = group.id == self.current_root_group
-        label = ft.TextButton(
-            content=f"{group.label}  ·  {len(group.members)} ops",
-            icon=ft.Icons.GRID_VIEW_ROUNDED,
-            tooltip=group.explanation,
-            data=f"hierarchy-row:{group.id}",
-            style=ft.ButtonStyle(
-                color=(self.palette.accent if selected or active else self.palette.ink),
-                bgcolor=(
-                    self.palette.accent_soft if active and not selected else "#00FFFFFF"
-                ),
-                shape=ft.RoundedRectangleBorder(radius=9),
-                alignment=ft.Alignment.CENTER_LEFT,
-            ),
-            on_click=self._group_handler(group.id),
-        )
-        row: ft.Control = label
-        if has_children or depth:
-            controls: list[ft.Control] = []
-            if depth:
-                controls.append(ft.Container(width=depth * _EXPLORER_INDENT))
-            if has_children:
-                expanded = self._hierarchy_expanded.get(group.id, depth == 0)
-                controls.append(
-                    ft.IconButton(
-                        icon=(
-                            ft.Icons.EXPAND_MORE_ROUNDED
-                            if expanded
-                            else ft.Icons.CHEVRON_RIGHT_ROUNDED
-                        ),
-                        icon_size=16,
-                        icon_color=self.palette.muted,
-                        tooltip="Collapse" if expanded else "Expand",
-                        data=f"hierarchy-toggle:{group.id}",
-                        on_click=self._hierarchy_toggle_handler(group.id, depth),
-                    )
-                )
-            controls.append(label)
-            row = ft.Row(
-                controls=controls,
-                spacing=0,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            )
-        if not selected:
-            return row
-        # The selection wash covers the whole row, indent and chevron
-        # included, which keeps it distinct from the drilled-in root's
-        # button-only chip; when a row is both, the selection look wins.
-        return ft.Container(
-            content=row,
-            bgcolor=self.palette.accent_soft,
-            border_radius=9,
-            data=f"hierarchy-selected:{group.id}",
+        return self.hierarchy_panel.build_row(
+            group,
+            depth,
+            has_children,
+            current_root_group=self.current_root_group,
+            indent=_EXPLORER_INDENT,
         )
 
     def _hierarchy_toggle_handler(
         self, group_id: str, depth: int
     ) -> Callable[[ft.Event[ft.IconButton]], None]:
-        def toggle(event: ft.Event[ft.IconButton]) -> None:
-            expanded = self._hierarchy_expanded.get(group_id, depth == 0)
-            self._hierarchy_expanded[group_id] = not expanded
-            self._refresh_hierarchy()
-            self.page.update()
-
-        return toggle
+        return self.hierarchy_panel.toggle_handler(group_id, depth)
 
     def _group_handler(
         self, group_id: str
     ) -> Callable[[ft.Event[ft.TextButton]], None]:
-        def navigate(event: ft.Event[ft.TextButton]) -> None:
-            self.show_group(group_id)
-            self._refresh_inspector(frozenset({group_id}))
-            self.page.update()
+        return self.hierarchy_panel.navigate_handler(group_id)
 
-        return navigate
+    def _navigate_hierarchy_group(self, group_id: str) -> None:
+        self.show_group(group_id)
+        self._refresh_inspector(frozenset({group_id}))
+        self.page.update()
 
     def _refresh_breadcrumbs(self) -> None:
         if self.session is None or self.current_graph is None:

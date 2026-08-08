@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ import flet as ft
 from nneditor.input_generation import (
     GeneratedTensor,
     InputGenerationError,
+    SyntheticDistribution,
     generate_csv_tensor,
     generate_image_tensor,
     generate_mask_tensor,
@@ -33,7 +35,31 @@ from nneditor.tokenization import (
 )
 from nneditor.ui.shell_layout import ShellPalette
 
-__all__ = ["InputTarget", "TestInputWorkspace", "build_input_workspace"]
+__all__ = [
+    "InputGeneratorPreset",
+    "InputTarget",
+    "TestInputWorkspace",
+    "build_input_workspace",
+    "preset_for_target",
+]
+
+_SUPPORTED_DTYPES = frozenset(
+    {
+        "bool",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "float16",
+        "float32",
+        "float64",
+    }
+)
+_TOKEN_DTYPES = frozenset({"int32", "int64", "uint32", "uint64"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +72,102 @@ class InputTarget:
     is_mask: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class InputGeneratorPreset:
+    """A concrete, disclosed generator plan for one model input."""
+
+    target: InputTarget
+    kind: str
+    shape: tuple[int, ...] | None
+    dtype: str | None
+    distribution: SyntheticDistribution
+    assumptions: tuple[str, ...] = ()
+    unavailable_reason: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.unavailable_reason is None
+
+
+def preset_for_target(target: InputTarget) -> InputGeneratorPreset:
+    """Infer a bounded generator preset without reading model payloads."""
+    if target.element_type not in _SUPPORTED_DTYPES:
+        return InputGeneratorPreset(
+            target=target,
+            kind="tensor",
+            shape=None,
+            dtype=target.element_type,
+            distribution="zeros",
+            unavailable_reason=(
+                "the declared dtype is unknown"
+                if target.element_type is None
+                else f"dtype {target.element_type!r} is not supported"
+            ),
+        )
+    if target.shape is None:
+        return InputGeneratorPreset(
+            target=target,
+            kind="tensor",
+            shape=None,
+            dtype=target.element_type,
+            distribution="zeros",
+            unavailable_reason="the model does not declare an input shape",
+        )
+    if not target.shape:
+        return InputGeneratorPreset(
+            target=target,
+            kind="tensor",
+            shape=None,
+            dtype=target.element_type,
+            distribution="zeros",
+            unavailable_reason="scalar input generation is not supported",
+        )
+    if any(isinstance(extent, int) and extent <= 0 for extent in target.shape):
+        return InputGeneratorPreset(
+            target=target,
+            kind="tensor",
+            shape=None,
+            dtype=target.element_type,
+            distribution="zeros",
+            unavailable_reason="the declared shape contains a non-positive extent",
+        )
+    symbolic = tuple(extent for extent in target.shape if not isinstance(extent, int))
+    shape = tuple(extent if isinstance(extent, int) else 1 for extent in target.shape)
+    assumptions = ("symbolic or unknown extents default to 1",) if symbolic else ()
+    name = target.name.casefold()
+    distribution: SyntheticDistribution
+    if target.is_mask:
+        kind = "mask"
+        distribution = "ones"
+    elif len(shape) == 2 and target.element_type in _TOKEN_DTYPES:
+        kind = "text-tokens"
+        distribution = "zeros"
+    elif _looks_like_image(shape, name):
+        kind = "image"
+        distribution = "normal"
+    else:
+        kind = "tensor"
+        distribution = "normal" if target.element_type.startswith("float") else "zeros"
+    return InputGeneratorPreset(
+        target=target,
+        kind=kind,
+        shape=shape,
+        dtype=target.element_type,
+        distribution=distribution,
+        assumptions=assumptions,
+    )
+
+
+def _looks_like_image(shape: tuple[int, ...], name: str) -> bool:
+    if "pixel" in name or "image" in name:
+        return len(shape) in {2, 3, 4}
+    if len(shape) == 4:
+        return shape[1] in {1, 3} or shape[3] in {1, 3}
+    if len(shape) == 3:
+        return shape[0] in {1, 3} or shape[2] in {1, 3}
+    return len(shape) == 2
+
+
 class TestInputWorkspace:
     """Own the generator form, safe publication, and target defaults."""
 
@@ -56,6 +178,7 @@ class TestInputWorkspace:
         picker: ft.FilePicker,
         palette: ShellPalette,
         assign: Callable[[str, GeneratedTensor], None],
+        assign_many: Callable[[Sequence[tuple[str, GeneratedTensor]]], None],
         on_error: Callable[[str], None],
         on_status: Callable[[str], None],
         clear_error: Callable[[], None],
@@ -65,18 +188,24 @@ class TestInputWorkspace:
         self.picker = picker
         self.palette = palette
         self._assign = assign
+        self._assign_many = assign_many
         self._on_error = on_error
         self._on_status = on_status
         self._clear_error = clear_error
         self._watch_text_focus = watch_text_focus
         self._targets: dict[str, InputTarget] = {}
+        self.input_presets: dict[str, InputGeneratorPreset] = {}
         self._can_assign = False
 
         self.kind = ft.Dropdown(
-            value="image",
+            value="automatic",
             label="Input source",
             dense=True,
             options=[
+                ft.DropdownOption(
+                    key="automatic",
+                    text="Automatic from input",
+                ),
                 ft.DropdownOption(key="image", text="Image file"),
                 ft.DropdownOption(key="mask", text="Mask"),
                 ft.DropdownOption(key="text-tokens", text="Text tokens"),
@@ -93,6 +222,37 @@ class TestInputWorkspace:
             options=[],
             disabled=True,
             on_select=self._on_target_changed,
+        )
+        self.automatic_summary = ft.Text(
+            "Open a model to infer an input tensor.",
+            size=11,
+            color=palette.ink,
+            selectable=True,
+        )
+        self.automatic_section = ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Text(
+                        "Automatic model-input tensor",
+                        size=13,
+                        weight=ft.FontWeight.W_700,
+                        color=palette.ink,
+                    ),
+                    self.automatic_summary,
+                    ft.Text(
+                        "Choose another input source above to provide an image, "
+                        "text, tabular data, or custom tensor values instead.",
+                        size=10,
+                        color=palette.muted,
+                    ),
+                ],
+                spacing=6,
+            ),
+            padding=12,
+            bgcolor=palette.canvas,
+            border=ft.Border.all(1, palette.border),
+            border_radius=10,
+            visible=False,
         )
 
         self.image_path = self._field(
@@ -381,6 +541,7 @@ class TestInputWorkspace:
             visible=False,
         )
         self.sections = (
+            self.automatic_section,
             self.image_section,
             self.mask_section,
             self.token_section,
@@ -399,6 +560,22 @@ class TestInputWorkspace:
             on_click=self._on_generate_and_assign,
             disabled=True,
         )
+        self.generate_all_and_assign_button = ft.FilledButton(
+            content="Generate & assign all detected inputs",
+            icon=ft.Icons.AUTO_AWESOME_ROUNDED,
+            on_click=self._on_generate_all_and_assign,
+            disabled=True,
+        )
+        self.detected_inputs = ft.Column(
+            controls=[
+                ft.Text(
+                    "Open a model to detect and configure its inputs.",
+                    size=11,
+                    color=palette.muted,
+                )
+            ],
+            spacing=4,
+        )
         self.status = ft.Text(
             "Configure a source, then choose where to save the .npy file.",
             size=11,
@@ -414,12 +591,15 @@ class TestInputWorkspace:
             palette=palette,
             kind=self.kind,
             target_input=self.target_input,
+            detected_inputs=self.detected_inputs,
             sections=self.sections,
             generate_button=self.generate_button,
             generate_and_assign_button=self.generate_and_assign_button,
+            generate_all_and_assign_button=self.generate_all_and_assign_button,
             status=self.status,
             summary=self.summary,
         )
+        self._refresh_assign_button()
 
     def refresh_targets(
         self,
@@ -430,6 +610,9 @@ class TestInputWorkspace:
         """Replace model targets and preserve a still-valid selection."""
         previous = self.target_input.value
         self._targets = {target.name: target for target in targets}
+        self.input_presets = {
+            target.name: preset_for_target(target) for target in targets
+        }
         self._can_assign = can_assign
         names = tuple(self._targets)
         self.target_input.options = [
@@ -449,8 +632,58 @@ class TestInputWorkspace:
         self.target_input.hint_text = (
             "Select a model input" if names else "Open a model to select an input"
         )
+        self.detected_inputs.controls = self._detected_input_rows(targets)
         self._apply_target_defaults()
         self._refresh_assign_button()
+
+    def _detected_input_rows(self, targets: Sequence[InputTarget]) -> list[ft.Control]:
+        if not targets:
+            return [
+                ft.Text(
+                    "Open a model to detect and configure its inputs.",
+                    size=11,
+                    color=self.palette.muted,
+                )
+            ]
+        rows: list[ft.Control] = [
+            ft.Text(
+                f"Detected {len(targets)} model input"
+                f"{'s' if len(targets) != 1 else ''}",
+                size=13,
+                weight=ft.FontWeight.W_700,
+                color=self.palette.ink,
+            )
+        ]
+        for target in targets:
+            preset = self.input_presets[target.name]
+            if preset.ready:
+                details = f"{preset.kind} | {preset.dtype} | {preset.shape}" + (
+                    f" | {', '.join(preset.assumptions)}" if preset.assumptions else ""
+                )
+                icon = ft.Icons.CHECK_CIRCLE_OUTLINE_ROUNDED
+            else:
+                details = f"Automatic preset unavailable: {preset.unavailable_reason}"
+                icon = ft.Icons.WARNING_AMBER_ROUNDED
+            rows.append(
+                ft.TextButton(
+                    content=f"{target.name}\n{details}",
+                    icon=icon,
+                    data=f"input-preset:{target.name}",
+                    style=ft.ButtonStyle(alignment=ft.Alignment.CENTER_LEFT),
+                    on_click=self._target_handler(target.name),
+                )
+            )
+        return rows
+
+    def _target_handler(
+        self, target_name: str
+    ) -> Callable[[ft.Event[ft.TextButton]], None]:
+        def select(event: ft.Event[ft.TextButton]) -> None:
+            self.target_input.value = target_name
+            self._on_target_changed(None)
+            self.page.update()
+
+        return select
 
     def _build_token_section(self, palette: ShellPalette) -> ft.Container:
         """Build the language-model token-id form and its codebook slots.
@@ -632,13 +865,48 @@ class TestInputWorkspace:
     def _on_kind_changed(self, event: ft.Event[ft.Dropdown] | None) -> None:
         selected = self.kind.value or "image"
         for key, section in zip(
-            ("image", "mask", "text-tokens", "csv", "time-series", "tensor"),
+            (
+                "automatic",
+                "image",
+                "mask",
+                "text-tokens",
+                "csv",
+                "time-series",
+                "tensor",
+            ),
             self.sections,
             strict=True,
         ):
             section.visible = key == selected
+        self._refresh_automatic_summary()
+        self._refresh_assign_button()
         if event is not None:
             self.page.update()
+
+    def _refresh_automatic_summary(self) -> None:
+        preset = self.input_presets.get(self.target_input.value or "")
+        if preset is None:
+            self.automatic_summary.value = "Select a detected model input first."
+            return
+        if not preset.ready:
+            self.automatic_summary.value = (
+                f"Automatic generation unavailable: {preset.unavailable_reason}."
+            )
+            return
+        assumptions = (
+            f" Assumption: {', '.join(preset.assumptions)}."
+            if preset.assumptions
+            else ""
+        )
+        values = (
+            "all-valid values"
+            if preset.kind == "mask"
+            else f"deterministic {preset.distribution} synthetic values"
+        )
+        self.automatic_summary.value = (
+            f"{preset.target.name}: {values}, shape {preset.shape}, "
+            f"dtype {preset.dtype}.{assumptions}"
+        )
 
     def _on_codebook_changed(self, event: ft.Event[ft.Dropdown] | None) -> None:
         self._refresh_token_choice()
@@ -759,8 +1027,148 @@ class TestInputWorkspace:
     async def _on_generate_and_assign(self, event: ft.Event[ft.Button]) -> None:
         await self.generate(assign=True)
 
+    async def _on_generate_all_and_assign(self, event: ft.Event[ft.Button]) -> None:
+        await self.generate_all_and_assign()
+
+    async def generate_all_and_assign(self) -> None:
+        """Generate every ready preset into one directory and bind them."""
+        presets = tuple(self.input_presets.values())
+        unavailable = tuple(preset for preset in presets if not preset.ready)
+        if not self._can_assign or not presets:
+            self._on_error("Open a desktop model with declared inputs first.")
+            self.page.update()
+            return
+        if unavailable:
+            names = ", ".join(preset.target.name for preset in unavailable)
+            self._on_error(
+                "Automatic generation is unavailable for these inputs: "
+                f"{names}. Generate them individually."
+            )
+            self.page.update()
+            return
+        directory = await self.picker.get_directory_path(
+            dialog_title="Choose a directory for generated model inputs"
+        )
+        if directory is None:
+            return
+        self._set_generation_buttons_disabled(True)
+        self.status.value = f"Generating {len(presets)} configured model inputs..."
+        self.page.update()
+        generated: tuple[tuple[str, GeneratedTensor], ...] = ()
+        try:
+            generated = await asyncio.to_thread(
+                self.generate_configured_inputs,
+                Path(directory),
+            )
+            self._assign_many(generated)
+        except (InputGenerationError, OSError, TypeError, ValueError) as error:
+            if generated:
+                self._on_error(f"Generated every input, but assignment failed: {error}")
+                self.status.value = (
+                    f"Generated {len(generated)} inputs; assignment failed."
+                )
+            else:
+                self._on_error(f"Could not generate all model inputs: {error}")
+                self.status.value = "Input-set generation failed."
+        else:
+            self._clear_error()
+            self.status.value = f"Generated and assigned {len(generated)} model inputs"
+            self.summary.value = "\n".join(
+                f"{name}: {tensor.path.name} | shape={tensor.shape} | "
+                f"dtype={tensor.dtype}"
+                for name, tensor in generated
+            )
+            self._on_status(str(self.status.value))
+        finally:
+            self._set_generation_buttons_disabled(False)
+            self.page.update()
+
+    def generate_configured_inputs(
+        self, directory: Path
+    ) -> tuple[tuple[str, GeneratedTensor], ...]:
+        """Publish the complete detected-input plan without overwriting files."""
+        target_directory = directory.expanduser().resolve()
+        if not target_directory.is_dir():
+            raise InputGenerationError(
+                f"destination directory does not exist: {target_directory}"
+            )
+        planned = tuple(
+            (
+                preset,
+                target_directory / self._preset_filename(index, preset.target.name),
+            )
+            for index, preset in enumerate(self.input_presets.values())
+        )
+        existing = tuple(path.name for _preset, path in planned if path.exists())
+        if existing:
+            raise InputGenerationError(
+                "automatic input generation never overwrites existing files: "
+                + ", ".join(existing)
+            )
+        generated: list[tuple[str, GeneratedTensor]] = []
+        try:
+            for preset, destination in planned:
+                generated.append(
+                    (
+                        preset.target.name,
+                        self._generate_preset(preset, destination),
+                    )
+                )
+        except BaseException:
+            for _name, tensor in generated:
+                tensor.path.unlink(missing_ok=True)
+            raise
+        return tuple(generated)
+
+    @staticmethod
+    def _generate_preset(
+        preset: InputGeneratorPreset, destination: Path
+    ) -> GeneratedTensor:
+        if not preset.ready or preset.shape is None or preset.dtype is None:
+            raise InputGenerationError(
+                f"input {preset.target.name!r} has no complete generator preset"
+            )
+        if preset.kind == "mask":
+            return generate_mask_tensor(
+                destination,
+                shape=preset.shape,
+                fill="ones",
+                dtype=preset.dtype,
+                seed=0,
+            )
+        return generate_synthetic_tensor(
+            destination,
+            shape=preset.shape,
+            distribution=preset.distribution,
+            dtype=preset.dtype,
+            seed=0,
+        )
+
+    @staticmethod
+    def _preset_filename(index: int, target_name: str) -> str:
+        return (
+            f"{index + 1:02d}-{TestInputWorkspace._safe_target_stem(target_name)}.npy"
+        )
+
+    @staticmethod
+    def _safe_target_stem(target_name: str) -> str:
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", target_name).strip(".-_")
+        return (stem or "input")[:80]
+
+    def _set_generation_buttons_disabled(self, disabled: bool) -> None:
+        self.generate_button.disabled = disabled
+        self.generate_and_assign_button.disabled = disabled
+        self.generate_all_and_assign_button.disabled = disabled
+
     async def generate(self, *, assign: bool) -> None:
         """Prompt for a destination, publish, and optionally bind the tensor."""
+        if (self.kind.value or "automatic") == "automatic":
+            try:
+                self._selected_automatic_preset()
+            except InputGenerationError as error:
+                self._on_error(f"Could not generate test input: {error}")
+                self.page.update()
+                return
         if assign and self.target_input.value is None:
             self._on_error("Open a model and select a target input first.")
             self.page.update()
@@ -773,8 +1181,7 @@ class TestInputWorkspace:
         )
         if destination is None:
             return
-        self.generate_button.disabled = True
-        self.generate_and_assign_button.disabled = True
+        self._set_generation_buttons_disabled(True)
         self.status.value = "Generating and validating tensor…"
         self.page.update()
         generated: GeneratedTensor | None = None
@@ -824,7 +1231,12 @@ class TestInputWorkspace:
 
     def generate_current_input(self, destination: Path) -> GeneratedTensor:
         """Create the tensor described by the currently visible form."""
-        kind = self.kind.value or "image"
+        kind = self.kind.value or "automatic"
+        if kind == "automatic":
+            return self._generate_preset(
+                self._selected_automatic_preset(),
+                destination,
+            )
         if kind == "image":
             return generate_image_tensor(
                 self._required_text(self.image_path, "choose an image file"),
@@ -921,6 +1333,20 @@ class TestInputWorkspace:
             seed=self._integer_field(self.tensor_seed, "tensor seed"),
         )
 
+    def _selected_automatic_preset(self) -> InputGeneratorPreset:
+        target_name = self.target_input.value
+        if target_name is None:
+            raise InputGenerationError("Open a model and select a detected input")
+        preset = self.input_presets.get(target_name)
+        if preset is None:
+            raise InputGenerationError(f"input {target_name!r} has no detected preset")
+        if not preset.ready:
+            raise InputGenerationError(
+                f"input {target_name!r} cannot be generated automatically: "
+                f"{preset.unavailable_reason}"
+            )
+        return preset
+
     def _token_codebook(self) -> Codebook:
         """Build the selected codebook, refusing before a needed file is read."""
         choice = self._token_choice()
@@ -964,7 +1390,10 @@ class TestInputWorkspace:
         target_name = self.target_input.value
         target = self._targets.get(target_name or "")
         if target is None:
+            self._on_kind_changed(None)
             return
+        preset = self.input_presets.get(target.name)
+        self.kind.value = "automatic"
         supported_dtypes = {str(option.key) for option in self.tensor_dtype.options}
         if target.element_type in supported_dtypes:
             for dtype_field in (
@@ -980,33 +1409,30 @@ class TestInputWorkspace:
         token_dtypes = {str(option.key) for option in self.token_dtype.options}
         if target.element_type in token_dtypes:
             self.token_dtype.value = target.element_type
-        if target.shape is not None and all(
-            isinstance(extent, int) for extent in target.shape
-        ):
-            shape = tuple(extent for extent in target.shape if isinstance(extent, int))
+        if preset is not None and preset.shape is not None:
+            shape = preset.shape
             shape_text = ",".join(str(extent) for extent in shape)
             self.mask_shape.value = shape_text
             self.tensor_shape.value = shape_text
+            self.tensor_distribution.value = preset.distribution
+            self.mask_fill.value = "ones"
+            self.image_normalization.value = "zero-one"
             if len(shape) == 4 and shape[1] in {1, 3}:
-                self.kind.value = "image"
                 self.image_layout.value = "NCHW"
                 self.image_color.value = "rgb" if shape[1] == 3 else "grayscale"
                 self.image_height.value = str(shape[2])
                 self.image_width.value = str(shape[3])
             elif len(shape) == 4 and shape[3] in {1, 3}:
-                self.kind.value = "image"
                 self.image_layout.value = "NHWC"
                 self.image_color.value = "rgb" if shape[3] == 3 else "grayscale"
                 self.image_height.value = str(shape[1])
                 self.image_width.value = str(shape[2])
             elif len(shape) == 3 and shape[0] in {1, 3}:
-                self.kind.value = "image"
                 self.image_layout.value = "CHW"
                 self.image_color.value = "rgb" if shape[0] == 3 else "grayscale"
                 self.image_height.value = str(shape[1])
                 self.image_width.value = str(shape[2])
             elif len(shape) == 3 and shape[2] in {1, 3}:
-                self.kind.value = "image"
                 self.image_layout.value = "HWC"
                 self.image_color.value = "rgb" if shape[2] == 3 else "grayscale"
                 self.image_height.value = str(shape[0])
@@ -1018,29 +1444,23 @@ class TestInputWorkspace:
                 and "pixel" in target.name.lower()
             ):
                 grid_height, grid_width = self._closest_landscape_patch_grid(shape[0])
-                self.kind.value = "image"
                 self.image_layout.value = "QWEN3VL_PATCHES"
                 self.image_color.value = "rgb"
                 self.image_normalization.value = "minus-one-one"
                 self.image_height.value = str(grid_height * 16)
                 self.image_width.value = str(grid_width * 16)
-                self._on_kind_changed(None)
             elif len(shape) == 2 and target.element_type in token_dtypes:
                 # A rank-2 integer input is a batch of token ids, not a picture.
-                self.kind.value = "text-tokens"
                 self.token_sequence_length.value = str(shape[1])
-                self._on_kind_changed(None)
             elif len(shape) == 2:
-                self.kind.value = "image"
                 self.image_layout.value = "HW"
                 self.image_color.value = "grayscale"
                 self.image_height.value = str(shape[0])
                 self.image_width.value = str(shape[1])
-            if self.kind.value == "image":
-                self._on_kind_changed(None)
-        if target.is_mask:
-            self.kind.value = "mask"
-            self._on_kind_changed(None)
+        else:
+            self.mask_shape.value = ""
+            self.tensor_shape.value = ""
+        self._on_kind_changed(None)
 
     @staticmethod
     def _closest_landscape_patch_grid(patch_count: int) -> tuple[int, int]:
@@ -1057,12 +1477,26 @@ class TestInputWorkspace:
         return min(candidates, key=lambda item: item[1] / item[0])
 
     def _refresh_assign_button(self) -> None:
+        preset = self.input_presets.get(self.target_input.value or "")
+        automatic_unavailable = (self.kind.value or "automatic") == "automatic" and (
+            preset is None or not preset.ready
+        )
+        self.generate_button.disabled = automatic_unavailable
         self.generate_and_assign_button.disabled = (
-            not self._can_assign or self.target_input.value is None
+            not self._can_assign
+            or self.target_input.value is None
+            or automatic_unavailable
+        )
+        self.generate_all_and_assign_button.disabled = (
+            not self._can_assign
+            or not self.input_presets
+            or any(not preset.ready for preset in self.input_presets.values())
         )
 
     def generated_input_name(self) -> str:
-        kind = self.kind.value or "tensor"
+        kind = self.kind.value or "automatic"
+        if kind == "automatic" and self.target_input.value is not None:
+            return f"{self._safe_target_stem(self.target_input.value)}.npy"
         if kind == "image" and self.image_path.value:
             return f"{Path(self.image_path.value).stem}.npy"
         if kind == "csv" and self.csv_path.value:
@@ -1108,9 +1542,11 @@ def build_input_workspace(
     palette: ShellPalette,
     kind: ft.Dropdown,
     target_input: ft.Dropdown,
+    detected_inputs: ft.Column,
     sections: tuple[ft.Container, ...],
     generate_button: ft.FilledButton,
     generate_and_assign_button: ft.FilledButton,
+    generate_all_and_assign_button: ft.FilledButton,
     status: ft.Text,
     summary: ft.Text,
 ) -> ft.Container:
@@ -1154,6 +1590,8 @@ def build_input_workspace(
                     spacing=12,
                 ),
                 ft.Divider(height=20, color=palette.border),
+                detected_inputs,
+                ft.Divider(height=20, color=palette.border),
                 kind,
                 *sections,
                 ft.Divider(height=20, color=palette.border),
@@ -1163,6 +1601,7 @@ def build_input_workspace(
                     wrap=True,
                     spacing=8,
                 ),
+                generate_all_and_assign_button,
             ],
             spacing=12,
         ),

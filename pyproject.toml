@@ -148,7 +148,7 @@ max-statements = 80
 # Export staging/publication and the streaming statistics pass.
 "src/nneditor/adapters/onnx/exporter.py" = ["C901", "PLR0915"]
 "src/nneditor/analysis/statistics.py" = ["C901"]
-# `Shell.__init__` only: 649 -> 564 lines after the panel extractions, still
+# `Shell.__init__` only: 649 -> 403 lines after the panel extractions, still
 # above the statement ceiling. Remaining work is moving control construction
 # into `shell_layout` factories.
 "src/nneditor/ui/app.py" = ["PLR0915"]

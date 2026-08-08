@@ -35,9 +35,9 @@ jobs:
         run: |
           uv run ruff format --check .
           uv run ruff check .
-          uv run mypy
-          uv run pytest -m "not performance" --cov=nneditor --cov-report=term-missing --cov-fail-under=90
-          uv run pytest -m performance tests/performance
+          uv run python -m mypy
+          uv run python -m pytest -m "not performance" --cov=nneditor --cov-report=term-missing --cov-fail-under=90
+          uv run python -m pytest -m performance tests/performance
 
       - name: Validate tag matches package version
         if: github.ref_type == 'tag'

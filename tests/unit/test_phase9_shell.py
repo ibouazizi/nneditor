@@ -20,6 +20,7 @@ from PIL import Image
 from nneditor.analysis.lod import DetailLevel
 from nneditor.application.session import ApplicationService, ModelSession
 from nneditor.desktop.windows_associations import FileAssociationError
+from nneditor.input_generation import InputGenerationError
 from nneditor.tokenization import TOKENIZER_CHOICES, WordHashCodebook
 from nneditor.tracing import (
     ActivationRecord,
@@ -545,11 +546,180 @@ def test_generator_target_switches_mask_inputs_to_all_valid_mask(
         generator.target_input.value = "pixel_mask"
         generator._on_target_changed(None)
 
-        assert generator.kind.value == "mask"
+        assert generator.kind.value == "automatic"
         assert generator.mask_fill.value == "ones"
         assert generator.mask_dtype.value == "int64"
+        assert generator.automatic_section.visible
+        assert "all-valid values" in str(generator.automatic_summary.value)
+
+        generator.kind.value = "mask"
+        generator._on_kind_changed(None)
         assert generator.mask_section.visible
         assert not generator.image_section.visible
+
+
+def test_generator_automatic_source_uses_inferred_shape_without_image_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "masked-image.onnx"
+    destination = tmp_path / "pixel_values.npy"
+    build_masked_image_model(model)
+
+    async def save_file(
+        picker: ft.FilePicker,
+        **kwargs: object,
+    ) -> str:
+        assert kwargs["file_name"] == "pixel_values.npy"
+        return str(destination)
+
+    monkeypatch.setattr(ft.FilePicker, "save_file", save_file)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        shell.show_session(service.open_model(model))
+        generator = shell.input_generator
+
+        assert generator.kind.value == "automatic"
+        assert str(generator.kind.options[0].text) == "Automatic from input"
+        assert generator.image_path.value in {None, ""}
+        asyncio.run(generator._on_generate(cast(Any, SimpleNamespace())))
+
+        generated = np.load(destination, allow_pickle=False)
+        assert generated.shape == (1, 3, 224, 224)
+        assert generated.dtype == np.dtype("float32")
+        assert generator.status.value == "Saved pixel_values.npy"
+        assert not shell.error_banner.visible
+
+
+def test_generator_detects_and_preconfigures_every_model_input(tmp_path: Path) -> None:
+    model = tmp_path / "masked-image.onnx"
+    build_masked_image_model(model)
+
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        shell.show_session(service.open_model(model))
+        generator = shell.input_generator
+
+        assert tuple(generator.input_presets) == ("pixel_values", "pixel_mask")
+        pixels = generator.input_presets["pixel_values"]
+        assert pixels.kind == "image"
+        assert pixels.shape == (1, 3, 224, 224)
+        assert pixels.dtype == "float32"
+        assert pixels.assumptions == ("symbolic or unknown extents default to 1",)
+        mask = generator.input_presets["pixel_mask"]
+        assert mask.kind == "mask"
+        assert mask.shape == (1, 64, 64)
+        assert mask.dtype == "int64"
+        assert mask.distribution == "ones"
+        assert [
+            control.data
+            for control in generator.detected_inputs.controls
+            if isinstance(control, ft.TextButton)
+        ] == ["input-preset:pixel_values", "input-preset:pixel_mask"]
+        assert generator.target_input.value == "pixel_values"
+        assert generator.kind.value == "automatic"
+        assert generator.automatic_section.visible
+        assert "shape (1, 3, 224, 224)" in str(generator.automatic_summary.value)
+        assert generator.image_layout.value == "NCHW"
+        assert generator.image_height.value == "224"
+        assert generator.image_width.value == "224"
+        assert not generator.generate_all_and_assign_button.disabled
+
+        mask_row = generator.detected_inputs.controls[2]
+        assert isinstance(mask_row, ft.TextButton)
+        cast(Any, mask_row.on_click)(cast(Any, SimpleNamespace()))
+        assert generator.target_input.value == "pixel_mask"
+        assert generator.kind.value == "automatic"
+        assert generator.mask_shape.value == "1,64,64"
+
+
+def test_generator_generates_and_assigns_complete_detected_input_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "masked-image.onnx"
+    output_directory = tmp_path / "inputs"
+    output_directory.mkdir()
+    build_masked_image_model(model)
+
+    async def get_directory_path(
+        picker: ft.FilePicker,
+        **kwargs: object,
+    ) -> str:
+        assert kwargs["dialog_title"] == (
+            "Choose a directory for generated model inputs"
+        )
+        return str(output_directory)
+
+    monkeypatch.setattr(ft.FilePicker, "get_directory_path", get_directory_path)
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        shell.show_session(service.open_model(model))
+        generator = shell.input_generator
+
+        asyncio.run(generator.generate_all_and_assign())
+
+        pixel_path = output_directory / "01-pixel_values.npy"
+        mask_path = output_directory / "02-pixel_mask.npy"
+        pixels = np.load(pixel_path, allow_pickle=False)
+        mask = np.load(mask_path, allow_pickle=False)
+        assert pixels.shape == (1, 3, 224, 224)
+        assert pixels.dtype == np.dtype("float32")
+        assert mask.shape == (1, 64, 64)
+        assert mask.dtype == np.dtype("int64")
+        np.testing.assert_array_equal(mask, np.ones(mask.shape, dtype=np.int64))
+        assert set(shell.trace.input_bindings) == {"pixel_values", "pixel_mask"}
+        assert shell.trace.input_bindings["pixel_values"].tensor_file == str(
+            pixel_path.resolve()
+        )
+        assert shell.trace.input_bindings["pixel_mask"].tensor_file == str(
+            mask_path.resolve()
+        )
+        assert generator.status.value == "Generated and assigned 2 model inputs"
+        assert "pixel_values" in str(generator.summary.value)
+        assert "pixel_mask" in str(generator.summary.value)
+
+
+def test_generator_complete_set_never_overwrites_existing_input(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "masked-image.onnx"
+    output_directory = tmp_path / "inputs"
+    output_directory.mkdir()
+    existing = output_directory / "01-pixel_values.npy"
+    existing.write_bytes(b"user data")
+    build_masked_image_model(model)
+
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        shell.show_session(service.open_model(model))
+
+        with pytest.raises(InputGenerationError, match="never overwrites"):
+            shell.input_generator.generate_configured_inputs(output_directory)
+
+        assert existing.read_bytes() == b"user data"
+        assert not (output_directory / "02-pixel_mask.npy").exists()
+
+
+def test_generator_validates_complete_set_before_binding_any_input(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "masked-image.onnx"
+    output_directory = tmp_path / "inputs"
+    output_directory.mkdir()
+    build_masked_image_model(model)
+
+    with ApplicationService() as service:
+        shell, _page = make_shell(service)
+        shell.show_session(service.open_model(model))
+        generated = shell.input_generator.generate_configured_inputs(output_directory)
+        mask_path = generated[1][1].path
+        np.save(mask_path, np.ones((1, 64, 64), dtype=np.float32), allow_pickle=False)
+
+        with pytest.raises(ValueError, match="dtype float32"):
+            shell._assign_generated_inputs(generated)
+
+        assert shell.trace.input_bindings == {}
 
 
 def test_generator_target_switches_qwen3vl_pixels_to_patch_profile() -> None:
@@ -567,12 +737,12 @@ def test_generator_target_switches_qwen3vl_pixels_to_patch_profile() -> None:
             can_assign=True,
         )
 
-        assert generator.kind.value == "image"
+        assert generator.kind.value == "automatic"
         assert generator.image_layout.value == "QWEN3VL_PATCHES"
         assert generator.image_width.value == "640"
         assert generator.image_height.value == "352"
         assert generator.image_normalization.value == "minus-one-one"
-        assert generator.image_section.visible
+        assert generator.automatic_section.visible
 
 
 @pytest.mark.parametrize(
@@ -607,7 +777,7 @@ def test_generator_maps_tensor_height_and_width_without_transposing(
             can_assign=True,
         )
 
-        assert generator.kind.value == "image"
+        assert generator.kind.value == "automatic"
         assert generator.image_layout.value == layout
         assert generator.image_height.value == height
         assert generator.image_width.value == width
@@ -748,8 +918,12 @@ def test_generator_text_tokens_save_and_assign_to_a_token_id_input(
         shell.show_session(service.open_model(model))
         generator = shell.input_generator
 
-        # A rank-2 integer input is a token-id batch, so the form opens there.
-        assert generator.kind.value == "text-tokens"
+        # Automatic generation is the default, while the inferred token form
+        # remains preconfigured as a manual alternative.
+        assert generator.kind.value == "automatic"
+        assert generator.automatic_section.visible
+        generator.kind.value = "text-tokens"
+        generator._on_kind_changed(None)
         assert generator.token_section.visible
         assert not generator.image_section.visible
         assert generator.token_sequence_length.value == "8"

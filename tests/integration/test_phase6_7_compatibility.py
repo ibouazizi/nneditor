@@ -18,13 +18,21 @@ import pytest
 import torch
 
 from nneditor.adapters.detect import DetectionError, detect_artifact_kind
-from nneditor.adapters.pytorch import open_safetensors, write_safetensors
+from nneditor.adapters.pytorch import (
+    SafetensorSource,
+    open_safetensors,
+    write_safetensors,
+    write_safetensors_stream,
+)
+from nneditor.adapters.pytorch import safetensors as safetensors_module
 from nneditor.adapters.pytorch.checkpoint import CheckpointError, open_checkpoint
 from nneditor.adapters.pytorch.pickle_scan import PickleScanError, scan_state_dict
 from nneditor.adapters.pytorch.pt2 import Pt2Error, open_pt2
 from nneditor.adapters.pytorch.safetensors import SafetensorsError
 from nneditor.adapters.pytorch.zip_store import ZipStoreError, zip_members
+from nneditor.application.editing import EditingController
 from nneditor.application.session import ApplicationService, SessionError
+from nneditor.cancellation import CancellationToken, OperationCancelled
 from nneditor.ir.capabilities import (
     ArtifactKind,
     Availability,
@@ -215,6 +223,66 @@ class TestWeightsOnlyExport:
         assert metadata["fidelity"] == "weights only"
         reloaded = torch.load(source, weights_only=True)
         assert torch.equal(reloaded["linear.bias"], state["linear.bias"])
+
+    def test_session_export_reads_tensor_payloads_in_bounded_ranges(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = tmp_path / "weights.safetensors"
+        build_safetensors_file(source)
+        destination = tmp_path / "streamed.safetensors"
+        calls: list[tuple[int, int | None]] = []
+        original = EditingController.read
+
+        def recording_read(
+            controller: EditingController,
+            tensor_id: str,
+            *,
+            offset: int = 0,
+            length: int | None = None,
+        ) -> bytes:
+            calls.append((offset, length))
+            return original(controller, tensor_id, offset=offset, length=length)
+
+        monkeypatch.setattr(safetensors_module, "_WRITE_CHUNK_BYTES", 4)
+        monkeypatch.setattr(EditingController, "read", recording_read)
+        with ApplicationService() as service:
+            session = service.open_model(source)
+            session.export_weights_only(destination)
+
+        assert calls
+        assert all(length is not None and length <= 4 for _offset, length in calls)
+        assert open_safetensors(destination).tensors
+
+    def test_streaming_writer_removes_partial_output_when_cancelled(
+        self, tmp_path: Path
+    ) -> None:
+        destination = tmp_path / "cancelled.safetensors"
+        payload = bytes(range(24))
+        token = CancellationToken()
+
+        def cancel_after_first_read(offset: int, length: int) -> bytes:
+            token.cancel()
+            return payload[offset : offset + length]
+
+        source = SafetensorSource(
+            name="weight",
+            element_type="float32",
+            dims=(6,),
+            byte_length=len(payload),
+            read=cancel_after_first_read,
+        )
+        with pytest.raises(OperationCancelled):
+            write_safetensors_stream(
+                destination,
+                [source],
+                token=token,
+                chunk_bytes=4,
+            )
+
+        assert not destination.exists()
+        assert not destination.with_name(destination.name + ".partial").exists()
 
     def test_export_never_overwrites(self, tmp_path: Path) -> None:
         source = tmp_path / "weights.safetensors"

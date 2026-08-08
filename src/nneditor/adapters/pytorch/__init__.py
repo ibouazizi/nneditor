@@ -13,15 +13,19 @@ from nneditor.adapters.pytorch.fx import open_fx_graph_module
 from nneditor.adapters.pytorch.pt2 import open_pt2
 from nneditor.adapters.pytorch.safetensors import (
     SafetensorsError,
+    SafetensorSource,
     open_safetensors,
     write_safetensors,
+    write_safetensors_stream,
 )
 
 __all__ = [
+    "SafetensorSource",
     "SafetensorsError",
     "open_checkpoint",
     "open_fx_graph_module",
     "open_pt2",
     "open_safetensors",
     "write_safetensors",
+    "write_safetensors_stream",
 ]

@@ -48,8 +48,9 @@ capture bound, so NNEditor reported an honest partial result while retaining
 - Save only when needed through a dirty-aware top-bar action, or close the
   current model without quitting the application.
 - Generate safe `.npy` test inputs from images, masks, CSV data, synthetic
-  time series, text token ids, or generic tensor patterns, then assign them to
-  model inputs.
+  time series, text token ids, or generic tensor patterns. Model inputs are
+  detected and preconfigured automatically, and the complete generated set can
+  be assigned in one action.
 - Tokenize prompt text into language-model input ids through a selectable
   codebook: byte level, Unicode code points, or hashed words with no external
   files, plus GPT-2/RoBERTa byte-level BPE loaded from a HuggingFace
@@ -88,7 +89,7 @@ actions explain the format-specific reason directly in the interface.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.1.1
+python -m pip install nneditor==1.3.3
 ```
 
 Start the desktop application with either command:
@@ -142,11 +143,17 @@ it as complete.
 
 Desktop tracing is available for ONNX models:
 
-1. Open **Generate test input** to resize an image, create a mask, convert
-   numeric CSV/time-series data, synthesize a signal, or create a generic
-   tensor. Select a model input and use **Generate, save & assign** to return
-   directly to that input node. You can also click the tensor-picker button
-   inside an input node and choose an existing safe NumPy `.npy` tensor.
+1. Open **Generate test input**. NNEditor detects every model input and creates
+   a preset from its name, dtype, and shape. Symbolic or unknown extents default
+   to 1 and this assumption is shown in the input plan. **Automatic from input**
+   is the default input source and generates deterministic values directly from
+   that preset. Select an image, text, CSV, time-series, mask, or generic tensor
+   source when you want to provide the values instead. When every input has a
+   supported dtype and declared shape,
+   use **Generate & assign all detected inputs** to create and validate the
+   complete input set in one directory. You can also click the
+   tensor-picker button inside an input node and choose an existing safe NumPy
+   `.npy` tensor.
    Image dimensions are shown and applied as height then width, matching tensor
    shape conventions. Fixed Qwen3-VL `pixel_values` inputs automatically use
    the model-compatible flattened-patch profile.
@@ -328,17 +335,23 @@ Run the browser application:
 uv run flet run --web src/main.py
 ```
 
+On Windows, a moved or restored checkout can leave stale console-script paths
+inside `.venv`. If `uv run flet` reports `Failed to canonicalize script path`,
+repair the environment with `uv sync --locked --group dev --reinstall` before
+launching it again. Python-backed quality gates use module invocation below so
+they do not depend on those script shims.
+
 Run the release quality gates:
 
 ```bash
 uv run ruff format --check .
 uv run ruff check .
-uv run mypy
-uv run pytest -m "not performance" \
+uv run python -m mypy
+uv run python -m pytest -m "not performance" \
   --cov=nneditor \
   --cov-report=term-missing \
   --cov-fail-under=90
-uv run pytest -m performance tests/performance
+uv run python -m pytest -m performance tests/performance
 ```
 
 Build and validate the distributions:

@@ -17,12 +17,14 @@ from __future__ import annotations
 import json
 import os
 import struct
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
 from nneditor import __version__
 from nneditor.adapters.pytorch.scalar_types import element_width_bytes
+from nneditor.cancellation import CancellationToken, OperationCancelled
 from nneditor.diagnostics import DiagnosticLog, Severity
 from nneditor.ir.capabilities import ArtifactKind, contract_for
 from nneditor.ir.core import (
@@ -38,10 +40,17 @@ from nneditor.ir.core import (
 from nneditor.ir.identity import ROOT_GRAPH_ID, initializer_id
 from nneditor.storage.reader import hash_file
 
-__all__ = ["SafetensorsError", "open_safetensors", "write_safetensors"]
+__all__ = [
+    "SafetensorSource",
+    "SafetensorsError",
+    "open_safetensors",
+    "write_safetensors",
+    "write_safetensors_stream",
+]
 
 _MAX_HEADER_BYTES: Final = 100 * 1024 * 1024
 _HEADER_LENGTH = struct.Struct("<Q")
+_WRITE_CHUNK_BYTES: Final = 8 * 1024 * 1024
 
 _DTYPE_TO_IR: Final[dict[str, str]] = {
     "F64": "float64",
@@ -65,6 +74,22 @@ _IR_TO_DTYPE: Final[dict[str, str]] = {
 
 class SafetensorsError(ValueError):
     """Raised when a safetensors artifact cannot be read or written."""
+
+
+@dataclass(frozen=True, slots=True)
+class SafetensorSource:
+    """One tensor whose bytes can be fetched in bounded ranges.
+
+    ``byte_length`` may be omitted when the fixed-width dtype and shape fully
+    determine it. The writer resolves every length before opening the staged
+    output, then calls ``read(offset, length)`` in bounded chunks.
+    """
+
+    name: str
+    element_type: str
+    dims: tuple[int, ...]
+    byte_length: int | None
+    read: Callable[[int, int], bytes]
 
 
 def _read_header(path: Path) -> tuple[dict[str, JsonValue], int]:
@@ -305,6 +330,127 @@ def _open_safetensors(source: Path) -> Document:
     )
 
 
+def _prepare_safetensor_header(
+    tensors: Iterable[SafetensorSource],
+    metadata: Mapping[str, str] | None,
+) -> tuple[dict[str, JsonValue], tuple[tuple[SafetensorSource, int], ...]]:
+    """Validate tensor metadata and resolve the byte ranges in the header."""
+    header: dict[str, JsonValue] = {}
+    if metadata:
+        header["__metadata__"] = {
+            str(key): str(value) for key, value in metadata.items()
+        }
+    prepared: list[tuple[SafetensorSource, int]] = []
+    cursor = 0
+    for source in tensors:
+        dtype = _IR_TO_DTYPE.get(source.element_type)
+        if dtype is None:
+            raise SafetensorsError(
+                f"tensor {source.name!r} has element type "
+                f"{source.element_type!r}, which safetensors cannot represent"
+            )
+        if source.name in header:
+            raise SafetensorsError(f"duplicate tensor name {source.name!r}")
+        if any(dim < 0 for dim in source.dims):
+            raise SafetensorsError(
+                f"tensor {source.name!r} has a negative shape dimension"
+            )
+        width = element_width_bytes(source.element_type)
+        if width is None:
+            raise SafetensorsError(
+                f"tensor {source.name!r} has element type "
+                f"{source.element_type!r} without a fixed byte width"
+            )
+        count = 1
+        for dim in source.dims:
+            count *= dim
+        expected = count * width
+        length = expected if source.byte_length is None else source.byte_length
+        if length < 0:
+            raise SafetensorsError(
+                f"tensor {source.name!r} declares a negative byte length"
+            )
+        if expected != length:
+            raise SafetensorsError(
+                f"tensor {source.name!r} holds {length} bytes but its shape "
+                f"and dtype imply {expected}"
+            )
+        header[source.name] = {
+            "dtype": dtype,
+            "shape": list(source.dims),
+            "data_offsets": [cursor, cursor + length],
+        }
+        prepared.append((source, length))
+        cursor += length
+    return header, tuple(prepared)
+
+
+def write_safetensors_stream(
+    destination: Path | str,
+    tensors: Iterable[SafetensorSource],
+    *,
+    metadata: Mapping[str, str] | None = None,
+    token: CancellationToken | None = None,
+    chunk_bytes: int | None = None,
+) -> Path:
+    """Write range-readable tensors atomically without accumulating payloads."""
+    target = Path(destination)
+    if target.exists():
+        raise SafetensorsError(f"{target} already exists; exports never overwrite")
+    if token is not None:
+        token.raise_if_cancelled()
+    chunk_size = _WRITE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
+    if chunk_size <= 0:
+        raise SafetensorsError("safetensors write chunk size must be positive")
+    header, prepared = _prepare_safetensor_header(tensors, metadata)
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    if len(header_bytes) > _MAX_HEADER_BYTES:
+        raise SafetensorsError(
+            f"safetensors header is {len(header_bytes)} bytes; the limit is "
+            f"{_MAX_HEADER_BYTES}"
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(target.name + ".partial")
+    try:
+        with open(partial, "xb") as handle:
+            handle.write(_HEADER_LENGTH.pack(len(header_bytes)))
+            handle.write(header_bytes)
+            for source, length in prepared:
+                offset = 0
+                while offset < length:
+                    if token is not None:
+                        token.raise_if_cancelled()
+                    requested = min(chunk_size, length - offset)
+                    try:
+                        chunk = source.read(offset, requested)
+                    except OperationCancelled:
+                        raise
+                    except Exception as error:
+                        raise SafetensorsError(
+                            f"tensor {source.name!r} could not be read: "
+                            f"{type(error).__name__}: {error}"
+                        ) from error
+                    if len(chunk) != requested:
+                        raise SafetensorsError(
+                            f"tensor {source.name!r} returned {len(chunk)} bytes "
+                            f"for range [{offset}, {offset + requested}); expected "
+                            f"{requested}"
+                        )
+                    handle.write(chunk)
+                    offset += requested
+            if token is not None:
+                token.raise_if_cancelled()
+            handle.flush()
+            os.fsync(handle.fileno())
+        if token is not None:
+            token.raise_if_cancelled()
+        os.replace(partial, target)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    return target
+
+
 def write_safetensors(
     destination: Path | str,
     tensors: Iterable[tuple[str, str, tuple[int, ...], bytes]],
@@ -317,55 +463,21 @@ def write_safetensors(
     same tensors always produce byte-identical files — golden export tests
     depend on it. The destination is never overwritten.
     """
-    target = Path(destination)
-    if target.exists():
-        raise SafetensorsError(f"{target} already exists; exports never overwrite")
-    header: dict[str, JsonValue] = {}
-    if metadata:
-        header["__metadata__"] = {
-            str(key): str(value) for key, value in metadata.items()
-        }
-    chunks: list[bytes] = []
-    cursor = 0
-    for name, element_type, dims, raw in tensors:
-        dtype = _IR_TO_DTYPE.get(element_type)
-        if dtype is None:
-            raise SafetensorsError(
-                f"tensor {name!r} has element type {element_type!r}, which "
-                "safetensors cannot represent"
-            )
-        width = element_width_bytes(element_type)
-        if width is not None:
-            count = 1
-            for dim in dims:
-                count *= dim
-            if count * width != len(raw):
-                raise SafetensorsError(
-                    f"tensor {name!r} holds {len(raw)} bytes but its shape "
-                    f"and dtype imply {count * width}"
-                )
-        if name in header:
-            raise SafetensorsError(f"duplicate tensor name {name!r}")
-        header[name] = {
-            "dtype": dtype,
-            "shape": list(dims),
-            "data_offsets": [cursor, cursor + len(raw)],
-        }
-        chunks.append(raw)
-        cursor += len(raw)
-    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    partial = target.with_name(target.name + ".partial")
-    try:
-        with open(partial, "xb") as handle:
-            handle.write(_HEADER_LENGTH.pack(len(header_bytes)))
-            handle.write(header_bytes)
-            for chunk in chunks:
-                handle.write(chunk)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(partial, target)
-    except BaseException:
-        partial.unlink(missing_ok=True)
-        raise
-    return target
+
+    def bytes_reader(payload: bytes) -> Callable[[int, int], bytes]:
+        def read(offset: int, length: int) -> bytes:
+            return payload[offset : offset + length]
+
+        return read
+
+    sources = (
+        SafetensorSource(
+            name=name,
+            element_type=element_type,
+            dims=dims,
+            byte_length=len(raw),
+            read=bytes_reader(raw),
+        )
+        for name, element_type, dims, raw in tensors
+    )
+    return write_safetensors_stream(destination, sources, metadata=metadata)
