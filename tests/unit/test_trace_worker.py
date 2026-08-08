@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import weakref
 from pathlib import Path
@@ -19,6 +20,29 @@ from tests.fixtures.onnx_models import (
     build_custom_domain_model,
     build_embedded_model,
 )
+
+
+def test_darwin_worker_leaves_address_space_to_parent_monitor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, tuple[int, int]]] = []
+    resource = SimpleNamespace(
+        RLIMIT_CPU=1,
+        RLIMIT_AS=2,
+        RLIMIT_NOFILE=3,
+        RLIM_INFINITY=999,
+        getrlimit=lambda resource_id: (999, 999),
+        setrlimit=lambda resource_id, limits: calls.append((resource_id, limits)),
+    )
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setitem(sys.modules, "resource", resource)
+
+    trace_worker._limit_process(
+        {"wall_seconds": 10, "memory_bytes": 1024 * 1024 * 1024}
+    )
+
+    assert calls == [(1, (10, 10)), (3, (64, 64))]
 
 
 def _target(

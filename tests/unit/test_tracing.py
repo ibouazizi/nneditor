@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -46,7 +47,9 @@ from nneditor.tracing import (
 )
 from nneditor.tracing.contracts import resolved_file
 from nneditor.tracing.runner import (
+    TraceError,
     _capture_pressure_note,
+    _check_darwin_worker_memory,
     _parse_worker_response,
     estimated_capture_bytes,
 )
@@ -88,6 +91,40 @@ def _record(
             else "capture byte ceiling"
         ),
     )
+
+
+def test_darwin_parent_kills_worker_above_memory_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = 42
+
+        def __init__(self) -> None:
+            self.killed = False
+            self.waited = False
+
+        def poll(self) -> int | None:
+            return None
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self) -> int:
+            self.waited = True
+            return -9
+
+    process = Process()
+    monkeypatch.setattr("nneditor.tracing.runner.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "nneditor.tracing.runner._darwin_process_memory_bytes",
+        lambda pid: 129 * 1024 * 1024,
+    )
+
+    with pytest.raises(TraceError, match="approved 128 MiB memory ceiling"):
+        _check_darwin_worker_memory(cast(Any, process), 128 * 1024 * 1024)
+
+    assert process.killed
+    assert process.waited
 
 
 def _commit(

@@ -54,6 +54,75 @@ class TraceError(RuntimeError):
     """An approved isolated trace could not produce a trustworthy result."""
 
 
+def _darwin_process_memory_bytes(pid: int) -> int | None:
+    """Return a Darwin process's physical memory footprint when available."""
+    if sys.platform != "darwin":
+        return None
+    import ctypes
+
+    class RUsageInfoV2(ctypes.Structure):
+        _fields_ = [
+            ("ri_uuid", ctypes.c_uint8 * 16),
+            ("ri_user_time", ctypes.c_uint64),
+            ("ri_system_time", ctypes.c_uint64),
+            ("ri_pkg_idle_wkups", ctypes.c_uint64),
+            ("ri_interrupt_wkups", ctypes.c_uint64),
+            ("ri_pageins", ctypes.c_uint64),
+            ("ri_wired_size", ctypes.c_uint64),
+            ("ri_resident_size", ctypes.c_uint64),
+            ("ri_phys_footprint", ctypes.c_uint64),
+            ("ri_proc_start_abstime", ctypes.c_uint64),
+            ("ri_proc_exit_abstime", ctypes.c_uint64),
+            ("ri_child_user_time", ctypes.c_uint64),
+            ("ri_child_system_time", ctypes.c_uint64),
+            ("ri_child_pkg_idle_wkups", ctypes.c_uint64),
+            ("ri_child_interrupt_wkups", ctypes.c_uint64),
+            ("ri_child_pageins", ctypes.c_uint64),
+            ("ri_child_elapsed_abstime", ctypes.c_uint64),
+            ("ri_diskio_bytesread", ctypes.c_uint64),
+            ("ri_diskio_byteswritten", ctypes.c_uint64),
+        ]
+
+    try:
+        libproc = ctypes.CDLL("libproc.dylib", use_errno=True)
+        query = libproc.proc_pid_rusage
+        query.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(RUsageInfoV2),
+        )
+        query.restype = ctypes.c_int
+        info = RUsageInfoV2()
+        if query(pid, 2, ctypes.byref(info)) != 0:
+            return None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return max(int(info.ri_resident_size), int(info.ri_phys_footprint))
+
+
+def _check_darwin_worker_memory(
+    process: subprocess.Popen[str], memory_limit: int
+) -> None:
+    """Fail closed when a live Darwin worker cannot honor its memory ceiling."""
+    if sys.platform != "darwin":
+        return
+    used = _darwin_process_memory_bytes(process.pid)
+    if used is None:
+        if process.poll() is not None:
+            return
+        process.kill()
+        process.wait()
+        raise TraceError("trace worker memory ceiling could not be enforced on macOS")
+    if used <= memory_limit:
+        return
+    process.kill()
+    process.wait()
+    raise TraceError(
+        f"trace worker exceeded the approved {memory_limit / _MIB:,.0f} MiB "
+        "memory ceiling"
+    )
+
+
 class DeclaredValue(Protocol):
     """Anything declaring an element type and shape, e.g. ``ir.core.Value``."""
 
@@ -381,6 +450,7 @@ def run_onnx_trace(
                     process.kill()
                     process.wait()
                     raise
+                _check_darwin_worker_memory(process, request.limits.memory_bytes)
                 if time.monotonic() - started > request.limits.wall_seconds:
                     process.kill()
                     process.wait()

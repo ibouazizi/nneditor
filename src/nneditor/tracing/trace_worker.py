@@ -179,7 +179,14 @@ def _limit_process(raw: dict[str, object]) -> None:
             resource.setrlimit(resource_id, (resolved, resolved))
 
         cap(resource.RLIMIT_CPU, cpu)
-        cap(resource.RLIMIT_AS, memory)
+        # Darwin aliases RLIMIT_AS to RLIMIT_RSS, but Python processes on
+        # current macOS releases start with hundreds of GiB of reserved
+        # virtual address space.  Any practical model budget is therefore
+        # below the process's existing mapping and setrlimit rejects it with
+        # EINVAL.  The parent uses proc_pid_rusage to enforce the approved
+        # resident-memory ceiling on macOS instead.
+        if sys.platform != "darwin":
+            cap(resource.RLIMIT_AS, memory)
         cap(resource.RLIMIT_NOFILE, 64)
     except (AttributeError, OSError, ValueError) as error:
         raise RuntimeError(
