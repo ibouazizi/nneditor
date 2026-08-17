@@ -78,6 +78,8 @@ workflow available for each artifact.
 | Safetensors | Weights and header metadata | Tensor-level changes | Safetensors | Unavailable |
 | Flax or Orbax checkpoint | Weights and tensor metadata | Tensor-level changes | Weights-only artifact | Unavailable |
 | Textual StableHLO | Functions, regions, operations, attributes | Inspection only | Unavailable | Unavailable |
+| Qualcomm DLC container | Decoded graph, typed weights, quantization encodings, container index | Unavailable | Unavailable | Unavailable |
+| Core ML package (.mlpackage) | Manifest, model header, feature names, typed weight blobs | Unavailable | Unavailable | Unavailable |
 
 Support is intentionally capability-specific. For example, opening a checkpoint
 does not imply that NNEditor can reconstruct a model graph, and reading
@@ -110,14 +112,16 @@ nneditor path/to/model.onnx
 
 On Windows, select **File types** in the top bar to register NNEditor for
 `.onnx`, `.pb`, `.pt2`, `.pt`, `.pth`, `.ckpt`, `.bin`, `.safetensors`,
-`.mlir`, and `.stablehlo` files. NNEditor then opens Windows Default apps,
+`.mlir`, `.stablehlo`, and `.dlc` files. NNEditor then opens Windows Default apps,
 where you choose which extensions should launch it. Registration is per-user
 and never replaces a protected Windows default without that explicit choice.
 
 ## First run
 
 1. Select **Open model** and choose a supported artifact. NNEditor detects its
-   format from the file contents.
+   format from the file contents. Directory bundles such as a Core ML
+   `.mlpackage` open through **Open folder** on the desktop shell, or directly
+   from the command line.
 2. Start in the architecture view, then open a block or change the detail level
    to move through blocks, layers, and operators.
 3. Select a node to inspect its ports, attributes, weights, and capability

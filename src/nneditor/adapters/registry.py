@@ -14,6 +14,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
+from nneditor.adapters.coreml.package import CoremlError, open_coreml_package
 from nneditor.adapters.detect import DetectionError, detect_artifact_kind
 from nneditor.adapters.jax.stablehlo import StableHloError, open_stablehlo
 from nneditor.adapters.onnx import OnnxIndexError, index_model, index_to_document
@@ -21,6 +22,7 @@ from nneditor.adapters.pytorch.checkpoint import CheckpointError, open_checkpoin
 from nneditor.adapters.pytorch.fx import FxError, open_fx_graph_module
 from nneditor.adapters.pytorch.pt2 import Pt2Error, open_pt2
 from nneditor.adapters.pytorch.safetensors import SafetensorsError, open_safetensors
+from nneditor.adapters.qualcomm.dlc import DlcError, open_dlc
 from nneditor.cancellation import CancellationToken, OperationCancelled
 from nneditor.ir.capabilities import ArtifactKind
 from nneditor.ir.core import Document
@@ -171,12 +173,28 @@ def _open_stablehlo(path: Path, _token: CancellationToken | None) -> Document:
         raise
 
 
+def _open_dlc(path: Path, _token: CancellationToken | None) -> Document:
+    try:
+        return open_dlc(path)
+    except DlcError:
+        raise
+
+
+def _open_coreml(path: Path, _token: CancellationToken | None) -> Document:
+    try:
+        return open_coreml_package(path)
+    except CoremlError:
+        raise
+
+
 DEFAULT_ARTIFACT_ADAPTERS: tuple[ArtifactAdapter, ...] = (
     _FunctionAdapter(ArtifactKind.ONNX_MODEL, _open_onnx),
     _FunctionAdapter(ArtifactKind.PYTORCH_EXPORTED_PROGRAM, _open_pt2),
     _FunctionAdapter(ArtifactKind.SAFETENSORS, _open_safetensors),
     _FunctionAdapter(ArtifactKind.PYTORCH_STATE_DICT, _open_checkpoint_or_fx),
     _FunctionAdapter(ArtifactKind.JAX_STABLEHLO, _open_stablehlo),
+    _FunctionAdapter(ArtifactKind.QUALCOMM_DLC, _open_dlc),
+    _FunctionAdapter(ArtifactKind.COREML_PACKAGE, _open_coreml),
 )
 
 

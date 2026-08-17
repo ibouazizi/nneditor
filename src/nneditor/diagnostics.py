@@ -342,10 +342,114 @@ _JAX_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
     ),
 )
 
+_DLC_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
+    CodeDescriptor(
+        "dlc.model-stream-not-decoded",
+        DiagnosticCategory.UNSUPPORTED,
+        "DLC model stream not decoded",
+        "The model stream is missing or does not match the validated "
+        "reverse-engineered NETD layout, so only the container index is "
+        "shown; the member remains readable as raw bytes.",
+    ),
+    CodeDescriptor(
+        "dlc.tensor-unresolved",
+        DiagnosticCategory.TENSOR_REFERENCE,
+        "Op edge names no tensor",
+        "An operation references a tensor name absent from the graph's "
+        "tensor table; a placeholder value keeps the edge visible.",
+    ),
+    CodeDescriptor(
+        "dlc.payload-unavailable",
+        DiagnosticCategory.TENSOR_REFERENCE,
+        "Static tensor payload unavailable",
+        "A static tensor's payload is missing from the parameter "
+        "directory, lies outside the container, or disagrees with the "
+        "declared shape and dtype; it is shown without typed values.",
+    ),
+    CodeDescriptor(
+        "dlc.compressed-member",
+        DiagnosticCategory.TENSOR_REFERENCE,
+        "Compressed container member not range-readable",
+        "The member is stored compressed inside the archive, so bounded "
+        "byte-range reads cannot serve its content; it is listed without "
+        "its bytes.",
+    ),
+    CodeDescriptor(
+        "dlc.metadata-unreadable",
+        DiagnosticCategory.METADATA_LOSS,
+        "DLC metadata member unreadable",
+        "The dlc.metadata member is missing, oversized, or not decodable "
+        "text; the container index is unaffected.",
+    ),
+    CodeDescriptor(
+        "dlc.member-index-truncated",
+        DiagnosticCategory.METADATA_LOSS,
+        "Container member index truncated",
+        "The archive holds more members than the indexing ceiling; the "
+        "excess members are counted but not listed.",
+    ),
+    CodeDescriptor(
+        "dlc.member-header-mismatch",
+        DiagnosticCategory.TENSOR_REFERENCE,
+        "Container member header inconsistent",
+        "A member's local header disagrees with the central directory, so "
+        "its bytes are not exposed.",
+    ),
+)
+
+_COREML_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
+    CodeDescriptor(
+        "coreml.mil-not-decoded",
+        DiagnosticCategory.UNSUPPORTED,
+        "MIL program not decoded",
+        "The package holds an ML Program whose operations this build does "
+        "not decode into a graph; header metadata and weight blobs are "
+        "still readable.",
+    ),
+    CodeDescriptor(
+        "coreml.manifest-unreadable",
+        DiagnosticCategory.METADATA_LOSS,
+        "Package manifest unreadable",
+        "Manifest.json is missing, oversized, or not valid JSON; the model "
+        "and weights are unaffected.",
+    ),
+    CodeDescriptor(
+        "coreml.model-header-unreadable",
+        DiagnosticCategory.METADATA_LOSS,
+        "Model header not parseable",
+        "The model.mlmodel protobuf header could not be walked, so the "
+        "specification version, model type, and feature names are unknown.",
+    ),
+    CodeDescriptor(
+        "coreml.blob-store-unreadable",
+        DiagnosticCategory.TENSOR_REFERENCE,
+        "Weight blob store unreadable",
+        "weight.bin is missing or its header does not declare the "
+        "supported blob-storage version, so no weight is exposed.",
+    ),
+    CodeDescriptor(
+        "coreml.blob-invalid",
+        DiagnosticCategory.TENSOR_REFERENCE,
+        "Weight blob record invalid",
+        "A blob's metadata record fails its sentinel or bounds check; the "
+        "blob and the records after it are not exposed.",
+    ),
+    CodeDescriptor(
+        "coreml.blob-raw-bytes",
+        DiagnosticCategory.UNSUPPORTED,
+        "Weight blob exposed as raw bytes",
+        "The blob's storage dtype is packed sub-byte or unknown to this "
+        "build, so the blob is exposed as raw bytes instead of typed "
+        "elements.",
+    ),
+)
+
 _DESCRIPTORS: tuple[CodeDescriptor, ...] = (
     _PYTORCH_DESCRIPTORS
     + _HIERARCHY_DESCRIPTORS
     + _JAX_DESCRIPTORS
+    + _DLC_DESCRIPTORS
+    + _COREML_DESCRIPTORS
     + (
         CodeDescriptor(
             "onnx.custom-domain",

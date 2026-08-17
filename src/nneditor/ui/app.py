@@ -1136,6 +1136,15 @@ class Shell:
                     icon=ft.Icons.FOLDER_OPEN_ROUNDED,
                     on_click=self._on_open_clicked,
                 ),
+                ft.TextButton(
+                    content="Open folder",
+                    icon=ft.Icons.FOLDER_ROUNDED,
+                    tooltip=(
+                        "Open a model package folder, such as a Core ML "
+                        ".mlpackage bundle"
+                    ),
+                    on_click=self._on_open_folder_clicked,
+                ),
                 self.save_model_button,
                 self.close_model_button,
                 ft.Container(expand=True),
@@ -1493,6 +1502,31 @@ class Shell:
                     )
                 ]
             )
+            return
+        display_name = Path(selected).name
+        job = self.service.open_model_async(selected)
+        self._begin_open_job(job, display_name)
+
+    async def _on_open_folder_clicked(
+        self, event: ft.Event[ft.TextButton] | None = None
+    ) -> None:
+        if self.open_job is not None and not self.open_job.state.is_terminal:
+            return
+        if self._pending_web_upload is not None:
+            return
+        if getattr(self.page, "web", False):
+            # A browser hands over file bytes, never a folder path, so
+            # directory bundles remain a desktop-shell workflow.
+            self._set_status(
+                "The browser cannot open a folder; package bundles open "
+                "through the desktop shell."
+            )
+            self.page.update()
+            return
+        selected = await self.picker.get_directory_path(
+            dialog_title="Open a model package folder (.mlpackage)"
+        )
+        if not selected:
             return
         display_name = Path(selected).name
         job = self.service.open_model_async(selected)

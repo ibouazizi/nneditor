@@ -18,6 +18,7 @@ MODEL_FILE_EXTENSION_GROUPS: Final[Mapping[str, tuple[str, ...]]] = MappingProxy
         "PyTorch": ("pt2", "pt", "pth", "ckpt", "bin"),
         "Safetensors": ("safetensors",),
         "StableHLO": ("mlir", "stablehlo"),
+        "Qualcomm DLC": ("dlc",),
     }
 )
 """Extension hints grouped by the artifact family shown to the user."""

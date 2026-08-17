@@ -98,9 +98,11 @@ class TestSafeOpenBoundary:
             with pytest.raises(SessionError, match="does not exist"):
                 service.open_model(tmp_path / "ghost.onnx")
 
-    def test_directories_are_rejected(self, tmp_path: Path) -> None:
+    def test_unrecognized_directories_are_rejected(self, tmp_path: Path) -> None:
+        # Directories are legal open targets since package bundles
+        # (.mlpackage) arrived, so the rejection now comes from detection.
         with ApplicationService() as service:
-            with pytest.raises(SessionError, match="not a file"):
+            with pytest.raises(SessionError, match="no recognized model package"):
                 service.open_model(tmp_path)
 
 

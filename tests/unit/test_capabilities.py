@@ -39,13 +39,20 @@ def test_status_lookup_matches_availability() -> None:
 
 
 def test_artifacts_without_topology_cannot_promise_a_graph() -> None:
-    """A weights-only artifact must never advertise executable topology."""
+    """An artifact without a graph must never advertise executable topology.
+
+    Its export ceiling is weights-only at best — or unavailable when, as for
+    a DLC container, not even individual weights can be located.
+    """
     for contract in ARTIFACT_CONTRACTS.values():
         if contract.availability(Capability.TOPOLOGY) is Availability.UNAVAILABLE:
             assert contract.availability(Capability.EXECUTION) is (
                 Availability.UNAVAILABLE
             )
-            assert contract.best_export_fidelity is ExportFidelity.WEIGHTS_ONLY
+            assert contract.best_export_fidelity in (
+                ExportFidelity.WEIGHTS_ONLY,
+                ExportFidelity.UNAVAILABLE,
+            )
 
 
 def test_topology_behind_trust_requires_the_trusted_loading_mode() -> None:

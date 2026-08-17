@@ -42,6 +42,8 @@ class ArtifactKind(StrEnum):
     JAX_STABLEHLO = "jax_stablehlo"
     JAX_TRACED_FUNCTION = "jax_traced_function"
     ORBAX_CHECKPOINT = "orbax_checkpoint"
+    QUALCOMM_DLC = "qualcomm_dlc"
+    COREML_PACKAGE = "coreml_package"
 
 
 class Capability(StrEnum):
@@ -520,6 +522,101 @@ _CONTRACTS: tuple[ArtifactContract, ...] = (
                 "Readable arrays export as a labelled weights-only safetensors "
                 "artifact. No Orbax writer is implemented, so checkpoint tree "
                 "and sharding metadata are not re-serialized.",
+            ),
+        },
+    ),
+    _contract(
+        ArtifactKind.QUALCOMM_DLC,
+        "Qualcomm DLC container",
+        ("model.dlc",),
+        (LoadingMode.SAFE_ARTIFACT,),
+        ExportFidelity.UNAVAILABLE,
+        {
+            Capability.TOPOLOGY: (
+                Availability.PARTIAL,
+                "The NETD model stream is decoded through a reverse-engineered "
+                "FlatBuffers layout validated against QAIRT 2.38 and 2.45 "
+                "converter output; a stream that does not match falls back to "
+                "the container index instead of guessing.",
+            ),
+            Capability.WEIGHTS: (
+                Availability.PARTIAL,
+                "Static tensors resolve to typed byte ranges in "
+                "model.params.bin through the NETP payload directory; "
+                "containers without a decodable stream expose raw member "
+                "bytes only.",
+            ),
+            Capability.METADATA: (
+                Availability.PARTIAL,
+                "The container index, the dlc.metadata records, and decoded "
+                "per-tensor quantization encodings are readable.",
+            ),
+            Capability.EDITING: (
+                Availability.UNAVAILABLE,
+                "The reverse-engineered layout is read-only and no DLC "
+                "writer exists, so no edit could be validated or saved.",
+            ),
+            Capability.EXECUTION: (
+                Availability.UNAVAILABLE,
+                "DLC executes through the Qualcomm SNPE/QAIRT runtime on "
+                "device; no desktop isolation contract exists for it.",
+            ),
+            Capability.TRACING: (
+                Availability.UNAVAILABLE,
+                "Activation capture requires executing the model, which is "
+                "unavailable for DLC on this desktop.",
+            ),
+            Capability.EXPORT: (
+                Availability.UNAVAILABLE,
+                "No DLC writer exists and the container's model stream cannot "
+                "be regenerated from an index of its bytes.",
+            ),
+        },
+    ),
+    _contract(
+        ArtifactKind.COREML_PACKAGE,
+        "Core ML package",
+        ("Model.mlpackage directory",),
+        (LoadingMode.SAFE_ARTIFACT,),
+        ExportFidelity.UNAVAILABLE,
+        {
+            Capability.TOPOLOGY: (
+                Availability.UNAVAILABLE,
+                "No MIL program decoder is implemented, so the model's "
+                "operations are not modelled as a graph. The model type and "
+                "specification version are read from the protobuf header.",
+            ),
+            Capability.WEIGHTS: (
+                Availability.PARTIAL,
+                "weight.bin blobs are typed and readable through bounded "
+                "byte ranges. Their parameter names live in the undecoded "
+                "MIL program, so blobs are listed by index.",
+            ),
+            Capability.METADATA: (
+                Availability.PARTIAL,
+                "The package manifest, specification version, model type, "
+                "and declared feature names are readable; the full model "
+                "description is not modelled.",
+            ),
+            Capability.EDITING: (
+                Availability.UNAVAILABLE,
+                "Without a modelled graph or named parameters no edit can "
+                "be validated, so none is offered.",
+            ),
+            Capability.EXECUTION: (
+                Availability.UNAVAILABLE,
+                "Core ML models execute through Apple's runtime on Apple "
+                "platforms; no desktop isolation contract exists for it.",
+            ),
+            Capability.TRACING: (
+                Availability.UNAVAILABLE,
+                "Activation capture requires executing the model, which is "
+                "unavailable for Core ML on this desktop.",
+            ),
+            Capability.EXPORT: (
+                Availability.UNAVAILABLE,
+                "No Core ML writer exists, and blob weights carry no "
+                "parameter names a labelled weights-only export would need.",
             ),
         },
     ),

@@ -29,7 +29,7 @@ def emitted_codes() -> set[str]:
     """
     pattern = re.compile(
         r"(?:log\.add|DiagnosticLog\(\)\.add|Diagnostic)\(\s*\n?\s*"
-        r'"((?:onnx|pytorch|jax|hierarchy)\.[a-z-]+)"'
+        r'"((?:onnx|pytorch|jax|hierarchy|dlc|coreml)\.[a-z-]+)"'
     )
     found: set[str] = set()
     for path in SRC.rglob("*.py"):

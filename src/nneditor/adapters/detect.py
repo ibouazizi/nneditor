@@ -41,6 +41,12 @@ def _zip_kind(path: Path) -> ArtifactKind:
         return ArtifactKind.PYTORCH_STATE_DICT
     if any(name.endswith("archive_format") for name in names):
         return ArtifactKind.PYTORCH_EXPORTED_PROGRAM
+    # SNPE/QAIRT converters always place a dlc.metadata member next to the
+    # serialized model stream; the member name is the container's marker.
+    # Current converters suffix it with the container format version
+    # (``dlc.metadata2.1.0``), so the basename is matched as a prefix.
+    if any(name.rsplit("/", 1)[-1].startswith("dlc.metadata") for name in names):
+        return ArtifactKind.QUALCOMM_DLC
     raise DetectionError(
         f"{path.name} is a zip archive but holds no recognized model container"
     )
@@ -60,9 +66,27 @@ def _leading_content(prefix: bytes) -> bytes:
     return b""
 
 
+def _directory_kind(target: Path) -> ArtifactKind:
+    """The contract a directory bundle satisfies, decided from its members.
+
+    A Core ML ``.mlpackage`` is a directory: a ``Manifest.json`` next to a
+    ``Data/com.apple.CoreML/model.mlmodel`` protobuf. The marker is the
+    layout, not the directory's name or extension.
+    """
+    manifest = target / "Manifest.json"
+    model = target / "Data" / "com.apple.CoreML" / "model.mlmodel"
+    if manifest.is_file() and model.is_file():
+        return ArtifactKind.COREML_PACKAGE
+    raise DetectionError(
+        f"{target.name} is a directory but holds no recognized model package"
+    )
+
+
 def detect_artifact_kind(path: Path | str) -> ArtifactKind:
     """The artifact contract a file satisfies, decided from its content."""
     target = Path(path)
+    if target.is_dir():
+        return _directory_kind(target)
     with open(target, "rb") as handle:
         prefix = handle.read(4096)
     if not prefix:

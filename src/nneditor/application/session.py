@@ -1340,6 +1340,14 @@ class ApplicationService:
         """
         if not path.exists():
             raise SessionError(f"{path} does not exist")
+        if path.is_dir():
+            # Directory bundles (.mlpackage) are legal open targets; the
+            # adapter registry decides whether the layout is recognized.
+            try:
+                next(path.iterdir(), None)
+            except OSError as error:
+                raise SessionError(f"{path} cannot be read: {error}") from error
+            return
         if not path.is_file():
             raise SessionError(f"{path} is not a file")
         try:

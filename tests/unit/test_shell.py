@@ -422,6 +422,7 @@ def test_open_dialog_filters_every_supported_model_extension(
         "safetensors",
         "mlir",
         "stablehlo",
+        "dlc",
     }
 
 
