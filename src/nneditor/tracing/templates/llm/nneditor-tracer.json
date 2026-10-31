@@ -1,0 +1,11 @@
+{
+  "api_version": 1,
+  "id": "example.numpy-llm",
+  "name": "Example LLM tracer",
+  "version": "0.1.0",
+  "entry_point": "tracer.py:trace",
+  "artifact_kinds": ["gguf_model", "huggingface_model"],
+  "architectures": ["llama", "qwen2", "qwen3", "qwen35", "gpt2"],
+  "devices": ["cpu"],
+  "description": "Editable starter that delegates to NNEditor's NumPy LLM decoder."
+}

@@ -103,7 +103,7 @@ IDs from the model's tokenizer for a faithful text prompt.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.7.0
+python -m pip install nneditor==1.8.0
 ```
 
 Start the desktop application with either command:
@@ -255,6 +255,89 @@ no trace.
 Desktop subprocess isolation is not a multi-tenant security boundary, so
 tracing is disabled in the browser application until a dedicated worker
 service is available.
+
+## Tracing extensions
+
+Tracing implementations can be added without editing NNEditor's core. An
+extension is a folder containing `nneditor-tracer.json`, a Python entry point,
+and optional helper modules. The Trace panel offers built-in and installed
+tracers, explains compatibility failures, and has **Install a tracer folder**
+and **Reload tracer extensions** buttons. Installing an extension does not
+import its Python code.
+
+Create and install a working starter:
+
+```bash
+python -m nneditor --create-tracer ./my-tracer
+# Edit my-tracer/nneditor-tracer.json and my-tracer/tracer.py.
+python -m nneditor --install-tracer ./my-tracer
+python -m nneditor --list-tracers
+```
+
+Select the installed tracer in **Trace**, prepare the model inputs, and choose
+**Approve & run trace**. The starter delegates to the existing NumPy LLM
+decoder. To support another architecture or runtime, replace its forward pass
+and declare the corresponding compatibility filters. NNEditor supplies the
+worker, limits, capture storage, and activation UI.
+
+A manifest identifies its API, implementation, and supported artifacts:
+
+```json
+{
+  "api_version": 1,
+  "id": "mycompany.my-decoder",
+  "name": "My decoder",
+  "version": "0.1.0",
+  "entry_point": "tracer.py:trace",
+  "artifact_kinds": ["gguf_model", "huggingface_model"],
+  "architectures": ["my_architecture"],
+  "devices": ["cpu"]
+}
+```
+
+`architectures`, `element_types`, and `operators` are optional allowlists.
+Architectures match GGUF's architecture name or Hugging Face's `model_type`.
+`devices` defaults to CPU; a runtime may declare GPU or NPU support. Installed
+tracers can also target other imported artifact kinds with declared graph
+inputs, including ONNX. Custom tracers currently execute source artifacts;
+the built-in ONNX tracer retains support for edited revisions.
+
+The entry point receives the public version 1 SDK:
+
+```python
+from nneditor.tracing.sdk import TraceContext, TraceOutcome
+
+def trace(context: TraceContext) -> TraceOutcome:
+    context.capture_inputs()
+    # Run your forward pass using context.inputs and context.metadata.
+    # Read packed weight slices through context.tensors.read(...), or decode
+    # individual supported weights with context.load_weight(name_or_id).
+    # Publish each activation immediately:
+    # context.capture("block-000-attn", hidden_array)
+    # context.capture("lm-head", logits_array)
+    return TraceOutcome(provider="my-runtime", notes=("Runtime build 1.0",))
+```
+
+Capture names must match a unique value name in
+`context.document.main_graph.values`; value IDs work too. Emit each value once
+per forward pass. NNEditor applies capture selection and byte budgets; missing
+requested values are visibly marked as dropped. A plugin may return
+`TraceOutcome` with notes and diagnostics, or return `None`. It owns the model's
+execution semantics and should validate configurations before reading weights.
+Install runtime dependencies in the same Python environment as NNEditor.
+
+For development, set `NNEDITOR_TRACE_PLUGIN_PATH` to the plugin folder or a
+directory containing plugin folders. Multiple directories use the platform's
+path separator. Edit the source and reload tracers directly. Installation
+copies a folder into the per-user directory printed by `--list-tracers` and
+refuses to overwrite an existing installation.
+
+Approvals and capture identities bind the selected plugin version, code
+fingerprint, and NNEditor version. NNEditor snapshots that code before execution; changes require a
+fresh selection and approval. Plugin code runs in the resource-limited worker,
+with the same timeout, cancellation, and capture handling as built-in tracers.
+These limits are not an operating-system security sandbox: install trusted
+plugin code. Artifact files themselves are never treated as plugins.
 
 ## Editing and optimization
 

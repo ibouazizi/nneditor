@@ -283,6 +283,7 @@ class TraceApproval:
     approved: bool
     backend: TraceBackend = TraceBackend.AUTO
     device: TraceDevice = TraceDevice.AUTO
+    tracer: str | None = None
 
     @classmethod
     def approve(
@@ -293,6 +294,7 @@ class TraceApproval:
         limits: TraceLimits,
         backend: TraceBackend = TraceBackend.AUTO,
         device: TraceDevice = TraceDevice.AUTO,
+        tracer: str | None = None,
     ) -> TraceApproval:
         return cls(
             model_title,
@@ -302,6 +304,7 @@ class TraceApproval:
             True,
             backend,
             device,
+            tracer,
         )
 
     def validate(
@@ -313,6 +316,7 @@ class TraceApproval:
         limits: TraceLimits,
         backend: TraceBackend = TraceBackend.AUTO,
         device: TraceDevice = TraceDevice.AUTO,
+        tracer: str | None = None,
     ) -> None:
         if not self.approved:
             raise ValueError("inference tracing requires explicit per-run approval")
@@ -323,6 +327,7 @@ class TraceApproval:
             limits.hash,
             backend,
             device,
+            tracer,
         )
         actual = (
             self.model_title,
@@ -331,11 +336,12 @@ class TraceApproval:
             self.limits_hash,
             self.backend,
             self.device,
+            self.tracer,
         )
         if actual != expected:
             raise ValueError(
                 "trace approval does not name this model, input specification, "
-                "and resource limit set"
+                "resource limit set, and tracer extension"
             )
 
 
@@ -346,13 +352,16 @@ class TraceKey:
     input_specification_hash: str
     backend: TraceBackend = TraceBackend.AUTO
     device: TraceDevice = TraceDevice.AUTO
-    identity_version: int = 3
+    identity_version: int = 4
+    tracer: str | None = None
 
     def __post_init__(self) -> None:
         if not self.artifact_hash or not self.input_specification_hash:
             raise ValueError("trace key needs artifact and input-specification hashes")
-        if self.identity_version not in {1, 2, 3}:
+        if self.identity_version not in {1, 2, 3, 4}:
             raise ValueError("trace key identity version is unsupported")
+        if self.tracer is not None and self.identity_version < 4:
+            raise ValueError("tracer identity requires trace key version 4")
 
     @property
     def id(self) -> str:
@@ -369,6 +378,8 @@ class TraceKey:
             payload["backend"] = self.backend.value
         if self.identity_version >= 3:
             payload["device"] = self.device.value
+        if self.tracer is not None:
+            payload["tracer"] = self.tracer
         return _canonical_hash(
             payload,
             "trace",
@@ -384,6 +395,7 @@ class TraceRequest:
     backend: TraceBackend = TraceBackend.AUTO
     device: TraceDevice = TraceDevice.AUTO
     capture_policy: str = "greedy"
+    tracer: str | None = None
 
     def __post_init__(self) -> None:
         if self.backend in {
@@ -560,6 +572,7 @@ class TraceResult:
                 "backend": self.key.backend.value,
                 "device": self.key.device.value,
                 "identity_version": self.key.identity_version,
+                "tracer": self.key.tracer,
             },
             "records": [record.to_json() for record in self.records],
             "runtime": self.runtime,
@@ -594,6 +607,7 @@ class TraceResult:
                 backend=TraceBackend(str(key.get("backend", TraceBackend.AUTO.value))),
                 device=TraceDevice(str(key.get("device", TraceDevice.AUTO.value))),
                 identity_version=int(key.get("identity_version", 1)),
+                tracer=None if key.get("tracer") is None else str(key["tracer"]),
             ),
             records=tuple(ActivationRecord.from_json(item) for item in raw["records"]),
             runtime=str(raw["runtime"]),

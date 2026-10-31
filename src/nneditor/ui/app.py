@@ -2731,6 +2731,12 @@ class Shell:
             palette=self.palette,
             gguf_panel=self.gguf_panel,
             hf_panel=self.hf_panel,
+            capabilities=tuple(
+                (status.capability.value, status.availability.value, status.reason)
+                for status in (
+                    self.session.capability(c) for c in document.capabilities
+                )
+            ),
         )
         self._sync_info_sections()
         rows: list[ft.Control] = []
@@ -4009,6 +4015,23 @@ def cli(argv: Sequence[str] | None = None) -> None:
     )
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument(
+        "--create-tracer",
+        type=Path,
+        metavar="FOLDER",
+        help="create a working editable LLM tracer extension",
+    )
+    actions.add_argument(
+        "--install-tracer",
+        type=Path,
+        metavar="FOLDER",
+        help="install a folder containing nneditor-tracer.json",
+    )
+    actions.add_argument(
+        "--list-tracers",
+        action="store_true",
+        help="list tracing extensions and their installation folder",
+    )
+    actions.add_argument(
         "--register-file-types",
         action="store_true",
         help="register NNEditor in Windows Open with and Default apps",
@@ -4031,6 +4054,39 @@ def cli(argv: Sequence[str] | None = None) -> None:
     )
     arguments = parser.parse_args(argv)
     try:
+        if (
+            arguments.create_tracer
+            or arguments.install_tracer
+            or arguments.list_tracers
+        ):
+            from nneditor.tracing.plugins import (
+                create_trace_plugin,
+                default_trace_registry,
+                install_trace_plugin,
+                trace_plugin_directory,
+            )
+
+            if arguments.create_tracer:
+                created = create_trace_plugin(arguments.create_tracer)
+                print(
+                    f"Created {created.name} at {arguments.create_tracer}. "
+                    "Edit its manifest and tracer.py, then use --install-tracer."
+                )
+            elif arguments.install_tracer:
+                installed = install_trace_plugin(arguments.install_tracer)
+                print(
+                    f"Installed {installed.name} {installed.version}. "
+                    "Select it in the Trace panel; reload tracers if "
+                    "NNEditor is already open."
+                )
+            else:
+                registry = default_trace_registry()
+                print(f"Tracer directory: {trace_plugin_directory()}")
+                for plugin in registry.plugins:
+                    print(f"{plugin.id} {plugin.version} - {plugin.name}")
+                for error in registry.errors:
+                    print(f"Unavailable: {error}")
+            return
         if arguments.register_file_types:
             registration = register_file_associations(
                 icon_path=APP_WINDOW_ICON_PATH,
@@ -4047,6 +4103,6 @@ def cli(argv: Sequence[str] | None = None) -> None:
         if arguments.choose_default_app:
             open_default_apps_settings()
             return
-    except FileAssociationError as error:
+    except (FileAssociationError, OSError, ValueError) as error:
         parser.error(str(error))
     run(arguments.model)

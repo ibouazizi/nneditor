@@ -453,6 +453,12 @@ def run_onnx_trace(
     token: CancellationToken,
 ) -> TraceResult:
     """Export a working revision, run it out of process, then atomically adopt."""
+    from nneditor import __version__
+
+    if request.tracer not in (None, f"builtin.onnx@{__version__}"):
+        raise TraceError("The ONNX runner cannot execute a different tracer extension")
+    if key.tracer != request.tracer:
+        raise TraceError("trace key and approval must name the same tracer")
     request.approval.validate(
         model_title=Path(document.source.path).name,
         artifact_hash=document.source.content_hash,
@@ -460,6 +466,7 @@ def run_onnx_trace(
         limits=request.limits,
         backend=request.backend,
         device=request.device,
+        tracer=request.tracer,
     )
     token.raise_if_cancelled()
     try:

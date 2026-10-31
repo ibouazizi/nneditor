@@ -86,7 +86,7 @@ def _write_capture(
                 "full_byte_length": 0,
                 "stored_byte_length": 0,
                 "file_name": None,
-                "reason": reason or "the numpy LLM runtime produced no value",
+                "reason": reason or "the selected tracer produced no value",
             },
             remaining,
         )

@@ -19,6 +19,8 @@ from nneditor.tracing.contracts import (
 )
 from nneditor.tracing.inputs import bind_inputs
 from nneditor.tracing.llm_support import validate_llm_trace
+from nneditor.tracing.plugin_manifest import TracePlugin
+from nneditor.tracing.plugins import snapshot_plugin
 from nneditor.tracing.runner import (
     TraceError,
     _capture_pressure_note,
@@ -42,9 +44,10 @@ def run_llm_trace(
     store: ActivationStore,
     *,
     token: CancellationToken,
+    plugin: TracePlugin | None = None,
 ) -> TraceResult:
     """Trace a GGUF or Hugging Face snapshot in an isolated numpy worker."""
-    if document.artifact_kind not in _LLM_KINDS:
+    if plugin is None and document.artifact_kind not in _LLM_KINDS:
         raise TraceError(
             f"{document.artifact_kind.value} has no numpy LLM trace worker"
         )
@@ -55,9 +58,22 @@ def run_llm_trace(
         limits=request.limits,
         backend=request.backend,
         device=request.device,
+        tracer=request.tracer,
     )
     token.raise_if_cancelled()
-    validate_llm_trace(document)
+    if request.tracer is not None and plugin is None:
+        raise TraceError(
+            "An explicitly selected tracer needs its registered implementation"
+        )
+    if key.tracer != request.tracer:
+        raise TraceError("trace key and approval must name the same tracer")
+    if plugin is None or plugin.id == "builtin.numpy-llm":
+        validate_llm_trace(document)
+    if plugin is not None:
+        if request.tracer != plugin.identity:
+            raise TraceError("trace approval must name the selected tracer identity")
+        if reason := plugin.incompatibility(document):
+            raise TraceError(reason)
     if key.revision_id is not None:
         raise TraceError(
             "LLM traces require unedited source weights; undo edits before tracing."
@@ -84,6 +100,9 @@ def run_llm_trace(
     response_path = scratch / "response.json"
     try:
         token.raise_if_cancelled()
+        frozen = (
+            snapshot_plugin(plugin, scratch / "plugin") if plugin is not None else None
+        )
         minimum_memory = input_bytes + 64 * _MIB
         if request.limits.memory_bytes < minimum_memory:
             recommended = recommended_trace_limits(
@@ -115,6 +134,10 @@ def run_llm_trace(
             "device": request.device.value,
             "capture_policy": request.capture_policy,
             "revision_id": key.revision_id,
+            "tracer": request.tracer,
+            "tracer_manifest": str(frozen.manifest)
+            if frozen is not None and frozen.manifest is not None
+            else None,
             **request.limits.to_json(),
         }
         request_path.write_text(
@@ -134,7 +157,9 @@ def run_llm_trace(
             response_path,
             request.limits,
             token,
-            module=_WORKER_MODULE,
+            module="nneditor.tracing.plugin_worker"
+            if plugin is not None
+            else _WORKER_MODULE,
         )
         if pressure_note is not None:
             notes = (*notes, pressure_note)

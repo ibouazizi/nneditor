@@ -636,6 +636,7 @@ def model_overview_controls(
     palette: ShellPalette,
     gguf_panel: GgufContainerPanel | None = None,
     hf_panel: HfContainerPanel | None = None,
+    capabilities: tuple[tuple[str, str, str], ...] | None = None,
 ) -> list[ft.Control]:
     summary = dict(viewmodel.model_summary(document))
     gguf = gguf_container_summary(document)
@@ -671,7 +672,12 @@ def model_overview_controls(
         metadata_section(tuple(_artifact_items(document, summary)), palette=palette)
     )
     controls.append(
-        _capabilities_section(viewmodel.capability_lines(document), palette=palette)
+        _capabilities_section(
+            capabilities
+            if capabilities is not None
+            else viewmodel.capability_lines(document),
+            palette=palette,
+        )
     )
     findings = viewmodel.diagnostic_lines(document)
     if findings:

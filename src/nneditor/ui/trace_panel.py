@@ -13,6 +13,7 @@ callable.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import Callable
 from pathlib import Path
@@ -39,6 +40,11 @@ from nneditor.tracing.contracts import (
     declared_byte_size,
 )
 from nneditor.tracing.llm_support import LLM_KINDS
+from nneditor.tracing.plugins import (
+    TracePlugin,
+    install_trace_plugin,
+    trace_plugin_directory,
+)
 from nneditor.tracing.preflight import RuntimeStatus, runtime_status
 from nneditor.tracing.runner import estimated_capture_bytes
 from nneditor.ui import overview, viewmodel
@@ -195,6 +201,30 @@ class TracePanel:
         self._runtime_probe_started = False
         self._probing_runtime = False
         self._cached_runtime_status: RuntimeStatus | None = None
+        self.tracer = ft.Dropdown(
+            label="Tracer", dense=True, expand=True, on_select=self._on_tracer_changed
+        )
+        self.tracer_refresh = ft.IconButton(
+            icon=ft.Icons.REFRESH_ROUNDED,
+            tooltip="Reload tracer extensions",
+            on_click=self._on_tracers_refresh,
+        )
+        self.tracer_install = ft.IconButton(
+            icon=ft.Icons.CREATE_NEW_FOLDER_OUTLINED,
+            tooltip="Install a tracer folder",
+            on_click=self._on_install_tracer,
+        )
+        self.tracer_info = ft.Text(size=10, color=palette.muted)
+        self.tracer_panel = ft.Column(
+            controls=[
+                ft.Row(
+                    controls=[self.tracer, self.tracer_refresh, self.tracer_install],
+                    spacing=2,
+                ),
+                self.tracer_info,
+            ],
+            spacing=4,
+        )
         self.prepare_prompt = ft.TextButton(
             content="Prepare prompt input",
             icon=ft.Icons.TEXT_FIELDS_ROUNDED,
@@ -436,6 +466,7 @@ class TracePanel:
                 ),
                 self.result_annotations,
                 self.prepare_prompt,
+                self.tracer_panel,
                 self.run_settings,
                 self.blocker_notice,
                 self.approval_notice,
@@ -468,6 +499,7 @@ class TracePanel:
         # The capture-scope choice persists for one session only; the next
         # model starts from the smart default again.
         self._scope_choice = None
+        self.tracer.value = None
         self._configure_runtime()
         if (
             self._session() is not None
@@ -483,6 +515,7 @@ class TracePanel:
         return session is not None and session.document.artifact_kind in LLM_KINDS
 
     def _configure_runtime(self) -> None:
+        self._populate_tracers()
         llm = self._is_llm()
         self.prepare_prompt.visible = llm
         self.runtime_choices.visible = not llm
@@ -525,6 +558,117 @@ class TracePanel:
             self._render_runtime_status(self._cached_runtime_status)
         else:
             self.runtime_text.value = "Open an artifact to see tracing availability."
+        plugin = self._selected_tracer()
+        if plugin is not None and not plugin.builtin:
+            self.backend.options = [
+                ft.DropdownOption(
+                    key=TraceBackend.AUTO.value, text="Runtime provided by tracer"
+                )
+            ]
+            self.backend.value = TraceBackend.AUTO.value
+            self.device.options = [
+                ft.DropdownOption(key=d.value, text=d.value.upper())
+                for d in plugin.devices
+            ]
+            if self.device.value not in {d.value for d in plugin.devices}:
+                self.device.value = plugin.devices[0].value
+            self.runtime_choices.visible = len(plugin.devices) > 1
+            self.runtime_text.value = (
+                plugin.description
+                or f"{plugin.name} {plugin.version} · isolated extension worker"
+            )
+
+    def _selected_tracer(self) -> TracePlugin | None:
+        session = self._session()
+        return (
+            next(
+                (
+                    p
+                    for p in session.trace_registry.plugins
+                    if p.identity == self.tracer.value
+                ),
+                None,
+            )
+            if session is not None
+            else None
+        )
+
+    def _populate_tracers(self) -> None:
+        session = self._session()
+        self.tracer_panel.visible = session is not None
+        if session is None:
+            return
+        candidates = session.trace_registry.candidates(session.document)
+        self.tracer.options = [
+            ft.DropdownOption(
+                key=p.identity,
+                text=f"{p.name} {p.version}"
+                + (" (unavailable)" if session.tracer_reason(p) else ""),
+            )
+            for p in candidates
+        ]
+        if self.tracer.value not in {p.identity for p in candidates}:
+            preferred = next(
+                (p for p in candidates if session.tracer_reason(p) is None), None
+            )
+            self.tracer.value = (
+                preferred.identity
+                if preferred
+                else candidates[0].identity
+                if candidates
+                else None
+            )
+        errors = session.trace_registry.errors
+        self.tracer_info.value = (
+            "\n".join(errors)
+            if errors
+            else "Add a tracer folder, then select its implementation here."
+        )
+        self.tracer_info.tooltip = (
+            f"Install extensions in {trace_plugin_directory()} or use "
+            "nneditor --install-tracer FOLDER. Plugin Python runs only "
+            "in the approved worker."
+        )
+        self.tracer_info.color = self.palette.warning if errors else self.palette.muted
+        plugin = self._selected_tracer()
+        self.tracer.tooltip = (
+            f"{plugin.name} {plugin.version}" if plugin else "Select a tracer"
+        )
+
+    def _on_tracer_changed(self, event: ft.Event[ft.Dropdown]) -> None:
+        self._configure_runtime()
+        self.refresh_actions()
+        self._refresh_inspector(self._inspected_ids())
+        self.page.update()
+
+    def _on_tracers_refresh(self, event: ft.Event[ft.IconButton] | None = None) -> None:
+        session = self._session()
+        if session is not None:
+            session.refresh_tracers()
+        self._configure_runtime()
+        self.refresh_actions()
+        self._refresh_inspector(self._inspected_ids())
+        self.page.update()
+
+    async def _on_install_tracer(self, event: ft.Event[ft.IconButton]) -> None:
+        if getattr(self.page, "web", False):
+            self._on_error("Tracer installation is available in the desktop app.")
+            self.page.update()
+            return
+        directory = await self.picker.get_directory_path(
+            dialog_title="Choose a folder containing nneditor-tracer.json"
+        )
+        if directory is None:
+            return
+        try:
+            plugin = await asyncio.to_thread(install_trace_plugin, Path(directory))
+        except (OSError, ValueError) as error:
+            self._on_error(f"Could not install tracer: {error}")
+        else:
+            self._on_status(f"Installed {plugin.name} {plugin.version}")
+            self.tracer.value = plugin.identity
+            self._on_tracers_refresh()
+        self.page.update()
 
     # -- runtime preflight -------------------------------------------------
 
@@ -1187,18 +1331,23 @@ class TracePanel:
         available = False
         reason = "Open an artifact to see tracing availability."
         if session is not None:
-            status = session.capability(Capability.TRACING)
+            status = session.trace_capability(self.tracer.value)
             self.approval_notice.value = (
                 f"Selecting Approve & run authorizes one isolated trace of "
                 f"{session.title} using the backend, device, graph inputs, and "
                 "four limits shown. The memory limit covers host RAM; "
                 "accelerator memory is controlled by its driver."
             )
-            if self._is_llm():
+            plugin = self._selected_tracer()
+            if self._is_llm() and (plugin is None or plugin.builtin):
                 self.approval_notice.value = (
                     "Approve & run authorizes one isolated CPU trace of this "
                     "model's source weights, using your prompt input "
                     "and the limits shown."
+                )
+            if plugin is not None:
+                self.approval_notice.value += (
+                    f" Tracer: {plugin.name} {plugin.version}."
                 )
             available = status.availability is Availability.AVAILABLE and not web
             reason = (
@@ -1234,11 +1383,13 @@ class TracePanel:
             )
         elif self.active_trace_id is None:
             if self._is_llm():
+                plugin = self._selected_tracer()
+                kind = "CPU trace" if plugin is None or plugin.builtin else "trace"
                 self.status.value = (
                     "Prepare a sample or custom prompt, generate and assign its token "
-                    "input, then run a CPU trace."
+                    f"input, then run a {kind}."
                     if available and needs_prompt
-                    else "Prompt input is ready for a CPU trace."
+                    else f"Prompt input is ready for a {kind}."
                     if available
                     else reason.splitlines()[0]
                 )
@@ -1297,7 +1448,13 @@ class TracePanel:
         )
         self.capture_selected_only.disabled = busy
         self.capture_scope_choice.disabled = busy
-        self.backend.disabled = busy or self._is_llm()
+        self.tracer.disabled = busy
+        self.tracer_refresh.disabled = busy
+        self.tracer_install.disabled = busy or web
+        plugin = self._selected_tracer()
+        self.backend.disabled = (
+            busy or self._is_llm() or (plugin is not None and not plugin.builtin)
+        )
         reference_backend = self.backend.value in {
             TraceBackend.REFERENCE.value,
             TraceBackend.REFERENCE_NORMALIZED.value,
@@ -1398,6 +1555,7 @@ class TracePanel:
         capture_text = self.capture_mib.value or ""
         chunk_text = self.chunk_kib.value or ""
         backend_text = self.backend.value or TraceBackend.AUTO.value
+        tracer_text = self.tracer.value
         device_text = self.device.value or TraceDevice.AUTO.value
         if backend_text in {
             TraceBackend.REFERENCE.value,
@@ -1441,6 +1599,7 @@ class TracePanel:
                     limits,
                     backend,
                     device,
+                    tracer=tracer_text,
                 )
                 request = TraceRequest(
                     specification,
@@ -1450,6 +1609,7 @@ class TracePanel:
                     backend=backend,
                     device=device,
                     capture_policy=capture_policy,
+                    tracer=tracer_text,
                 )
                 job = session.trace_async(request)
             except (OSError, TypeError, ValueError) as error:

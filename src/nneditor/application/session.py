@@ -93,7 +93,9 @@ from nneditor.tracing.inputs import (
 )
 from nneditor.tracing.llm_runner import run_llm_trace
 from nneditor.tracing.llm_support import LLM_KINDS, trace_unavailable_reason
+from nneditor.tracing.plugins import TracePlugin, TraceRegistry, default_trace_registry
 from nneditor.tracing.runner import run_onnx_trace
+from nneditor.tracing.sdk import TracePluginError
 from nneditor.tracing.store import ActivationStore, ActivationView
 from nneditor.tracing.visualization import (
     ActivationVisualization,
@@ -226,6 +228,7 @@ class ModelSession:
         "_stats",
         "_stats_lock",
         "_stats_sidecar",
+        "_trace_registry",
         "editing",
         "hierarchy",
         "id",
@@ -245,11 +248,13 @@ class ModelSession:
         hierarchy_store: HierarchySidecarStore | None = None,
         activation_store: ActivationStore | None = None,
         input_store: InputSpecificationStore | None = None,
+        trace_registry: TraceRegistry | None = None,
     ) -> None:
         self.id = session_id
         self._source_document = document
         self.store = TensorStore(document)
         self._llm_preflight: tuple[Document, str | None] | None = None
+        self._trace_registry = trace_registry or default_trace_registry()
         try:
             self._state_lock = threading.RLock()
             self._slicer = slicer
@@ -291,7 +296,20 @@ class ModelSession:
     # -- capability and diagnostic access ---------------------------------
 
     def capability(self, capability: Capability) -> CapabilityStatus:
+        if capability is Capability.TRACING:
+            return self.trace_capability()
         document = self.document
+        if capability is Capability.EXECUTION:
+            plugin = self._trace_registry.preferred(document)
+            if plugin is not None and not plugin.builtin:
+                tracing = self.trace_capability(plugin.identity)
+                return CapabilityStatus(
+                    capability,
+                    Availability.PARTIAL
+                    if tracing.availability is Availability.AVAILABLE
+                    else Availability.UNAVAILABLE,
+                    tracing.reason,
+                )
         if (
             capability in {Capability.TRACING, Capability.EXECUTION}
             and document.artifact_kind in LLM_KINDS
@@ -307,6 +325,63 @@ class ModelSession:
             if reason:
                 return CapabilityStatus(capability, Availability.UNAVAILABLE, reason)
         return document.capability(capability)
+
+    @property
+    def trace_registry(self) -> TraceRegistry:
+        """The discovered tracers and any installation/discovery errors."""
+        return self._trace_registry
+
+    def refresh_tracers(self) -> None:
+        self._trace_registry = self._trace_registry.refreshed()
+
+    def tracer_reason(self, plugin: TracePlugin) -> str | None:
+        document = self.document
+        if plugin.id == "builtin.numpy-llm":
+            if self._llm_preflight is None or self._llm_preflight[0] is not document:
+                self._llm_preflight = (document, trace_unavailable_reason(document))
+            return self._llm_preflight[1]
+        return self._trace_registry.reason(plugin, document)
+
+    def trace_capability(self, tracer: str | None = None) -> CapabilityStatus:
+        """Availability for the selected extension, including source-only rules."""
+        document = self.document
+        candidates = self._trace_registry.candidates(document)
+        plugin = (
+            next((p for p in candidates if p.identity == tracer), None)
+            if tracer
+            else next((p for p in candidates if self.tracer_reason(p) is None), None)
+        )
+        if plugin is None and tracer is not None:
+            return CapabilityStatus(
+                Capability.TRACING,
+                Availability.UNAVAILABLE,
+                "The selected tracer changed or was removed. Refresh tracers.",
+            )
+        if plugin is not None:
+            reason = self.tracer_reason(plugin)
+            if (
+                reason is None
+                and self.editing.current_revision_id is not None
+                and plugin.id != "builtin.onnx"
+            ):
+                reason = (
+                    "LLM and extension tracing requires the source weights. "
+                    "Undo tensor edits or reopen the exported weights with "
+                    "the model configuration."
+                )
+            return CapabilityStatus(
+                Capability.TRACING,
+                Availability.UNAVAILABLE if reason else Availability.AVAILABLE,
+                reason
+                or f"Trace with {plugin.name} {plugin.version} in an isolated worker.",
+            )
+        if document.artifact_kind in LLM_KINDS:
+            reason = trace_unavailable_reason(document)
+            if reason:
+                return CapabilityStatus(
+                    Capability.TRACING, Availability.UNAVAILABLE, reason
+                )
+        return document.capability(Capability.TRACING)
 
     @property
     def title(self) -> str:
@@ -627,18 +702,13 @@ class ModelSession:
     def trace_async(self, request: TraceRequest) -> Job[TraceResult]:
         """Run an explicitly approved isolated trace outside the UI process."""
         self._ensure_open()
-        status = self.capability(Capability.TRACING)
+        status = self.trace_capability(request.tracer)
         if status.availability is not Availability.AVAILABLE:
             raise SessionError(status.reason)
-        kind = self.document.artifact_kind
-        if kind not in {
-            ArtifactKind.ONNX_MODEL,
-            ArtifactKind.GGUF_MODEL,
-            ArtifactKind.HUGGINGFACE_MODEL,
-        }:
-            raise SessionError(
-                "tracing is implemented for ONNX, GGUF, and Hugging Face snapshots"
-            )
+        try:
+            plugin = self._trace_registry.resolve(self.document, request.tracer)
+        except TracePluginError as error:
+            raise SessionError(str(error)) from error
         if self._jobs is None or self._activation_store is None:
             raise SessionError("this session has no trace worker/store")
         self.save_trace_inputs(request.specification)
@@ -656,11 +726,12 @@ class ModelSession:
             request.specification.hash,
             request.backend,
             request.device,
+            tracer=request.tracer,
         )
 
         def work(token: CancellationToken) -> TraceResult:
             assert self._activation_store is not None
-            if snapshot.artifact_kind is ArtifactKind.ONNX_MODEL:
+            if plugin.id == "builtin.onnx":
 
                 def build_model(
                     destination: Path, build_token: CancellationToken
@@ -692,6 +763,7 @@ class ModelSession:
                 request,
                 self._activation_store,
                 token=token,
+                plugin=plugin if request.tracer is not None else None,
             )
 
         return self._jobs.submit(f"trace {self.title}", work)
