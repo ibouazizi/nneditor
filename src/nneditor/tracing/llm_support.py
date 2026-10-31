@@ -24,6 +24,29 @@ from nneditor.tracing.llm_runtime import (
 LLM_KINDS = frozenset({ArtifactKind.GGUF_MODEL, ArtifactKind.HUGGINGFACE_MODEL})
 
 
+def _special_runtime_requirements(document: Document) -> tuple[str, ...]:
+    """Identify incompatible execution semantics from metadata, without reads.
+
+    Prism's type IDs are fork-specific. Name them only when the GGUF also
+    declares Prism metadata; keep unknown IDs opaque in the general reader.
+    """
+    if document.artifact_kind is not ArtifactKind.GGUF_MODEL:
+        return ()
+    metadata = dict(document.extensions).get("x-gguf.metadata")
+    if not isinstance(metadata, dict):
+        return ()
+    requirements: list[str] = []
+    if metadata.get("general.architecture") == "qwen35":
+        requirements.append("Qwen3.5 hybrid decoder with GatedDeltaNet layers")
+    if any(key.startswith("prism.hadamard.") for key in metadata):
+        types = {tensor.element_type for tensor in document.tensors.values()}
+        for dtype, name in (("gguf.type_142", "PQ2_0"), ("gguf.type_143", "PTQ1_0")):
+            if dtype in types:
+                requirements.append(f"Prism {name} packed-weight decoding")
+        requirements.append("Prism Hadamard activation transforms")
+    return tuple(requirements)
+
+
 def _roles(document: Document, node: Node, *, layer_norm: bool) -> set[str]:
     classifier = {
         "Embedding": _embed_role,
@@ -61,6 +84,12 @@ def _roles(document: Document, node: Node, *, layer_norm: bool) -> set[str]:
 
 def validate_llm_trace(document: Document) -> None:
     """Reject unsupported semantics before allocating or reading any weights."""
+    if requirements := _special_runtime_requirements(document):
+        raise LlmTraceError(
+            "NNEditor cannot trace this model yet. Missing runtime support:\n"
+            + "\n".join(f"• {requirement}" for requirement in requirements)
+            + "\nMetadata, the inferred graph, and weight bytes can still be inspected."
+        )
     params = hyperparams_from_document(document)
     if params.architecture not in {"llama", "qwen2", "qwen3", "gpt2"}:
         raise LlmTraceError(

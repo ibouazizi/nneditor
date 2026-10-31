@@ -332,6 +332,22 @@ class TracePanel:
             size=10,
             color=palette.muted,
         )
+        self.blocker_title = ft.Text(
+            size=11,
+            weight=ft.FontWeight.W_700,
+            color=palette.warning,
+        )
+        self.blocker_text = ft.Text(size=11, color=palette.ink, selectable=True)
+        self.blocker_notice = ft.Container(
+            data="trace-blocker",
+            content=ft.Column(
+                controls=[self.blocker_title, self.blocker_text], spacing=6
+            ),
+            padding=10,
+            bgcolor=palette.warning_soft,
+            border_radius=8,
+            visible=False,
+        )
         self.run_button = ft.FilledButton(
             content="Approve & run trace",
             icon=ft.Icons.PLAY_ARROW_ROUNDED,
@@ -392,6 +408,25 @@ class TracePanel:
         self._onnx_backends = list(self.backend.options)
         self._onnx_devices = list(self.device.options)
         self.runtime_choices = ft.Row(controls=[self.backend, self.device], spacing=6)
+        self.run_settings = ft.Column(
+            controls=[
+                self.seed,
+                self.shapes,
+                self.runtime_choices,
+                ft.Row(
+                    controls=[self.runtime_text, self.runtime_refresh],
+                    spacing=2,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                ft.Row(controls=[self.wall_seconds, self.memory_mib], spacing=6),
+                ft.Row(controls=[self.capture_mib, self.chunk_kib], spacing=6),
+                self.capture_estimate,
+                self.capture_scope_choice,
+                self.capture_selected_only,
+                self.capture_scope,
+            ],
+            spacing=8,
+        )
         self.control = ft.Column(
             controls=[
                 ft.Row(
@@ -401,26 +436,8 @@ class TracePanel:
                 ),
                 self.result_annotations,
                 self.prepare_prompt,
-                self.seed,
-                self.shapes,
-                self.runtime_choices,
-                ft.Row(
-                    controls=[self.runtime_text, self.runtime_refresh],
-                    spacing=2,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-                ft.Row(
-                    controls=[self.wall_seconds, self.memory_mib],
-                    spacing=6,
-                ),
-                ft.Row(
-                    controls=[self.capture_mib, self.chunk_kib],
-                    spacing=6,
-                ),
-                self.capture_estimate,
-                self.capture_scope_choice,
-                self.capture_selected_only,
-                self.capture_scope,
+                self.run_settings,
+                self.blocker_notice,
                 self.approval_notice,
                 ft.Row(
                     controls=[self.run_button, self.cancel_button],
@@ -1184,9 +1201,14 @@ class TracePanel:
                 "exactly one isolated trace."
             )
         self.progress.visible = busy
+        self.run_settings.visible = available
+        self.prepare_prompt.visible = self._is_llm() and available
         needs_prompt = self._is_llm() and not self.input_bindings
         self.prepare_prompt.disabled = busy or not available
         self.run_button.disabled = not available or busy or needs_prompt
+        self._refresh_run_blocker(
+            session is not None, available, busy, needs_prompt, reason
+        )
         self.cancel_button.disabled = not running
         active_result = (
             session.trace(self.active_trace_id)
@@ -1207,7 +1229,7 @@ class TracePanel:
                     if available and needs_prompt
                     else "Prompt input is ready for a CPU trace."
                     if available
-                    else reason
+                    else reason.splitlines()[0]
                 )
             else:
                 self.status.value = (
@@ -1271,6 +1293,40 @@ class TracePanel:
         }
         self.device.disabled = busy or reference_backend
         self.refresh_capture_scope()
+
+    def _refresh_run_blocker(
+        self,
+        has_session: bool,
+        available: bool,
+        busy: bool,
+        needs_prompt: bool,
+        reason: str,
+    ) -> None:
+        """Explain disabled approval at the action itself, including after a trace."""
+        self.blocker_notice.visible = (
+            has_session and not busy and (not available or needs_prompt)
+        )
+        self.blocker_notice.bgcolor = self.palette.warning_soft
+        self.blocker_title.color = self.palette.warning
+        self.blocker_text.color = self.palette.ink
+        if available and needs_prompt:
+            self.blocker_title.value = "Prompt input required"
+            self.blocker_text.value = (
+                "Select Prepare prompt input, enter a prompt, then choose "
+                "Generate, save & assign. You can also assign a .npy token tensor "
+                "from the model input node."
+            )
+        else:
+            self.blocker_title.value = "Tracing unavailable"
+            self.blocker_text.value = reason
+        self.approval_notice.visible = available
+        self.run_button.tooltip = (
+            "A trace is being prepared or is already running."
+            if busy
+            else self.blocker_text.value
+            if self.run_button.disabled
+            else "Run one approved trace with the inputs and limits shown."
+        )
 
     def _render_result_annotations(self, result: TraceResult | None) -> None:
         """Render a finished trace's diagnostics and notes as separate rows.

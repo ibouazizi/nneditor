@@ -81,20 +81,26 @@ workflow available for each artifact.
 | Textual StableHLO | Functions, regions, operations, attributes | Inspection only | Unavailable | Unavailable |
 | Qualcomm DLC container | Decoded graph, typed weights, quantization encodings, container index | Unavailable | Unavailable | Unavailable |
 | Core ML package (.mlpackage) | Manifest, model header, feature names, typed weight blobs | Unavailable | Unavailable | Unavailable |
-| GGUF (v1, v2, v3, including big-endian) | Synthetic LLM graph, lazy weights, architecture metadata | Tensor-level changes | Unavailable | Available on desktop |
-| Hugging Face snapshot directory | Synthetic LLM graph, config, tokenizer, lazy safetensors shards | Tensor-level changes | Weights-only safetensors | Available on desktop |
+| GGUF (v1, v2, v3, including big-endian) | Synthetic LLM graph, lazy weights, architecture metadata | Tensor-level changes | Unavailable | Supported decoder configurations on desktop |
+| Hugging Face snapshot directory | Synthetic LLM graph, config, tokenizer, lazy safetensors shards | Tensor-level changes | Weights-only safetensors | Supported decoder configurations on desktop |
 
 Support is intentionally capability-specific. For example, opening a checkpoint
 does not imply that NNEditor can reconstruct a model graph, and reading
 StableHLO does not imply that NNEditor can write the dialect back. Unavailable
 actions explain the format-specific reason directly in the interface.
 
+Ternary Bonsai 2 files using the `qwen35` hybrid decoder, Prism `PQ2_0` or
+`PTQ1_0` packed weights, and Hadamard activation transforms currently support
+inspection only. NNEditor's trace runtime does not implement those execution
+paths. The trace panel lists the missing runtime support beside the disabled
+run button; assigning a prompt does not enable unsupported models.
+
 ## Installation
 
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.6.0
+python -m pip install nneditor==1.6.1
 ```
 
 Start the desktop application with either command:
