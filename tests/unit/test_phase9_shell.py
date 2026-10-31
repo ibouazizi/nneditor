@@ -123,7 +123,7 @@ def test_open_model_applies_model_aware_trace_defaults(
     )
     monkeypatch.setattr(
         "nneditor.ui.app.recommended_trace_limits",
-        lambda _model_bytes: suggested,
+        lambda _model_bytes, **_kwargs: suggested,
     )
 
     with ApplicationService() as service:
@@ -1085,7 +1085,7 @@ def test_trace_shell_invalid_limits_and_web_unavailable(tmp_path: Path) -> None:
         page.web = True  # type: ignore[attr-defined]
         shell.trace.refresh_actions()
         assert shell.trace.run_button.disabled
-        assert "Phase 8" in str(shell.trace.status.value)
+        assert "desktop app" in str(shell.trace.status.value)
 
 
 def test_trace_shell_discloses_partial_capture(tmp_path: Path) -> None:

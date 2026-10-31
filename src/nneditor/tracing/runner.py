@@ -221,6 +221,8 @@ def _parse_worker_response(
 def _spawn_worker(
     scratch: Path,
     request_path: Path,
+    *,
+    module: str = "nneditor.tracing.trace_worker",
 ) -> tuple[subprocess.Popen[str], Path, Path]:
     """Start the isolated worker with its streams landing in files.
 
@@ -235,15 +237,29 @@ def _spawn_worker(
     err_handle = open(stderr_path, "w", encoding="utf-8", errors="replace")
     try:
         try:
+            env = _worker_environment("NNEDITOR_TRACE_WORKER")
+            # OpenBLAS/MKL default to one large workspace per core. Under
+            # RLIMIT_AS that mmap fails even for tiny models, so the isolated
+            # worker stays single-threaded.
+            env.update(
+                {
+                    "OPENBLAS_NUM_THREADS": "1",
+                    "OMP_NUM_THREADS": "1",
+                    "MKL_NUM_THREADS": "1",
+                    "NUMEXPR_NUM_THREADS": "1",
+                    "OPENBLAS_MAIN_FREE": "1",
+                    "VECLIB_MAXIMUM_THREADS": "1",
+                }
+            )
             process = subprocess.Popen(
                 [
                     sys.executable,
                     "-m",
-                    "nneditor.tracing.trace_worker",
+                    module,
                     str(request_path),
                 ],
                 cwd=scratch,
-                env=_worker_environment("NNEDITOR_TRACE_WORKER"),
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=out_handle,
                 stderr=err_handle,
@@ -259,11 +275,79 @@ def _spawn_worker(
     return process, stdout_path, stderr_path
 
 
+def _run_capped_worker(
+    scratch: Path,
+    request_path: Path,
+    response_path: Path,
+    limits: TraceLimits,
+    token: CancellationToken,
+    *,
+    module: str,
+) -> tuple[
+    tuple[ActivationRecord, ...],
+    str,
+    tuple[str, ...],
+    tuple[str, ...],
+    TraceDevice,
+    str,
+]:
+    """Spawn a worker, enforce the approved caps, and parse its response."""
+    process, stdout_path, stderr_path = _spawn_worker(
+        scratch, request_path, module=module
+    )
+    job = _cap_worker_process(process, limits.memory_bytes)
+    if os.name == "nt" and job is None:
+        process.kill()
+        process.wait()
+        raise TraceError("trace worker memory ceiling could not be enforced on Windows")
+    started = time.monotonic()
+    try:
+        while process.poll() is None:
+            try:
+                token.raise_if_cancelled()
+            except OperationCancelled:
+                process.kill()
+                process.wait()
+                raise
+            _check_darwin_worker_memory(process, limits.memory_bytes)
+            if time.monotonic() - started > limits.wall_seconds:
+                process.kill()
+                process.wait()
+                raise TraceError(
+                    f"trace worker exceeded {limits.wall_seconds:g} seconds"
+                )
+            time.sleep(0.02)
+    finally:
+        _close_job_object(job)
+    token.raise_if_cancelled()
+    if process.returncode != 0:
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        message = stderr.strip() or stdout.strip()
+        raise TraceError(f"trace worker failed: {message or process.returncode}")
+    try:
+        return _parse_worker_response(
+            json.loads(response_path.read_text(encoding="utf-8"))
+        )
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
+        raise TraceError(
+            f"trace worker returned an invalid response: {error}"
+        ) from error
+
+
 def _next_power_of_two(value: int) -> int:
     return 1 << max(0, value - 1).bit_length()
 
 
-def recommended_trace_limits(model_bytes: int) -> TraceLimits:
+def recommended_trace_limits(
+    model_bytes: int, *, streaming_weights: bool = False
+) -> TraceLimits:
     """Return practical isolated-worker defaults for an artifact's size."""
     if model_bytes < 0:
         raise ValueError("model byte size cannot be negative")
@@ -274,7 +358,12 @@ def recommended_trace_limits(model_bytes: int) -> TraceLimits:
     # CUDA trace of the 1.33 GB Qwen vision tower actually needed — its
     # host commit exceeded the previous six-set estimate and the job cap
     # turned driver allocations into spurious CUDA out-of-memory failures.
-    estimated_memory = model_bytes * 12 + _GIB + _DEFAULT_TRACE_CAPTURE_BYTES
+    # GGUF and Hugging Face workers stream one layer at a time, so the
+    # working set is the file plus one layer, capture, and interpreter headroom.
+    if streaming_weights:
+        estimated_memory = model_bytes + _GIB + _DEFAULT_TRACE_CAPTURE_BYTES
+    else:
+        estimated_memory = model_bytes * 12 + _GIB + _DEFAULT_TRACE_CAPTURE_BYTES
     memory_bytes = max(
         _DEFAULT_TRACE_MEMORY_BYTES,
         _next_power_of_two(estimated_memory),
@@ -433,60 +522,21 @@ def run_onnx_trace(
             json.dumps(payload, sort_keys=True),
             encoding="utf-8",
         )
-        process, stdout_path, stderr_path = _spawn_worker(scratch, request_path)
-        job = _cap_worker_process(process, request.limits.memory_bytes)
-        if os.name == "nt" and job is None:
-            process.kill()
-            process.wait()
-            raise TraceError(
-                "trace worker memory ceiling could not be enforced on Windows"
-            )
-        started = time.monotonic()
-        try:
-            while process.poll() is None:
-                try:
-                    token.raise_if_cancelled()
-                except OperationCancelled:
-                    process.kill()
-                    process.wait()
-                    raise
-                _check_darwin_worker_memory(process, request.limits.memory_bytes)
-                if time.monotonic() - started > request.limits.wall_seconds:
-                    process.kill()
-                    process.wait()
-                    raise TraceError(
-                        f"trace worker exceeded {request.limits.wall_seconds:g} seconds"
-                    )
-                time.sleep(0.02)
-        finally:
-            _close_job_object(job)
-        token.raise_if_cancelled()
-        if process.returncode != 0:
-            stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
-            stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
-            message = stderr.strip() or stdout.strip()
-            raise TraceError(f"trace worker failed: {message or process.returncode}")
-        try:
-            (
-                records,
-                runtime,
-                diagnostics,
-                notes,
-                execution_device,
-                execution_provider,
-            ) = _parse_worker_response(
-                json.loads(response_path.read_text(encoding="utf-8"))
-            )
-        except (
-            OSError,
-            KeyError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-        ) as error:
-            raise TraceError(
-                f"trace worker returned an invalid response: {error}"
-            ) from error
+        (
+            records,
+            runtime,
+            diagnostics,
+            notes,
+            execution_device,
+            execution_provider,
+        ) = _run_capped_worker(
+            scratch,
+            request_path,
+            response_path,
+            request.limits,
+            token,
+            module="nneditor.tracing.trace_worker",
+        )
         if pressure_note is not None:
             notes = (*notes, pressure_note)
         token.raise_if_cancelled()

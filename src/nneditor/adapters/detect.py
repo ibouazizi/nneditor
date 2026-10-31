@@ -14,6 +14,7 @@ import zipfile
 from pathlib import Path
 
 from nneditor.adapters.gguf.constants import GGUF_MAGIC_BYTES
+from nneditor.adapters.huggingface.snapshot import is_huggingface_snapshot
 from nneditor.ir.capabilities import ArtifactKind
 
 __all__ = ["DetectionError", "detect_artifact_kind"]
@@ -71,13 +72,17 @@ def _directory_kind(target: Path) -> ArtifactKind:
     """The contract a directory bundle satisfies, decided from its members.
 
     A Core ML ``.mlpackage`` is a directory: a ``Manifest.json`` next to a
-    ``Data/com.apple.CoreML/model.mlmodel`` protobuf. The marker is the
-    layout, not the directory's name or extension.
+    ``Data/com.apple.CoreML/model.mlmodel`` protobuf. A Hugging Face snapshot
+    is a directory: ``config.json`` (or ``adapter_config.json``) next to
+    safetensors or pickle weight files. The marker is the layout, not the
+    directory's name or extension.
     """
     manifest = target / "Manifest.json"
     model = target / "Data" / "com.apple.CoreML" / "model.mlmodel"
     if manifest.is_file() and model.is_file():
         return ArtifactKind.COREML_PACKAGE
+    if is_huggingface_snapshot(target):
+        return ArtifactKind.HUGGINGFACE_MODEL
     raise DetectionError(
         f"{target.name} is a directory but holds no recognized model package"
     )

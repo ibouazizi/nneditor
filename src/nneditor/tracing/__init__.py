@@ -72,6 +72,9 @@ from nneditor.tracing.inputs import (
 from nneditor.tracing.inputs import (
     tensor_file_binding_for_input as tensor_file_binding_for_input,
 )
+from nneditor.tracing.llm_runner import (
+    run_llm_trace as run_llm_trace,
+)
 from nneditor.tracing.runner import (
     TraceError as TraceError,
 )
@@ -142,6 +145,7 @@ __all__ = [
     "default_input_specification",
     "normalize_scan_axes",
     "recommended_trace_limits",
+    "run_llm_trace",
     "run_onnx_trace",
     "tensor_file_binding",
     "tensor_file_binding_for_input",

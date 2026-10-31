@@ -32,9 +32,14 @@ from types import TracebackType
 from typing import Final, Self
 
 from nneditor.cancellation import CancellationToken
+from nneditor.ir.capabilities import ArtifactKind
 from nneditor.ir.core import Document, Storage, TensorRef
 from nneditor.storage.cache import BudgetedCache, CacheSnapshot, CacheStats
-from nneditor.storage.paths import UnsafePathError, resolve_within
+from nneditor.storage.paths import (
+    UnsafePathError,
+    resolve_snapshot_member,
+    resolve_within,
+)
 from nneditor.storage.reader import ArtifactReader, RangeReadError
 
 __all__ = [
@@ -150,7 +155,12 @@ class TensorStore:
         # Resolved once here rather than once per read: resolution is a
         # syscall, and reads used to pay it while holding the store lock.
         self._source_resolved = self._source_path.resolve()
-        self._root = external_root if external_root else self._source_path.parent
+        if external_root is not None:
+            self._root = external_root
+        elif self._source_resolved.is_dir():
+            self._root = self._source_resolved
+        else:
+            self._root = self._source_path.parent
         self._slice_cache: BudgetedCache[tuple[str, int, int], bytes] = BudgetedCache(
             "tensor-slices", cache_budget, cost=len
         )
@@ -475,7 +485,12 @@ class TensorStore:
             assert tensor.external is not None
             reference = tensor.external
             try:
-                target = resolve_within(self._root, reference.location)
+                resolver = (
+                    resolve_snapshot_member
+                    if self.document.artifact_kind is ArtifactKind.HUGGINGFACE_MODEL
+                    else resolve_within
+                )
+                target = resolver(self._root, reference.location)
             except UnsafePathError as error:
                 raise TensorUnavailableError(
                     f"tensor {tensor.id!r} references an unsafe external "

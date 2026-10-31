@@ -27,7 +27,12 @@ __all__ = [
 
 _BLOCK_NAME: Final = re.compile(r"^blk\.(\d+)\.(.+)$")
 _EMBED_PREFIXES: Final = ("token_embd", "position_embd", "token_types")
-_EMPTY_KINDS: Final = {"attn": [], "ffn": [], "ssm": [], "extra": []}
+_EMPTY_KINDS: Final[dict[str, list[str]]] = {
+    "attn": [],
+    "ffn": [],
+    "ssm": [],
+    "extra": [],
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,10 +117,6 @@ def _vocab_size(
 
 
 def _attr_name(tensor_name: str) -> str:
-    if tensor_name.endswith(".weight"):
-        return tensor_name[: -len(".weight")]
-    if tensor_name.endswith(".bias"):
-        return tensor_name[: -len(".bias")]
     return tensor_name
 
 

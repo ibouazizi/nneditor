@@ -73,6 +73,7 @@ class GgufContainerPanel:
         self.query = ""
         self.dtype_filter = ""
         self.expanded_groups: set[str] = set()
+        self.row_limit = _MAX_ROWS
         self.search = ft.TextField(
             label="Search the container",
             hint_text="tensor name, metadata key, dtype…",
@@ -100,6 +101,7 @@ class GgufContainerPanel:
         self.query = ""
         self.dtype_filter = ""
         self.expanded_groups.clear()
+        self.row_limit = _MAX_ROWS
         self.search.value = ""
         self.list.controls = []
         self.root.controls = []
@@ -113,24 +115,32 @@ class GgufContainerPanel:
             self.query = ""
             self.dtype_filter = ""
             self.expanded_groups.clear()
+            self.row_limit = _MAX_ROWS
             self.search.value = ""
         self.document = document
         self._rebuild()
 
     def _on_search(self, event: ft.Event[ft.TextField]) -> None:
         self.query = str(event.control.value or "")
+        self.row_limit = _MAX_ROWS
         self._rebuild_catalog()
         self._update()
 
     def _set_pane(self, pane: str) -> ClickHandler:
         def handle(_event: ft.Event[ft.Control]) -> None:
             self.pane = pane
+            self.row_limit = _MAX_ROWS
             if pane != "tensors":
                 self.dtype_filter = ""
             self._rebuild()
             self._update()
 
         return handle
+
+    def _show_more(self, _event: ft.Event[ft.Control]) -> None:
+        self.row_limit += _MAX_ROWS
+        self._rebuild_catalog()
+        self._update()
 
     def _set_dtype(self, dtype: str) -> ClickHandler:
         def handle(_event: ft.Event[ft.Control]) -> None:
@@ -253,9 +263,11 @@ class GgufContainerPanel:
                 continue
             for row in items:
                 shown += 1
-                if shown <= _MAX_ROWS:
+                if shown <= self.row_limit:
                     controls.append(self._kv_card(row))
-        return _with_overflow(controls, shown, self.palette)
+        return _with_overflow(
+            controls, shown, self.palette, self.row_limit, self._show_more
+        )
 
     def _kv_card(self, row: GgufKvRow) -> ft.Control:
         actions: list[ft.Control] = []
@@ -380,9 +392,11 @@ class GgufContainerPanel:
                 continue
             for row in items:
                 shown += 1
-                if shown <= _MAX_ROWS:
+                if shown <= self.row_limit:
                     controls.append(self._tensor_card(row))
-        return _with_overflow(controls, shown, self.palette)
+        return _with_overflow(
+            controls, shown, self.palette, self.row_limit, self._show_more
+        )
 
     def _tensor_card(self, row: GgufTensorRow) -> ft.Control:
         offset = f" @ {row.offset:,}" if row.offset is not None else ""
@@ -630,13 +644,20 @@ def _hint(text: str, palette: ShellPalette) -> ft.Text:
 
 
 def _with_overflow(
-    controls: list[ft.Control], shown: int, palette: ShellPalette
+    controls: list[ft.Control],
+    shown: int,
+    palette: ShellPalette,
+    limit: int,
+    on_more: ClickHandler,
 ) -> list[ft.Control]:
-    if shown > _MAX_ROWS:
+    if shown > limit:
         controls.append(
             _hint(
-                f"{shown - _MAX_ROWS:,} more hidden — refine the search to see them.",
+                f"Showing {limit:,} of {shown:,} matching items.",
                 palette,
             )
+        )
+        controls.append(
+            ft.TextButton(content="Show more", on_click=on_more, data="gguf-show-more")
         )
     return controls

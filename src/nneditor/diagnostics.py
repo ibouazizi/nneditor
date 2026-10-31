@@ -524,6 +524,59 @@ _GGUF_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
     ),
 )
 
+_HUGGINGFACE_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
+    CodeDescriptor(
+        "huggingface.config-unreadable",
+        DiagnosticCategory.METADATA_LOSS,
+        "Hugging Face config unreadable",
+        "config.json is oversized or not valid JSON; weights are still "
+        "indexed when the shard files can be read.",
+    ),
+    CodeDescriptor(
+        "huggingface.index-unreadable",
+        DiagnosticCategory.EXTERNAL_DATA,
+        "Safetensors index unreadable",
+        "The shard index is missing, oversized, or not valid JSON, so "
+        "weight files are discovered from the directory instead.",
+    ),
+    CodeDescriptor(
+        "huggingface.missing-shard",
+        DiagnosticCategory.EXTERNAL_DATA,
+        "Weight shard is missing",
+        "The index names a shard that is not next to config.json; tensors "
+        "mapped to it are listed without bytes.",
+    ),
+    CodeDescriptor(
+        "huggingface.unsafe-shard-path",
+        DiagnosticCategory.EXTERNAL_DATA,
+        "Weight shard path escapes the snapshot",
+        "A weight_map location is absolute or traverses upward; tensors "
+        "mapped to it are listed without bytes.",
+    ),
+    CodeDescriptor(
+        "huggingface.pickle-weights",
+        DiagnosticCategory.UNSUPPORTED,
+        "Pickle weight shard not read",
+        "pytorch_model.bin and other pickle shards are not unpickled in "
+        "safe artifact mode; tensor names from an index are listed without "
+        "bytes.",
+    ),
+    CodeDescriptor(
+        "huggingface.duplicate-tensor-name",
+        DiagnosticCategory.IDENTITY,
+        "Duplicate Hugging Face tensor name",
+        "A later shard reuses a tensor name; the later entry is ignored so "
+        "identifiers stay unique.",
+    ),
+    CodeDescriptor(
+        "huggingface.tokenizer-elided",
+        DiagnosticCategory.METADATA_LOSS,
+        "Tokenizer vocabulary summarized",
+        "tokenizer.json is larger than the parse ceiling, so only its size "
+        "and file name are recorded at open.",
+    ),
+)
+
 
 _DESCRIPTORS: tuple[CodeDescriptor, ...] = (
     _PYTORCH_DESCRIPTORS
@@ -532,6 +585,7 @@ _DESCRIPTORS: tuple[CodeDescriptor, ...] = (
     + _DLC_DESCRIPTORS
     + _COREML_DESCRIPTORS
     + _GGUF_DESCRIPTORS
+    + _HUGGINGFACE_DESCRIPTORS
     + (
         CodeDescriptor(
             "onnx.custom-domain",

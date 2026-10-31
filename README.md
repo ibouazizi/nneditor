@@ -11,7 +11,8 @@
 </p>
 
 NNEditor 1.0 is a capability-aware neural-network workspace for ONNX, PyTorch,
-safetensors, GGUF, and textual StableHLO artifacts. It combines semantic graph
+safetensors, GGUF, Hugging Face snapshots, and textual StableHLO artifacts. It
+combines semantic graph
 navigation, lazy tensor access, reversible editing, validated export, and
 desktop activation tracing in one application.
 
@@ -80,7 +81,8 @@ workflow available for each artifact.
 | Textual StableHLO | Functions, regions, operations, attributes | Inspection only | Unavailable | Unavailable |
 | Qualcomm DLC container | Decoded graph, typed weights, quantization encodings, container index | Unavailable | Unavailable | Unavailable |
 | Core ML package (.mlpackage) | Manifest, model header, feature names, typed weight blobs | Unavailable | Unavailable | Unavailable |
-| GGUF (v1, v2, v3, including big-endian) | Synthetic LLM graph, lazy weights, architecture metadata | Tensor-level changes | Unavailable | Unavailable |
+| GGUF (v1, v2, v3, including big-endian) | Synthetic LLM graph, lazy weights, architecture metadata | Tensor-level changes | Unavailable | Available on desktop |
+| Hugging Face snapshot directory | Synthetic LLM graph, config, tokenizer, lazy safetensors shards | Tensor-level changes | Weights-only safetensors | Available on desktop |
 
 Support is intentionally capability-specific. For example, opening a checkpoint
 does not imply that NNEditor can reconstruct a model graph, and reading
@@ -92,7 +94,7 @@ actions explain the format-specific reason directly in the interface.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.5.0
+python -m pip install nneditor==1.6.0
 ```
 
 Start the desktop application with either command:
@@ -121,8 +123,8 @@ and never replaces a protected Windows default without that explicit choice.
 
 1. Select **Open model** and choose a supported artifact. NNEditor detects its
    format from the file contents. Directory bundles such as a Core ML
-   `.mlpackage` open through **Open folder** on the desktop shell, or directly
-   from the command line.
+   `.mlpackage` or a Hugging Face snapshot open through **Open folder** on the
+   desktop shell, or directly from the command line.
 2. Start in the architecture view, then open a block or change the detail level
    to move through blocks, layers, and operators.
 3. Select a node to inspect its ports, attributes, weights, and capability
@@ -146,7 +148,8 @@ it as complete.
 
 ## Activation tracing
 
-Desktop tracing is available for ONNX models:
+Desktop tracing is available for ONNX models, GGUF files, and Hugging Face
+snapshots.
 
 1. Open **Generate test input**. NNEditor detects every model input and creates
    a preset from its name, dtype, and shape. Symbolic or unknown extents default
@@ -164,14 +167,21 @@ Desktop tracing is available for ONNX models:
    the model-compatible flattened-patch profile.
    Required `*_mask` inputs left unchanged use an automatically generated
    all-valid mask; other inputs use deterministic random data.
+   GGUF files and Hugging Face snapshots open the **Text tokens** source with a
+   catalog of sample prompts. Sequence length left blank keeps the prompt's
+   natural token length. A Hugging Face `tokenizer.json` is used when it is a
+   complete byte-level BPE; otherwise words are hashed into the model's
+   vocabulary so shapes and ranges are valid.
 2. Open **Trace activations**, review the execution backend, execution device,
    input specification, and wall-clock, memory, capture, and chunk limits.
-   **Automatic** tries installed GPU and NPU execution providers before CPU;
-   an explicit GPU or NPU choice is strict and never silently runs on CPU.
-   Automatic backend mode falls back from ONNX Runtime to NNEditor's
+   For ONNX, **Automatic** tries installed GPU and NPU execution providers
+   before CPU; an explicit GPU or NPU choice is strict and never silently runs
+   on CPU. Automatic backend mode falls back from ONNX Runtime to NNEditor's
    axis-aware ONNX reference evaluator when no compatible runtime provider is
    available. The normalized reference option rewrites nonzero `Scan` axes
    with semantics-preserving transposes inside the private worker model.
+   GGUF and Hugging Face traces run a numpy decoder-only forward pass on CPU.
+   ONNX Runtime is not a backend for those formats.
 3. Select **Approve & run trace**. This click creates an approval bound to the
    current model, inputs, and limits for that run only.
 4. Click any operator, semantic block, visible connection, model input, or model
@@ -214,10 +224,18 @@ input or limit cannot reuse stale consent. The UI captures graph inputs and
 operator outputs by default so inspection does not depend on the selection that
 was active when the trace began.
 
-Tracing uses ONNX Runtime or an ONNX reference-evaluator mode in a separate,
-resource-limited process. The approved memory ceiling limits host RAM; device
-memory remains under the accelerator provider and driver. A failed or cancelled
-run publishes no trace.
+Tracing uses an isolated, resource-limited process. ONNX traces use ONNX
+Runtime or NNEditor's axis-aware reference evaluator. GGUF and Hugging Face
+traces use a numpy decoder-only worker that streams one layer at a time
+(Llama-style RMSNorm, RoPE, grouped-query attention, and SwiGLU, plus
+GPT-2-style fused projections where tensor names allow). Packed ggml types
+without a decoder, SSM blocks, scaled RoPE, sliding-window attention, pickle
+shards, and in-memory edits are refused before execution. Unsupported models
+remain available for inspection. Captures stream to disk as layers complete;
+the trace panel guides prompt preparation and shows the CPU backend.
+The approved memory ceiling limits host RAM; device memory remains
+under the accelerator provider and driver. A failed or cancelled run publishes
+no trace.
 Desktop subprocess isolation is not a multi-tenant security boundary, so
 tracing is disabled in the browser application until a dedicated worker
 service is available.

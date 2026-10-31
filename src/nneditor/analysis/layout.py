@@ -95,6 +95,17 @@ def _node_kind(node: Node) -> str:
 
 
 def _node_label(node: Node) -> str:
+    if node.domain == "nneditor.llm":
+        label = {
+            "Embedding": "Token embeddings",
+            "RMSNorm": "Final normalization",
+            "Linear": "Language model head",
+            "Attention": "Attention",
+            "FFN": "Feed-forward",
+            "SSM": "State-space block",
+            "Parameters": "Additional weights",
+        }.get(node.op_type, node.op_type)
+        return label
     return node.source_name or node.op_type
 
 
@@ -275,7 +286,9 @@ def layout_graph(
                     height=settings.node_height,
                     kind=_node_kind(node),
                     label=_node_label(node),
-                    type_label=node.qualified_op_type,
+                    type_label="Inferred layer"
+                    if node.domain == "nneditor.llm"
+                    else node.qualified_op_type,
                 )
             )
 

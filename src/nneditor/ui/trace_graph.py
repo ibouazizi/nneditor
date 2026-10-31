@@ -69,6 +69,7 @@ def build_trace_graph(
     members_by_glyph: dict[str, frozenset[str]],
 ) -> TraceGraphPresentation:
     """Add selectable model boundaries and map connections back to values."""
+    llm = any(node.domain == "nneditor.llm" for node in graph.nodes)
     representatives = {
         member: glyph_id
         for glyph_id, members in members_by_glyph.items()
@@ -163,7 +164,7 @@ def build_trace_graph(
                 width=_BOUNDARY_WIDTH,
                 height=_BOUNDARY_HEIGHT,
                 kind="graph-input",
-                label=value.name or "Model input",
+                label="Prompt tokens" if llm else value.name or "Model input",
                 type_label="Model input · choose tensor",
             )
         )
@@ -220,7 +221,7 @@ def build_trace_graph(
                 width=_BOUNDARY_WIDTH,
                 height=_BOUNDARY_HEIGHT,
                 kind="graph-output",
-                label=value.name or "Model output",
+                label="Logits" if llm else value.name or "Model output",
                 type_label="Model output · click to inspect",
             )
         )

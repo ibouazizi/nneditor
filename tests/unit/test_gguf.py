@@ -201,10 +201,13 @@ def test_synthetic_graph_and_source_hierarchy(tmp_path: Path) -> None:
     )
     assert embed.dims == (2, 2)
     model = dict(document.extensions)["x-gguf.model"]
+    assert isinstance(model, dict)
     assert model["architecture"] == "llama"
     assert model["tied_embeddings"] is True
-    assert model["kv_end"] > 0
-    assert model["tensor_table_end"] >= model["kv_end"]
+    kv_end, table_end = model["kv_end"], model["tensor_table_end"]
+    assert isinstance(kv_end, int) and isinstance(table_end, int)
+    assert kv_end > 0
+    assert table_end >= kv_end
     kv_records = dict(document.extensions)["x-gguf.kv"]
     assert isinstance(kv_records, list)
     keys = {item["key"] for item in kv_records if isinstance(item, dict)}
@@ -274,8 +277,12 @@ def test_weights_stay_available_on_a_healthy_file(tmp_path: Path) -> None:
     document = open_gguf(path)
     topology = document.capability(Capability.TOPOLOGY).availability
     weights = document.capability(Capability.WEIGHTS).availability
+    execution = document.capability(Capability.EXECUTION).availability
+    tracing = document.capability(Capability.TRACING).availability
     assert topology is Availability.PARTIAL
     assert weights is Availability.AVAILABLE
+    assert execution is Availability.UNAVAILABLE
+    assert tracing is Availability.UNAVAILABLE
     assert all(
         tensor.storage is Storage.EMBEDDED_RAW for tensor in document.tensors.values()
     )

@@ -25,6 +25,7 @@ from nneditor.input_generation import (
     parse_shape,
 )
 from nneditor.ir.core import Dim
+from nneditor.prompt_inputs import DEFAULT_PROMPT, SAMPLE_PROMPTS, PromptSettings
 from nneditor.tokenization import (
     TOKENIZER_CHOICES,
     Codebook,
@@ -70,6 +71,8 @@ class InputTarget:
     element_type: str | None
     shape: tuple[Dim, ...] | None
     is_mask: bool = False
+    prefer_form: str | None = None
+    prompt: PromptSettings | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,10 +86,18 @@ class InputGeneratorPreset:
     distribution: SyntheticDistribution
     assumptions: tuple[str, ...] = ()
     unavailable_reason: str | None = None
+    prompt: PromptSettings | None = None
+    sequence_length: int | None = None
 
     @property
     def ready(self) -> bool:
         return self.unavailable_reason is None
+
+    @property
+    def shape_description(self) -> str:
+        if self.kind == "text-tokens" and self.sequence_length is None and self.shape:
+            return f"({self.shape[0]}, prompt length)"
+        return str(self.shape)
 
 
 def preset_for_target(target: InputTarget) -> InputGeneratorPreset:
@@ -133,21 +144,34 @@ def preset_for_target(target: InputTarget) -> InputGeneratorPreset:
         )
     symbolic = tuple(extent for extent in target.shape if not isinstance(extent, int))
     shape = tuple(extent if isinstance(extent, int) else 1 for extent in target.shape)
-    assumptions = ("symbolic or unknown extents default to 1",) if symbolic else ()
     name = target.name.casefold()
     distribution: SyntheticDistribution
     if target.is_mask:
         kind = "mask"
         distribution = "ones"
+        assumptions = ("symbolic or unknown extents default to 1",) if symbolic else ()
     elif len(shape) == 2 and target.element_type in _TOKEN_DTYPES:
         kind = "text-tokens"
         distribution = "zeros"
+        # Prompt encoding chooses the sequence length; guessed `seq=1` would
+        # truncate every catalog prompt to a single token.
+        assumptions = (
+            ("prompt text is encoded at its natural token length",) if symbolic else ()
+        )
     elif _looks_like_image(shape, name):
         kind = "image"
         distribution = "normal"
+        assumptions = ("symbolic or unknown extents default to 1",) if symbolic else ()
     else:
         kind = "tensor"
         distribution = "normal" if target.element_type.startswith("float") else "zeros"
+        assumptions = ("symbolic or unknown extents default to 1",) if symbolic else ()
+    sequence_length: int | None = None
+    if kind == "text-tokens":
+        if target.prompt is not None and target.prompt.sequence_length is not None:
+            sequence_length = target.prompt.sequence_length
+        elif not symbolic:
+            sequence_length = shape[1]
     return InputGeneratorPreset(
         target=target,
         kind=kind,
@@ -155,6 +179,8 @@ def preset_for_target(target: InputTarget) -> InputGeneratorPreset:
         dtype=target.element_type,
         distribution=distribution,
         assumptions=assumptions,
+        prompt=target.prompt,
+        sequence_length=sequence_length,
     )
 
 
@@ -170,6 +196,8 @@ def _looks_like_image(shape: tuple[int, ...], name: str) -> bool:
 
 class TestInputWorkspace:
     """Own the generator form, safe publication, and target defaults."""
+
+    __test__ = False
 
     def __init__(
         self,
@@ -657,8 +685,13 @@ class TestInputWorkspace:
         for target in targets:
             preset = self.input_presets[target.name]
             if preset.ready:
-                details = f"{preset.kind} | {preset.dtype} | {preset.shape}" + (
-                    f" | {', '.join(preset.assumptions)}" if preset.assumptions else ""
+                details = (
+                    f"{preset.kind} | {preset.dtype} | {preset.shape_description}"
+                    + (
+                        f" | {', '.join(preset.assumptions)}"
+                        if preset.assumptions
+                        else ""
+                    )
                 )
                 icon = ft.Icons.CHECK_CIRCLE_OUTLINE_ROUNDED
             else:
@@ -695,10 +728,20 @@ class TestInputWorkspace:
         self.token_text = self._field(
             label="Text",
             hint_text="The prompt to encode into token ids",
-            value="The quick brown fox jumps over the lazy dog.",
+            value=DEFAULT_PROMPT,
             multiline=True,
             min_lines=2,
             max_lines=6,
+        )
+        self.token_prompt_catalog = ft.Dropdown(
+            value=SAMPLE_PROMPTS[0].id,
+            label="Sample prompt",
+            dense=True,
+            options=[
+                ft.DropdownOption(key=prompt.id, text=prompt.title)
+                for prompt in SAMPLE_PROMPTS
+            ],
+            on_select=self._on_sample_prompt,
         )
         self.token_codebook = ft.Dropdown(
             value=TOKENIZER_CHOICES[0].id,
@@ -786,6 +829,7 @@ class TestInputWorkspace:
         return ft.Container(
             content=ft.Column(
                 controls=[
+                    self.token_prompt_catalog,
                     self.token_text,
                     self.token_codebook,
                     self.token_note,
@@ -898,15 +942,46 @@ class TestInputWorkspace:
             if preset.assumptions
             else ""
         )
-        values = (
-            "all-valid values"
-            if preset.kind == "mask"
-            else f"deterministic {preset.distribution} synthetic values"
-        )
+        if preset.kind == "mask":
+            values = "all-valid values"
+        elif preset.kind == "text-tokens":
+            values = "prompt token ids"
+        else:
+            values = f"deterministic {preset.distribution} synthetic values"
         self.automatic_summary.value = (
-            f"{preset.target.name}: {values}, shape {preset.shape}, "
+            f"{preset.target.name}: {values}, shape {preset.shape_description}, "
             f"dtype {preset.dtype}.{assumptions}"
         )
+
+    def _on_sample_prompt(self, event: ft.Event[ft.Dropdown] | None) -> None:
+        selected = self.token_prompt_catalog.value
+        for prompt in SAMPLE_PROMPTS:
+            if prompt.id == selected:
+                self.token_text.value = prompt.text
+                break
+        if event is not None:
+            self.page.update()
+
+    def _apply_prompt_defaults(self, target: InputTarget) -> None:
+        prompt = target.prompt
+        if prompt is None:
+            return
+        self.token_text.value = prompt.text
+        self.token_prompt_catalog.value = SAMPLE_PROMPTS[0].id
+        if prompt.tokenizer_choice in {choice.id for choice in TOKENIZER_CHOICES}:
+            self.token_codebook.value = prompt.tokenizer_choice
+            self._refresh_token_choice()
+        if prompt.vocabulary_path:
+            self.token_vocabulary_path.value = prompt.vocabulary_path
+        if prompt.merges_path:
+            self.token_merges_path.value = prompt.merges_path
+        if prompt.vocab_size is not None:
+            self.token_vocab_size.value = str(prompt.vocab_size)
+        self.token_pad_id.value = str(prompt.pad_id)
+        self.token_bos_id.value = "" if prompt.bos_id is None else str(prompt.bos_id)
+        self.token_eos_id.value = "" if prompt.eos_id is None else str(prompt.eos_id)
+        if prompt.note:
+            self.token_note.value = prompt.note
 
     def _on_codebook_changed(self, event: ft.Event[ft.Dropdown] | None) -> None:
         self._refresh_token_choice()
@@ -1124,7 +1199,13 @@ class TestInputWorkspace:
     def _generate_preset(
         preset: InputGeneratorPreset, destination: Path
     ) -> GeneratedTensor:
-        if not preset.ready or preset.shape is None or preset.dtype is None:
+        if not preset.ready or preset.dtype is None:
+            raise InputGenerationError(
+                f"input {preset.target.name!r} has no complete generator preset"
+            )
+        if preset.kind == "text-tokens":
+            return TestInputWorkspace._generate_token_preset(preset, destination)
+        if preset.shape is None:
             raise InputGenerationError(
                 f"input {preset.target.name!r} has no complete generator preset"
             )
@@ -1142,6 +1223,30 @@ class TestInputWorkspace:
             distribution=preset.distribution,
             dtype=preset.dtype,
             seed=0,
+        )
+
+    @staticmethod
+    def _generate_token_preset(
+        preset: InputGeneratorPreset, destination: Path
+    ) -> GeneratedTensor:
+        prompt = preset.prompt
+        text = prompt.text if prompt is not None else DEFAULT_PROMPT
+        choice = prompt.tokenizer_choice if prompt is not None else "word-hash"
+        codebook = load_codebook(
+            choice,
+            vocabulary_path=prompt.vocabulary_path if prompt is not None else None,
+            merges_path=prompt.merges_path if prompt is not None else None,
+            vocab_size=prompt.vocab_size if prompt is not None else None,
+        )
+        return generate_token_ids_tensor(
+            destination,
+            text=text,
+            codebook=codebook,
+            sequence_length=preset.sequence_length,
+            dtype=preset.dtype or "int64",
+            pad_id=prompt.pad_id if prompt is not None else 0,
+            bos_id=prompt.bos_id if prompt is not None else None,
+            eos_id=prompt.eos_id if prompt is not None else None,
         )
 
     @staticmethod
@@ -1393,7 +1498,10 @@ class TestInputWorkspace:
             self._on_kind_changed(None)
             return
         preset = self.input_presets.get(target.name)
-        self.kind.value = "automatic"
+        self.kind.value = (
+            "text-tokens" if target.prefer_form == "text-tokens" else "automatic"
+        )
+        self._apply_prompt_defaults(target)
         supported_dtypes = {str(option.key) for option in self.tensor_dtype.options}
         if target.element_type in supported_dtypes:
             for dtype_field in (
@@ -1451,7 +1559,12 @@ class TestInputWorkspace:
                 self.image_width.value = str(grid_width * 16)
             elif len(shape) == 2 and target.element_type in token_dtypes:
                 # A rank-2 integer input is a batch of token ids, not a picture.
-                self.token_sequence_length.value = str(shape[1])
+                if preset is not None and preset.sequence_length is not None:
+                    self.token_sequence_length.value = str(preset.sequence_length)
+                elif target.prefer_form == "text-tokens":
+                    self.token_sequence_length.value = ""
+                else:
+                    self.token_sequence_length.value = str(shape[1])
             elif len(shape) == 2:
                 self.image_layout.value = "HW"
                 self.image_color.value = "grayscale"

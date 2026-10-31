@@ -15,10 +15,12 @@ import flet as ft
 from nneditor.ir.core import Document
 from nneditor.ui import viewmodel
 from nneditor.ui.gguf_view import GgufContainerSummary, gguf_container_summary
+from nneditor.ui.hf_view import HfContainerSummary, hf_container_summary
 from nneditor.ui.shell_layout import ShellPalette
 
 if TYPE_CHECKING:
     from nneditor.ui.gguf_inspector import GgufContainerPanel
+    from nneditor.ui.hf_inspector import HfContainerPanel
 
 __all__ = [
     "metadata_section",
@@ -484,6 +486,60 @@ def _default_metrics(
     )
 
 
+def _hf_metrics(hf: HfContainerSummary, *, palette: ShellPalette) -> ft.ResponsiveRow:
+    cards = [
+        _metric_card(
+            "Architecture",
+            hf.architecture,
+            ft.Icons.ACCOUNT_TREE_ROUNDED,
+            palette=palette,
+        ),
+        _metric_card(
+            "Blocks",
+            f"{hf.block_count:,}",
+            ft.Icons.LAYERS_ROUNDED,
+            palette=palette,
+        ),
+        _metric_card(
+            "Tensors",
+            f"{hf.n_tensors:,}",
+            ft.Icons.GRID_VIEW_ROUNDED,
+            palette=palette,
+        ),
+        _metric_card(
+            "Weights",
+            viewmodel.compact_bytes(hf.payload_bytes),
+            ft.Icons.DATA_OBJECT_ROUNDED,
+            palette=palette,
+        ),
+    ]
+    if hf.vocab_size is not None:
+        cards.append(
+            _metric_card(
+                "Vocab",
+                f"{hf.vocab_size:,}",
+                ft.Icons.TEXT_FIELDS_ROUNDED,
+                palette=palette,
+            )
+        )
+    if hf.context_length is not None:
+        cards.append(
+            _metric_card(
+                "Context",
+                f"{hf.context_length:,}",
+                ft.Icons.HISTORY_ROUNDED,
+                palette=palette,
+            )
+        )
+    metrics: list[ft.Control] = list(cards)
+    return ft.ResponsiveRow(
+        data="model-overview-metrics",
+        controls=metrics,
+        spacing=8,
+        run_spacing=8,
+    )
+
+
 def _gguf_metrics(
     gguf: GgufContainerSummary, *, palette: ShellPalette
 ) -> ft.ResponsiveRow:
@@ -551,7 +607,15 @@ def _artifact_items(
     ]
     if producer := summary.get("Producer"):
         items.append(("Producer", producer))
-    for key in ("Architecture", "Name", "GGUF", "Blocks", "Vocab", "Metadata keys"):
+    for key in (
+        "Architecture",
+        "Name",
+        "GGUF",
+        "Blocks",
+        "Vocab",
+        "Metadata keys",
+        "Shards",
+    ):
         if value := summary.get(key):
             items.append((key, value))
     items.append(("Fingerprint", summary["Content hash"]))
@@ -560,6 +624,9 @@ def _artifact_items(
         items.extend(gguf.extras)
         if gguf.tied_embeddings:
             items.append(("Embeddings", "tied to the output head"))
+    hf = hf_container_summary(document)
+    if hf is not None and hf.tied_embeddings:
+        items.append(("Embeddings", "tied to the output head"))
     return items
 
 
@@ -568,14 +635,17 @@ def model_overview_controls(
     *,
     palette: ShellPalette,
     gguf_panel: GgufContainerPanel | None = None,
+    hf_panel: HfContainerPanel | None = None,
 ) -> list[ft.Control]:
     summary = dict(viewmodel.model_summary(document))
     gguf = gguf_container_summary(document)
-    metrics = (
-        _gguf_metrics(gguf, palette=palette)
-        if gguf is not None
-        else _default_metrics(document, summary, palette=palette)
-    )
+    hf = hf_container_summary(document)
+    if gguf is not None:
+        metrics = _gguf_metrics(gguf, palette=palette)
+    elif hf is not None:
+        metrics = _hf_metrics(hf, palette=palette)
+    else:
+        metrics = _default_metrics(document, summary, palette=palette)
     controls: list[ft.Control] = [
         ft.Column(
             data="model-overview-summary",
@@ -594,6 +664,9 @@ def model_overview_controls(
     if gguf_panel is not None and gguf is not None:
         gguf_panel.refresh(document)
         controls.append(gguf_panel.root)
+    if hf_panel is not None and hf is not None:
+        hf_panel.refresh(document)
+        controls.append(hf_panel.root)
     controls.append(
         metadata_section(tuple(_artifact_items(document, summary)), palette=palette)
     )

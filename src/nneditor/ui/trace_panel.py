@@ -38,6 +38,7 @@ from nneditor.tracing.contracts import (
     TraceResult,
     declared_byte_size,
 )
+from nneditor.tracing.llm_support import LLM_KINDS
 from nneditor.tracing.preflight import RuntimeStatus, runtime_status
 from nneditor.tracing.runner import estimated_capture_bytes
 from nneditor.ui import overview, viewmodel
@@ -157,6 +158,7 @@ class TracePanel:
         on_device: Callable[[TraceDevice | None, str], None],
         clear_error: Callable[[], None],
         watch_text_focus: Callable[[ft.TextField], ft.TextField],
+        prepare_inputs: Callable[[], None] | None = None,
     ) -> None:
         self.page = page
         self.picker = picker
@@ -192,6 +194,14 @@ class TracePanel:
         self._scope_choice: str | None = None
         self._runtime_probe_started = False
         self._probing_runtime = False
+        self._cached_runtime_status: RuntimeStatus | None = None
+        self.prepare_prompt = ft.TextButton(
+            content="Prepare prompt input",
+            icon=ft.Icons.TEXT_FIELDS_ROUNDED,
+            on_click=lambda _event: prepare_inputs() if prepare_inputs else None,
+            visible=False,
+            data="llm-prepare-prompt",
+        )
 
         self.seed = ft.TextField(
             label="Deterministic seed",
@@ -368,6 +378,20 @@ class TracePanel:
             self.chunk_kib,
         ):
             watch_text_focus(field)
+        for field in (
+            self.wall_seconds,
+            self.memory_mib,
+            self.capture_mib,
+            self.chunk_kib,
+        ):
+            field.expand = True
+        self.wall_seconds.label = "Time limit (s)"
+        self.memory_mib.label = "RAM limit (MiB)"
+        self.capture_mib.label = "Capture (MiB)"
+        self.chunk_kib.label = "Chunk (KiB)"
+        self._onnx_backends = list(self.backend.options)
+        self._onnx_devices = list(self.device.options)
+        self.runtime_choices = ft.Row(controls=[self.backend, self.device], spacing=6)
         self.control = ft.Column(
             controls=[
                 ft.Row(
@@ -376,12 +400,10 @@ class TracePanel:
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
                 self.result_annotations,
+                self.prepare_prompt,
                 self.seed,
                 self.shapes,
-                ft.Row(
-                    controls=[self.backend, self.device],
-                    spacing=6,
-                ),
+                self.runtime_choices,
                 ft.Row(
                     controls=[self.runtime_text, self.runtime_refresh],
                     spacing=2,
@@ -429,10 +451,52 @@ class TracePanel:
         # The capture-scope choice persists for one session only; the next
         # model starts from the smart default again.
         self._scope_choice = None
-        if self._session() is not None and not self._runtime_probe_started:
+        self._configure_runtime()
+        if (
+            self._session() is not None
+            and not self._is_llm()
+            and not self._runtime_probe_started
+        ):
             self._runtime_probe_started = True
             self._start_runtime_probe()
         self._on_device(None, "Idle")
+
+    def _is_llm(self) -> bool:
+        session = self._session()
+        return session is not None and session.document.artifact_kind in LLM_KINDS
+
+    def _configure_runtime(self) -> None:
+        llm = self._is_llm()
+        self.prepare_prompt.visible = llm
+        self.runtime_choices.visible = not llm
+        self.shapes.visible = not llm
+        self.seed.visible = not llm
+        self.runtime_refresh.visible = not llm
+        self.backend.options = (
+            [
+                ft.DropdownOption(
+                    key=TraceBackend.REFERENCE.value, text="NumPy LLM decoder"
+                )
+            ]
+            if llm
+            else list(self._onnx_backends)
+        )
+        self.device.options = (
+            [ft.DropdownOption(key=TraceDevice.CPU.value, text="CPU")]
+            if llm
+            else list(self._onnx_devices)
+        )
+        self.backend.value = (
+            TraceBackend.REFERENCE.value if llm else TraceBackend.AUTO.value
+        )
+        self.device.value = TraceDevice.CPU.value if llm else TraceDevice.AUTO.value
+        if llm:
+            self.runtime_text.value = "NumPy decoder · CPU · weights load as needed."
+            self.runtime_text.color = self.palette.muted
+        elif self._cached_runtime_status is not None:
+            self._render_runtime_status(self._cached_runtime_status)
+        else:
+            self.runtime_text.value = "Open an artifact to see tracing availability."
 
     # -- runtime preflight -------------------------------------------------
 
@@ -461,6 +525,9 @@ class TracePanel:
 
     def _render_runtime_status(self, status: RuntimeStatus) -> None:
         """Show the probed providers, or the error naming nneditor[runtime]."""
+        self._cached_runtime_status = status
+        if self._is_llm():
+            return
         if status.error is not None:
             self.runtime_text.value = f"ONNX Runtime unavailable: {status.error}."
             self.runtime_text.color = self.palette.warning
@@ -1099,9 +1166,15 @@ class TracePanel:
                 "four limits shown. The memory limit covers host RAM; "
                 "accelerator memory is controlled by its driver."
             )
+            if self._is_llm():
+                self.approval_notice.value = (
+                    "Approve & run authorizes one isolated CPU trace of this "
+                    "model's source weights, using your prompt input "
+                    "and the limits shown."
+                )
             available = status.availability is Availability.AVAILABLE and not web
             reason = (
-                "Web tracing awaits the Phase 8 isolated worker service."
+                "Activation tracing is available in the desktop app."
                 if web and status.availability is Availability.AVAILABLE
                 else status.reason
             )
@@ -1111,7 +1184,9 @@ class TracePanel:
                 "exactly one isolated trace."
             )
         self.progress.visible = busy
-        self.run_button.disabled = not available or busy
+        needs_prompt = self._is_llm() and not self.input_bindings
+        self.prepare_prompt.disabled = busy or not available
+        self.run_button.disabled = not available or busy or needs_prompt
         self.cancel_button.disabled = not running
         active_result = (
             session.trace(self.active_trace_id)
@@ -1125,10 +1200,20 @@ class TracePanel:
                 "overlay shows maximum absolute error"
             )
         elif self.active_trace_id is None:
-            self.status.value = (
-                f"{reason} Choose .npy tensors with the buttons on model inputs, "
-                "or keep automatic all-valid masks and deterministic random data."
-            )
+            if self._is_llm():
+                self.status.value = (
+                    "Prepare a sample or custom prompt, generate and assign its token "
+                    "input, then run a CPU trace."
+                    if available and needs_prompt
+                    else "Prompt input is ready for a CPU trace."
+                    if available
+                    else reason
+                )
+            else:
+                self.status.value = (
+                    f"{reason} Choose .npy tensors with the buttons on model inputs, "
+                    "or keep automatic all-valid masks and deterministic random data."
+                )
         elif session is not None and active_result is not None:
             # Three-way wording: "Partial" only when requested data is
             # missing; a truncated-but-all-readable capture reads "Preview".
@@ -1179,7 +1264,7 @@ class TracePanel:
         )
         self.capture_selected_only.disabled = busy
         self.capture_scope_choice.disabled = busy
-        self.backend.disabled = busy
+        self.backend.disabled = busy or self._is_llm()
         reference_backend = self.backend.value in {
             TraceBackend.REFERENCE.value,
             TraceBackend.REFERENCE_NORMALIZED.value,
@@ -1236,10 +1321,7 @@ class TracePanel:
         if self.job is not None and not self.job.state.is_terminal:
             return
         if getattr(self.page, "web", False):
-            self._on_error(
-                "Web tracing is unavailable until the Phase 8 isolated worker "
-                "service is deployed."
-            )
+            self._on_error("Activation tracing is available in the desktop app.")
             self.page.update()
             return
         seed_text = self.seed.value or ""

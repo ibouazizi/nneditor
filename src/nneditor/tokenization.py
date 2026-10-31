@@ -297,6 +297,11 @@ class BpeCodebook:
     def vocab_size(self) -> int:
         return max(self._vocab.values()) + 1
 
+    @property
+    def complete_byte_vocabulary(self) -> bool:
+        """Whether every UTF-8 byte can be encoded without an unknown token."""
+        return all(char in self._vocab for char in self._bytes.values())
+
     def _merge(self, symbols: tuple[str, ...]) -> tuple[str, ...]:
         word = symbols
         while len(word) > 1:
@@ -366,7 +371,12 @@ def _vocabulary_from(payload: object, where: str) -> dict[str, int]:
         raise TokenizationError(f"{where} does not contain a vocabulary object")
     vocabulary: dict[str, int] = {}
     for token, identifier in payload.items():
-        if not isinstance(token, str) or not isinstance(identifier, int):
+        if (
+            not isinstance(token, str)
+            or not isinstance(identifier, int)
+            or isinstance(identifier, bool)
+            or identifier < 0
+        ):
             raise TokenizationError(
                 f"{where} has a non string-to-integer vocabulary entry"
             )
@@ -455,9 +465,25 @@ def load_codebook(
                 f"tokenizer.json model type {model.get('type')!r} is not "
                 "supported; only byte-level BPE is implemented"
             )
-        return BpeCodebook(
+        codebook = BpeCodebook(
             _vocabulary_from(model.get("vocab"), "tokenizer.json"),
             _merges_from(model.get("merges"), "tokenizer.json"),
             name="tokenizer-json",
         )
+        if not codebook.complete_byte_vocabulary:
+            raise TokenizationError(
+                "tokenizer.json has no complete byte-level vocabulary"
+            )
+        pretokenizer = json.dumps(payload.get("pre_tokenizer"))
+        if (
+            any(
+                kind in pretokenizer
+                for kind in ("Metaspace", "BertPreTokenizer", "Whitespace")
+            )
+            or payload.get("normalizer") is not None
+        ):
+            raise TokenizationError(
+                "tokenizer.json uses unsupported text normalization or pre-tokenization"
+            )
+        return codebook
     raise TokenizationError(f"unsupported tokenizer choice: {choice_id!r}")

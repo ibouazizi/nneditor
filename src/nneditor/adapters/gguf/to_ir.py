@@ -18,7 +18,7 @@ from nneditor.adapters.gguf.architecture import (
 )
 from nneditor.adapters.gguf.index import GgufIndex, GgufTensorIndex
 from nneditor.adapters.gguf.indexer import GgufIndexError, index_gguf
-from nneditor.cancellation import CancellationToken
+from nneditor.cancellation import CancellationToken, OperationCancelled
 from nneditor.ir.capabilities import (
     ArtifactKind,
     Availability,
@@ -123,12 +123,30 @@ def _narrow_capabilities(
                 reason="the tensor's bytes could not be located",
             )
         )
-    if absent:
+    readable = [tensor for tensor in tensors if tensor.storage is not Storage.ABSENT]
+    if not readable:
+        statuses[Capability.WEIGHTS] = CapabilityStatus(
+            Capability.WEIGHTS,
+            Availability.UNAVAILABLE,
+            "no tensor payloads could be located, so weights cannot be read.",
+        )
+        statuses[Capability.EXECUTION] = CapabilityStatus(
+            Capability.EXECUTION,
+            Availability.UNAVAILABLE,
+            "the numpy LLM worker needs at least one readable weight tensor.",
+        )
+        statuses[Capability.TRACING] = CapabilityStatus(
+            Capability.TRACING,
+            Availability.UNAVAILABLE,
+            "activation capture needs readable weights to run the isolated "
+            "numpy worker.",
+        )
+    elif absent:
         statuses[Capability.WEIGHTS] = CapabilityStatus(
             Capability.WEIGHTS,
             Availability.PARTIAL,
             f"{len(absent)} of {len(tensors)} tensors have no readable bytes; "
-            "see the capability notes on each tensor",
+            "see the capability notes on each tensor.",
         )
     return tuple(statuses.values()), tuple(notes)
 
@@ -231,12 +249,14 @@ def _build_graph(index: GgufIndex, plan: ArchitecturePlan) -> Graph:
 
 def index_to_document(index: GgufIndex) -> Document:
     """Build the canonical IR document for an indexed GGUF artifact."""
+    from nneditor.tracing.llm_support import with_trace_support
+
     plan = plan_architecture(index)
     tensors = [_tensor_ref(tensor) for tensor in index.tensors]
     statuses, notes = _narrow_capabilities(tensors)
     graph = _build_graph(index, plan)
     tool_version = f"nneditor {__version__}"
-    return Document(
+    document = Document(
         source=ArtifactRef(
             path=str(index.path),
             content_hash=index.content_hash,
@@ -277,6 +297,7 @@ def index_to_document(index: GgufIndex) -> Document:
             ("x-gguf.kv", _kv_records(index)),
         ],
     )
+    return with_trace_support(document)
 
 
 def open_gguf(
@@ -287,7 +308,7 @@ def open_gguf(
     source = Path(path)
     try:
         return index_to_document(index_gguf(source, token=token))
-    except GgufIndexError:
+    except (GgufIndexError, OperationCancelled):
         raise
     except Exception as error:
         raise GgufIndexError(

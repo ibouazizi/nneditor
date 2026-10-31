@@ -17,6 +17,7 @@ from typing import Protocol, runtime_checkable
 from nneditor.adapters.coreml.package import CoremlError, open_coreml_package
 from nneditor.adapters.detect import DetectionError, detect_artifact_kind
 from nneditor.adapters.gguf import GgufIndexError, open_gguf
+from nneditor.adapters.huggingface import HuggingFaceError, open_huggingface
 from nneditor.adapters.jax.stablehlo import StableHloError, open_stablehlo
 from nneditor.adapters.onnx import OnnxIndexError, index_model, index_to_document
 from nneditor.adapters.pytorch.checkpoint import CheckpointError, open_checkpoint
@@ -195,6 +196,13 @@ def _open_gguf(path: Path, token: CancellationToken | None) -> Document:
         raise
 
 
+def _open_huggingface(path: Path, token: CancellationToken | None) -> Document:
+    try:
+        return open_huggingface(path, token=token)
+    except HuggingFaceError:
+        raise
+
+
 DEFAULT_ARTIFACT_ADAPTERS: tuple[ArtifactAdapter, ...] = (
     _FunctionAdapter(ArtifactKind.ONNX_MODEL, _open_onnx),
     _FunctionAdapter(ArtifactKind.PYTORCH_EXPORTED_PROGRAM, _open_pt2),
@@ -204,6 +212,7 @@ DEFAULT_ARTIFACT_ADAPTERS: tuple[ArtifactAdapter, ...] = (
     _FunctionAdapter(ArtifactKind.QUALCOMM_DLC, _open_dlc),
     _FunctionAdapter(ArtifactKind.COREML_PACKAGE, _open_coreml),
     _FunctionAdapter(ArtifactKind.GGUF_MODEL, _open_gguf),
+    _FunctionAdapter(ArtifactKind.HUGGINGFACE_MODEL, _open_huggingface),
 )
 
 

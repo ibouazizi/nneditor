@@ -69,6 +69,7 @@ def humanize_identifier(value: str) -> str:
     acronyms = {
         "fx": "FX",
         "gguf": "GGUF",
+        "huggingface": "Hugging Face",
         "jax": "JAX",
         "onnx": "ONNX",
         "pytorch": "PyTorch",
@@ -261,6 +262,23 @@ def model_summary(document: Document) -> tuple[tuple[str, str], ...]:
         vocab_size = gguf_extension.get("vocab_size")
         if isinstance(vocab_size, int) and not isinstance(vocab_size, bool):
             lines.append(("Vocab", f"{vocab_size:,}"))
+    hf_extension = dict(document.extensions).get("x-huggingface.model")
+    if isinstance(hf_extension, dict):
+        architecture = hf_extension.get("architecture")
+        if isinstance(architecture, str) and architecture:
+            lines.append(("Architecture", architecture))
+        hf_name = hf_extension.get("name")
+        if isinstance(hf_name, str) and hf_name:
+            lines.append(("Name", hf_name))
+        block_count = hf_extension.get("block_count")
+        if isinstance(block_count, int) and not isinstance(block_count, bool):
+            lines.append(("Blocks", f"{block_count:,}"))
+        vocab_size = hf_extension.get("vocab_size")
+        if isinstance(vocab_size, int) and not isinstance(vocab_size, bool):
+            lines.append(("Vocab", f"{vocab_size:,}"))
+        n_shards = hf_extension.get("n_shards")
+        if isinstance(n_shards, int) and not isinstance(n_shards, bool):
+            lines.append(("Shards", f"{n_shards:,}"))
     return tuple(lines)
 
 

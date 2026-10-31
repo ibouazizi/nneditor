@@ -41,8 +41,10 @@ from nneditor.ir.identity import ROOT_GRAPH_ID, initializer_id
 from nneditor.storage.reader import hash_file
 
 __all__ = [
+    "SafetensorEntry",
     "SafetensorSource",
     "SafetensorsError",
+    "index_safetensors_file",
     "open_safetensors",
     "write_safetensors",
     "write_safetensors_stream",
@@ -74,6 +76,22 @@ _IR_TO_DTYPE: Final[dict[str, str]] = {
 
 class SafetensorsError(ValueError):
     """Raised when a safetensors artifact cannot be read or written."""
+
+
+@dataclass(frozen=True, slots=True)
+class SafetensorEntry:
+    """One tensor located in a safetensors file, without its payload.
+
+    ``offset`` is the absolute file offset of the packed bytes. Unreadable
+    entries still carry the declared range so a caller can diagnose them.
+    """
+
+    name: str
+    element_type: str
+    dims: tuple[int, ...]
+    offset: int
+    length: int
+    readable: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,11 +196,18 @@ def _overlapping_names(header: dict[str, JsonValue]) -> tuple[set[str], bool]:
     return overlapping, unordered
 
 
-def _open_safetensors(source: Path) -> Document:
-    header, data_start = _read_header(source)
-    file_size = source.stat().st_size
-    log = DiagnosticLog()
+def index_safetensors_file(
+    path: Path,
+    log: DiagnosticLog | None = None,
+) -> tuple[tuple[SafetensorEntry, ...], dict[str, str], int]:
+    """Index one safetensors file from its header, never the payloads.
 
+    Returns the tensor catalog, the free-form ``__metadata__`` map, and the
+    file size. Unreadable entries stay in the catalog with ``readable=False``.
+    """
+    header, data_start = _read_header(path)
+    file_size = path.stat().st_size
+    log = log if log is not None else DiagnosticLog()
     overlapping, unordered = _overlapping_names(header)
     if unordered:
         log.add(
@@ -191,114 +216,143 @@ def _open_safetensors(source: Path) -> Document:
             "the header lists tensor ranges out of byte order, which the "
             "safetensors specification does not allow; the bytes are still "
             "read because the ranges are disjoint",
-            source.name,
+            path.name,
         )
-
-    tensors: list[TensorRef] = []
+    entries: list[SafetensorEntry] = []
     metadata: dict[str, str] = {}
     for name, entry in header.items():
-        if name == "__metadata__":
-            if isinstance(entry, dict):
+        parsed = _parse_header_entry(
+            name,
+            entry,
+            data_start=data_start,
+            file_size=file_size,
+            overlapping=overlapping,
+            log=log,
+        )
+        if parsed is None:
+            if name == "__metadata__" and isinstance(entry, dict):
                 metadata = {str(key): str(value) for key, value in entry.items()}
             continue
-        if not isinstance(entry, dict):
-            log.add(
-                "pytorch.malformed-tensor-entry",
-                Severity.ERROR,
-                f"header entry {name!r} is not an object",
-                name,
-            )
-            continue
-        dtype = str(entry.get("dtype", ""))
-        element_type = _DTYPE_TO_IR.get(dtype)
-        shape_raw = entry.get("shape")
-        offsets = entry.get("data_offsets")
-        if (
-            element_type is None
-            or not isinstance(shape_raw, list)
-            or not isinstance(offsets, list)
-            or len(offsets) != 2
-        ):
-            log.add(
-                "pytorch.malformed-tensor-entry",
-                Severity.ERROR,
-                f"header entry {name!r} has an unsupported dtype or malformed "
-                f"shape/offsets (dtype={dtype!r})",
-                name,
-            )
-            continue
-        if not all(
-            isinstance(item, int) and not isinstance(item, bool)
-            for item in (*shape_raw, *offsets)
-        ):
-            # Bools are ints to isinstance, but `true` is not a dimension.
-            log.add(
-                "pytorch.malformed-tensor-entry",
-                Severity.ERROR,
-                f"header entry {name!r} holds non-integer shape or offsets",
-                name,
-            )
-            continue
-        dims = tuple(int(item) for item in shape_raw if isinstance(item, int))
-        begin = int(offsets[0]) if isinstance(offsets[0], int) else 0
-        end = int(offsets[1]) if isinstance(offsets[1], int) else 0
-        if any(dim < 0 for dim in dims):
-            log.add(
-                "pytorch.malformed-tensor-entry",
-                Severity.ERROR,
-                f"header entry {name!r} holds a negative dimension",
-                name,
-            )
-            continue
-        width = element_width_bytes(element_type)
-        expected = None
-        if width is not None:
-            count = 1
-            for dim in dims:
-                count *= dim
-            expected = count * width
-        absolute = PayloadRange(data_start + begin, max(0, end - begin))
-        tensor_id = initializer_id(ROOT_GRAPH_ID, name)
-        if begin < 0 or end < begin or data_start + end > file_size:
-            log.add(
-                "pytorch.tensor-range-out-of-bounds",
-                Severity.ERROR,
-                f"tensor {name!r} declares offsets [{begin}, {end}) outside "
-                "the data section",
-                tensor_id,
-            )
-            tensors.append(TensorRef(tensor_id, element_type, dims, Storage.ABSENT))
-            continue
-        if name in overlapping:
-            log.add(
-                "pytorch.tensor-range-overlap",
-                Severity.ERROR,
-                f"tensor {name!r} declares offsets [{begin}, {end}) that "
-                "overlap another tensor's range; editing one would corrupt "
-                "the other, so its bytes are not exposed",
-                tensor_id,
-            )
-            tensors.append(TensorRef(tensor_id, element_type, dims, Storage.ABSENT))
-            continue
-        if expected is not None and expected != absolute.length:
-            log.add(
-                "pytorch.tensor-length-mismatch",
-                Severity.ERROR,
-                f"tensor {name!r} holds {absolute.length} bytes but its shape "
-                f"and dtype imply {expected}",
-                tensor_id,
-            )
-            tensors.append(TensorRef(tensor_id, element_type, dims, Storage.ABSENT))
-            continue
-        tensors.append(
-            TensorRef(
-                tensor_id,
-                element_type,
-                dims,
-                Storage.EMBEDDED_RAW,
-                payload=absolute,
-            )
+        entries.append(parsed)
+    return tuple(entries), metadata, file_size
+
+
+def _parse_header_entry(
+    name: str,
+    entry: JsonValue,
+    *,
+    data_start: int,
+    file_size: int,
+    overlapping: set[str],
+    log: DiagnosticLog,
+) -> SafetensorEntry | None:
+    if name == "__metadata__":
+        return None
+    if not isinstance(entry, dict):
+        log.add(
+            "pytorch.malformed-tensor-entry",
+            Severity.ERROR,
+            f"header entry {name!r} is not an object",
+            name,
         )
+        return None
+    dtype = str(entry.get("dtype", ""))
+    element_type = _DTYPE_TO_IR.get(dtype)
+    shape_raw = entry.get("shape")
+    offsets = entry.get("data_offsets")
+    if (
+        element_type is None
+        or not isinstance(shape_raw, list)
+        or not isinstance(offsets, list)
+        or len(offsets) != 2
+    ):
+        log.add(
+            "pytorch.malformed-tensor-entry",
+            Severity.ERROR,
+            f"header entry {name!r} has an unsupported dtype or malformed "
+            f"shape/offsets (dtype={dtype!r})",
+            name,
+        )
+        return None
+    if not all(
+        isinstance(item, int) and not isinstance(item, bool)
+        for item in (*shape_raw, *offsets)
+    ):
+        log.add(
+            "pytorch.malformed-tensor-entry",
+            Severity.ERROR,
+            f"header entry {name!r} holds non-integer shape or offsets",
+            name,
+        )
+        return None
+    dims = tuple(int(item) for item in shape_raw if isinstance(item, int))
+    begin = int(offsets[0]) if isinstance(offsets[0], int) else 0
+    end = int(offsets[1]) if isinstance(offsets[1], int) else 0
+    if any(dim < 0 for dim in dims):
+        log.add(
+            "pytorch.malformed-tensor-entry",
+            Severity.ERROR,
+            f"header entry {name!r} holds a negative dimension",
+            name,
+        )
+        return None
+    width = element_width_bytes(element_type)
+    expected = None
+    if width is not None:
+        count = 1
+        for dim in dims:
+            count *= dim
+        expected = count * width
+    length = max(0, end - begin)
+    offset = data_start + begin
+    tensor_id = initializer_id(ROOT_GRAPH_ID, name)
+    readable = True
+    if begin < 0 or end < begin or data_start + end > file_size:
+        log.add(
+            "pytorch.tensor-range-out-of-bounds",
+            Severity.ERROR,
+            f"tensor {name!r} declares offsets [{begin}, {end}) outside "
+            "the data section",
+            tensor_id,
+        )
+        readable = False
+    elif name in overlapping:
+        log.add(
+            "pytorch.tensor-range-overlap",
+            Severity.ERROR,
+            f"tensor {name!r} declares offsets [{begin}, {end}) that "
+            "overlap another tensor's range; editing one would corrupt "
+            "the other, so its bytes are not exposed",
+            tensor_id,
+        )
+        readable = False
+    elif expected is not None and expected != length:
+        log.add(
+            "pytorch.tensor-length-mismatch",
+            Severity.ERROR,
+            f"tensor {name!r} holds {length} bytes but its shape "
+            f"and dtype imply {expected}",
+            tensor_id,
+        )
+        readable = False
+    return SafetensorEntry(name, element_type, dims, offset, length, readable)
+
+
+def _open_safetensors(source: Path) -> Document:
+    log = DiagnosticLog()
+    entries, metadata, file_size = index_safetensors_file(source, log)
+    tensors = [
+        TensorRef(
+            initializer_id(ROOT_GRAPH_ID, entry.name),
+            entry.element_type,
+            entry.dims,
+            Storage.EMBEDDED_RAW if entry.readable else Storage.ABSENT,
+            payload=(
+                PayloadRange(entry.offset, entry.length) if entry.readable else None
+            ),
+        )
+        for entry in entries
+    ]
 
     extensions: list[tuple[str, JsonValue]] = []
     if metadata:

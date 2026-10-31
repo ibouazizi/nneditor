@@ -91,6 +91,8 @@ from nneditor.tracing.inputs import (
     default_input_specification,
     tensor_file_binding_for_input,
 )
+from nneditor.tracing.llm_runner import run_llm_trace
+from nneditor.tracing.llm_support import LLM_KINDS, trace_unavailable_reason
 from nneditor.tracing.runner import run_onnx_trace
 from nneditor.tracing.store import ActivationStore, ActivationView
 from nneditor.tracing.visualization import (
@@ -131,12 +133,16 @@ switch otherwise pays the full base-layout-plus-semantic-slice cost cold —
 hundreds of milliseconds on large models, well past the interaction budget."""
 
 
+def _is_synthetic_llm(document: Document) -> bool:
+    return any(
+        entry.operation == "synthesize-llm-architecture"
+        for entry in document.provenance
+    )
+
+
 def _capped_detail(document: Document, detail_level: DetailLevel) -> DetailLevel:
-    """GGUF's finest useful view is LAYER; OPERATOR would duplicate it."""
-    if (
-        document.artifact_kind is ArtifactKind.GGUF_MODEL
-        and detail_level is DetailLevel.OPERATOR
-    ):
+    """A synthesized LLM graph's finest useful view is LAYER."""
+    if _is_synthetic_llm(document) and detail_level is DetailLevel.OPERATOR:
         return DetailLevel.LAYER
     return detail_level
 
@@ -211,6 +217,7 @@ class ModelSession:
         "_hierarchy_store",
         "_input_store",
         "_jobs",
+        "_llm_preflight",
         "_navigation",
         "_prewarm_job",
         "_slicer",
@@ -242,6 +249,7 @@ class ModelSession:
         self.id = session_id
         self._source_document = document
         self.store = TensorStore(document)
+        self._llm_preflight: tuple[Document, str | None] | None = None
         try:
             self._state_lock = threading.RLock()
             self._slicer = slicer
@@ -283,7 +291,22 @@ class ModelSession:
     # -- capability and diagnostic access ---------------------------------
 
     def capability(self, capability: Capability) -> CapabilityStatus:
-        return self.document.capability(capability)
+        document = self.document
+        if (
+            capability in {Capability.TRACING, Capability.EXECUTION}
+            and document.artifact_kind in LLM_KINDS
+        ):
+            if self._llm_preflight is None or self._llm_preflight[0] is not document:
+                self._llm_preflight = (document, trace_unavailable_reason(document))
+            reason = self._llm_preflight[1]
+            if reason is None and self.editing.current_revision_id is not None:
+                reason = (
+                    "LLM tracing requires the source weights. Undo tensor edits "
+                    "or reopen the exported weights with the model configuration."
+                )
+            if reason:
+                return CapabilityStatus(capability, Availability.UNAVAILABLE, reason)
+        return document.capability(capability)
 
     @property
     def title(self) -> str:
@@ -340,10 +363,12 @@ class ModelSession:
                 revision_id = self.editing.current_revision_id
                 graph_id = document.entry_graph
                 hierarchy = self.hierarchy.hierarchy(graph_id)
-                levels = _PREWARM_DETAIL_LEVELS
-                if document.artifact_kind is ArtifactKind.GGUF_MODEL:
+                levels: tuple[DetailLevel, ...] = _PREWARM_DETAIL_LEVELS
+                if _is_synthetic_llm(document):
                     levels = tuple(
-                        level for level in levels if level is not DetailLevel.OPERATOR
+                        level
+                        for level in _PREWARM_DETAIL_LEVELS
+                        if level is not DetailLevel.OPERATOR
                     )
             warmed: list[GraphSlice] = []
             for level in levels:
@@ -600,13 +625,20 @@ class ModelSession:
         return self._input_store.specifications(self.document.source.content_hash)
 
     def trace_async(self, request: TraceRequest) -> Job[TraceResult]:
-        """Run an explicitly approved ONNX trace outside the UI process."""
+        """Run an explicitly approved isolated trace outside the UI process."""
         self._ensure_open()
         status = self.capability(Capability.TRACING)
         if status.availability is not Availability.AVAILABLE:
             raise SessionError(status.reason)
-        if self.document.artifact_kind is not ArtifactKind.ONNX_MODEL:
-            raise SessionError("only ONNX reference-evaluator tracing is implemented")
+        kind = self.document.artifact_kind
+        if kind not in {
+            ArtifactKind.ONNX_MODEL,
+            ArtifactKind.GGUF_MODEL,
+            ArtifactKind.HUGGINGFACE_MODEL,
+        }:
+            raise SessionError(
+                "tracing is implemented for ONNX, GGUF, and Hugging Face snapshots"
+            )
         if self._jobs is None or self._activation_store is None:
             raise SessionError("this session has no trace worker/store")
         self.save_trace_inputs(request.specification)
@@ -627,27 +659,38 @@ class ModelSession:
         )
 
         def work(token: CancellationToken) -> TraceResult:
-            def build_model(destination: Path, build_token: CancellationToken) -> None:
-                # The result is keyed by the captured revision id, so the
-                # captured snapshot and its pinned reader stay the correct
-                # source even while the user keeps editing — no lock and no
-                # staleness check. A session closed mid-export fails the
-                # base read, which surfaces through the job-error path.
-                export_revision(
-                    snapshot,
-                    revisions,
-                    destination,
-                    tensor_reader=read_snapshot,
-                    token=build_token,
-                )
-
             assert self._activation_store is not None
-            return run_onnx_trace(
+            if snapshot.artifact_kind is ArtifactKind.ONNX_MODEL:
+
+                def build_model(
+                    destination: Path, build_token: CancellationToken
+                ) -> None:
+                    # The result is keyed by the captured revision id, so the
+                    # captured snapshot and its pinned reader stay the correct
+                    # source even while the user keeps editing — no lock and no
+                    # staleness check. A session closed mid-export fails the
+                    # base read, which surfaces through the job-error path.
+                    export_revision(
+                        snapshot,
+                        revisions,
+                        destination,
+                        tensor_reader=read_snapshot,
+                        token=build_token,
+                    )
+
+                return run_onnx_trace(
+                    snapshot,
+                    key,
+                    request,
+                    self._activation_store,
+                    build_model,
+                    token=token,
+                )
+            return run_llm_trace(
                 snapshot,
                 key,
                 request,
                 self._activation_store,
-                build_model,
                 token=token,
             )
 
@@ -877,6 +920,7 @@ class ModelSession:
             ArtifactKind.PYTORCH_STATE_DICT,
             ArtifactKind.SAFETENSORS,
             ArtifactKind.ORBAX_CHECKPOINT,
+            ArtifactKind.HUGGINGFACE_MODEL,
         }
         if self.document.artifact_kind in weights_only:
             return ExportPlan(

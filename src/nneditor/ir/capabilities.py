@@ -45,6 +45,7 @@ class ArtifactKind(StrEnum):
     QUALCOMM_DLC = "qualcomm_dlc"
     COREML_PACKAGE = "coreml_package"
     GGUF_MODEL = "gguf_model"
+    HUGGINGFACE_MODEL = "huggingface_model"
 
 
 class Capability(StrEnum):
@@ -651,19 +652,73 @@ _CONTRACTS: tuple[ArtifactContract, ...] = (
                 "cannot be saved back as GGUF.",
             ),
             Capability.EXECUTION: (
-                Availability.UNAVAILABLE,
-                "GGUF is a weight container; running it needs a separate "
-                "runtime that this desktop does not ship.",
+                Availability.PARTIAL,
+                "A numpy decoder-only forward pass runs in an isolated worker "
+                "for Llama-style and GPT-2-style graphs; packed ggml types "
+                "without a decoder, SSM blocks, and in-memory edits are not "
+                "executed.",
             ),
             Capability.TRACING: (
-                Availability.UNAVAILABLE,
-                "There is no isolated GGUF execution adapter whose "
-                "intermediate values could be captured.",
+                Availability.AVAILABLE,
+                "Intermediate activations of the synthesized LLM operators "
+                "are captured from the isolated numpy worker.",
             ),
             Capability.EXPORT: (
                 Availability.UNAVAILABLE,
                 "No GGUF writer is implemented, so edited tensors cannot be "
                 "re-serialized in this container.",
+            ),
+        },
+    ),
+    _contract(
+        ArtifactKind.HUGGINGFACE_MODEL,
+        "Hugging Face model",
+        (
+            "Transformers snapshot directory with config.json and safetensors weights",
+            "sharded snapshot plus model.safetensors.index.json",
+        ),
+        (LoadingMode.SAFE_ARTIFACT, LoadingMode.REMOTE_REPOSITORY),
+        ExportFidelity.WEIGHTS_ONLY,
+        {
+            Capability.TOPOLOGY: (
+                Availability.PARTIAL,
+                "A synthetic LLM graph is derived from tensor names and "
+                "config.json; the snapshot stores weights, not operators.",
+            ),
+            Capability.WEIGHTS: (
+                Availability.AVAILABLE,
+                "Each safetensors tensor is a byte range in its shard, "
+                "read on demand without hashing or decoding the payloads.",
+            ),
+            Capability.METADATA: (
+                Availability.AVAILABLE,
+                "config.json, tokenizer files, and the shard index are "
+                "part of the container; large tokenizer vocabularies are "
+                "summarized rather than parsed at open.",
+            ),
+            Capability.EDITING: (
+                Availability.PARTIAL,
+                "Tensor-level edits apply when the payload is "
+                "range-readable; pickle shards stay unread and no snapshot "
+                "writer exists.",
+            ),
+            Capability.EXECUTION: (
+                Availability.PARTIAL,
+                "A numpy decoder-only forward pass runs in an isolated worker "
+                "for Llama-style and GPT-2-style graphs; pickle shards, SSM "
+                "blocks, and in-memory edits are not executed.",
+            ),
+            Capability.TRACING: (
+                Availability.AVAILABLE,
+                "Intermediate activations of the synthesized LLM operators "
+                "are captured from the isolated numpy worker.",
+            ),
+            Capability.EXPORT: (
+                Availability.PARTIAL,
+                "Readable tensors export as a labelled weights-only "
+                "safetensors artifact. No Hugging Face snapshot writer is "
+                "implemented, so config, tokenizer, and shard layout are "
+                "not re-serialized.",
             ),
         },
     ),

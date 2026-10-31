@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from nneditor.adapters.gguf.constants import (
     GGUF_DEFAULT_ALIGNMENT,
     GGUF_MAGIC_BYTES,
@@ -18,7 +20,109 @@ from nneditor.adapters.gguf.constants import (
     layout_for,
 )
 
-__all__ = ["GgufFixtureTensor", "write_gguf"]
+__all__ = ["GgufFixtureTensor", "write_gguf", "write_traceable_llama_gguf"]
+
+_F32 = 0
+_N_EMBD = 4
+_N_HEAD = 2
+_N_FF = 8
+_VOCAB = 8
+
+
+def _f32_payload(shape: tuple[int, ...], seed: int, scale: float = 0.02) -> bytes:
+    rng = np.random.default_rng(seed)
+    array = rng.standard_normal(shape).astype("<f4") * np.float32(scale)
+    return array.tobytes()
+
+
+def _ones_payload(shape: tuple[int, ...]) -> bytes:
+    return np.ones(shape, dtype="<f4").tobytes()
+
+
+def write_traceable_llama_gguf(path: Path) -> Path:
+    """A one-block Llama GGUF with every weight a numpy trace needs."""
+    tensors = (
+        GgufFixtureTensor(
+            "token_embd.weight",
+            (_VOCAB, _N_EMBD),
+            _F32,
+            _f32_payload((_VOCAB, _N_EMBD), 1),
+        ),
+        GgufFixtureTensor(
+            "blk.0.attn_norm.weight", (_N_EMBD,), _F32, _ones_payload((_N_EMBD,))
+        ),
+        GgufFixtureTensor(
+            "blk.0.attn_q.weight",
+            (_N_EMBD, _N_EMBD),
+            _F32,
+            _f32_payload((_N_EMBD, _N_EMBD), 2),
+        ),
+        GgufFixtureTensor(
+            "blk.0.attn_k.weight",
+            (_N_EMBD, _N_EMBD),
+            _F32,
+            _f32_payload((_N_EMBD, _N_EMBD), 3),
+        ),
+        GgufFixtureTensor(
+            "blk.0.attn_v.weight",
+            (_N_EMBD, _N_EMBD),
+            _F32,
+            _f32_payload((_N_EMBD, _N_EMBD), 4),
+        ),
+        GgufFixtureTensor(
+            "blk.0.attn_output.weight",
+            (_N_EMBD, _N_EMBD),
+            _F32,
+            _f32_payload((_N_EMBD, _N_EMBD), 5),
+        ),
+        GgufFixtureTensor(
+            "blk.0.ffn_norm.weight", (_N_EMBD,), _F32, _ones_payload((_N_EMBD,))
+        ),
+        GgufFixtureTensor(
+            "blk.0.ffn_gate.weight",
+            (_N_FF, _N_EMBD),
+            _F32,
+            _f32_payload((_N_FF, _N_EMBD), 6),
+        ),
+        GgufFixtureTensor(
+            "blk.0.ffn_up.weight",
+            (_N_FF, _N_EMBD),
+            _F32,
+            _f32_payload((_N_FF, _N_EMBD), 7),
+        ),
+        GgufFixtureTensor(
+            "blk.0.ffn_down.weight",
+            (_N_EMBD, _N_FF),
+            _F32,
+            _f32_payload((_N_EMBD, _N_FF), 8),
+        ),
+        GgufFixtureTensor(
+            "output_norm.weight", (_N_EMBD,), _F32, _ones_payload((_N_EMBD,))
+        ),
+        GgufFixtureTensor(
+            "output.weight", (_VOCAB, _N_EMBD), _F32, _f32_payload((_VOCAB, _N_EMBD), 9)
+        ),
+    )
+    return write_gguf(
+        path,
+        version=3,
+        kv=(
+            ("general.architecture", KV_TYPE_STRING, "llama"),
+            ("general.name", KV_TYPE_STRING, "tiny-trace"),
+            ("llama.block_count", KV_TYPE_UINT32, 1),
+            ("llama.embedding_length", KV_TYPE_UINT32, _N_EMBD),
+            ("llama.feed_forward_length", KV_TYPE_UINT32, _N_FF),
+            ("llama.attention.head_count", KV_TYPE_UINT32, _N_HEAD),
+            ("llama.attention.head_count_kv", KV_TYPE_UINT32, _N_HEAD),
+            ("llama.attention.layer_norm_rms_eps", KV_TYPE_FLOAT32, 1e-5),
+            ("llama.rope.freq_base", KV_TYPE_FLOAT32, 10000.0),
+            ("llama.context_length", KV_TYPE_UINT32, 32),
+            ("llama.vocab_size", KV_TYPE_UINT32, _VOCAB),
+            ("tokenizer.ggml.bos_token_id", KV_TYPE_UINT32, 1),
+            ("tokenizer.ggml.eos_token_id", KV_TYPE_UINT32, 2),
+        ),
+        tensors=tensors,
+    )
 
 
 @dataclass(frozen=True, slots=True)

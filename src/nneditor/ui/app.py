@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import json
 import math
 import sys
 import tempfile
@@ -31,6 +32,7 @@ import flet as ft
 import flet.canvas as cv
 
 from nneditor.adapters.gguf.preview import preview_kv_array
+from nneditor.adapters.huggingface import preview_tokenizer_vocab
 from nneditor.analysis.hierarchy import Group, Hierarchy
 from nneditor.analysis.lod import DetailLevel, detail_for_scale
 from nneditor.application.editing import SidecarPersistenceError
@@ -50,6 +52,7 @@ from nneditor.desktop import (
 from nneditor.editing.validation import EditRequest, EditTransaction
 from nneditor.input_generation import GeneratedTensor
 from nneditor.ir.capabilities import ArtifactKind
+from nneditor.prompt_inputs import prompt_settings_for_document
 from nneditor.rendering import create_flet_renderer
 from nneditor.rendering.contract import InteractiveGraphRenderer, RendererFactory
 from nneditor.rendering.scene import NodeGlyph, Scene, Viewport
@@ -64,6 +67,8 @@ from nneditor.ui.activation_inspector import ActivationInspector
 from nneditor.ui.edit_panel import EditPanel
 from nneditor.ui.gguf_inspector import GgufContainerPanel
 from nneditor.ui.gguf_view import GgufKvRow, tensor_owner_node_id
+from nneditor.ui.hf_inspector import HfContainerPanel
+from nneditor.ui.hf_view import HfConfigRow
 from nneditor.ui.hierarchy_panel import HierarchyPanel, natural_key
 from nneditor.ui.trace_graph import build_trace_graph
 from nneditor.ui.trace_panel import TracePanel, uses_automatic_mask
@@ -76,6 +81,12 @@ APP_ICON_PATH = APP_ASSETS_DIRECTORY / "nneditor.png"
 APP_WINDOW_ICON_PATH = APP_ASSETS_DIRECTORY / "nneditor.ico"
 _WEB_UPLOAD_TEMP = tempfile.TemporaryDirectory(prefix="nneditor-web-upload-")
 _WEB_UPLOAD_DIRECTORY = Path(_WEB_UPLOAD_TEMP.name)
+
+
+def _is_weight_container(document: object) -> bool:
+    kind = getattr(document, "artifact_kind", None)
+    return kind in {ArtifactKind.GGUF_MODEL, ArtifactKind.HUGGINGFACE_MODEL}
+
 
 # Compatibility alias for callers that historically imported this helper from
 # the shell module. The hierarchy component now owns the implementation.
@@ -409,6 +420,14 @@ class Shell:
             on_expand_kv=self._on_gguf_expand_kv,
             update=page.update,
         )
+        self.hf_panel = HfContainerPanel(
+            palette=self.palette,
+            on_select_tensor=self._on_gguf_tensor,
+            on_select_block=self._on_gguf_block,
+            on_expand_config=self._on_hf_expand_config,
+            on_preview_tokenizer=self._on_hf_preview_tokenizer,
+            update=page.update,
+        )
         # Compatibility aliases keep the shell's existing public test and
         # plugin-facing surface while the component owns these controls.
         self.hierarchy_list = self.hierarchy_panel.list
@@ -626,6 +645,7 @@ class Shell:
             on_device=self._set_trace_device,
             clear_error=self._clear_error,
             watch_text_focus=self._watch_text_focus,
+            prepare_inputs=self._prepare_prompt_input,
         )
 
         self._edit_controls = self.edit_panel.control
@@ -1152,8 +1172,8 @@ class Shell:
                     content="Open folder",
                     icon=ft.Icons.FOLDER_ROUNDED,
                     tooltip=(
-                        "Open a model package folder, such as a Core ML "
-                        ".mlpackage bundle"
+                        "Open a model package folder, such as a Hugging Face "
+                        "snapshot or a Core ML .mlpackage bundle"
                     ),
                     on_click=self._on_open_folder_clicked,
                 ),
@@ -1329,6 +1349,7 @@ class Shell:
         # These panels re-render from `self.palette` on their next refresh.
         self.activations.palette = self.palette
         self.gguf_panel.set_palette(self.palette)
+        self.hf_panel.set_palette(self.palette)
         self.trace.palette = self.palette
         self.input_generator.palette = self.palette
         self.watch.palette = self.palette
@@ -1458,12 +1479,19 @@ class Shell:
             self.input_generator.refresh_targets((), can_assign=False)
             return
         graph = session.document.main_graph
+        llm_kind = session.document.artifact_kind in {
+            ArtifactKind.GGUF_MODEL,
+            ArtifactKind.HUGGINGFACE_MODEL,
+        }
+        settings = prompt_settings_for_document(session.document) if llm_kind else None
         targets = tuple(
             input_workspace.InputTarget(
                 name=value.name or value.id,
                 element_type=value.element_type,
                 shape=value.shape,
                 is_mask=uses_automatic_mask(value.name or value.id),
+                prefer_form="text-tokens" if llm_kind else None,
+                prompt=settings,
             )
             for value_id in graph.inputs
             if value_id not in graph.initializers
@@ -1473,6 +1501,11 @@ class Shell:
             targets,
             can_assign=not bool(getattr(self.page, "web", False)),
         )
+
+    def _prepare_prompt_input(self) -> None:
+        self.workspace_tabs.selected_index = 1
+        self._close_operations_drawer()
+        self.page.update()
 
     # -- event handlers ----------------------------------------------------
 
@@ -1537,7 +1570,9 @@ class Shell:
             self.page.update()
             return
         selected = await self.picker.get_directory_path(
-            dialog_title="Open a model package folder (.mlpackage)"
+            dialog_title=(
+                "Open a model package folder (Hugging Face snapshot or .mlpackage)"
+            )
         )
         if not selected:
             return
@@ -1648,6 +1683,7 @@ class Shell:
         self._minimap_view_rect = None
         self.activations.reset()
         self.gguf_panel.reset()
+        self.hf_panel.reset()
         self._inspected_ids = frozenset()
         self.pending_edit = None
         self.pending_transformation = None
@@ -2236,7 +2272,11 @@ class Shell:
             # session takes over; otherwise every reopen leaks all three.
             self.service.close_session(previous.id)
         self.session = session
-        suggested_limits = recommended_trace_limits(session.document.source.byte_size)
+        suggested_limits = recommended_trace_limits(
+            session.document.source.byte_size,
+            streaming_weights=session.document.artifact_kind
+            in {ArtifactKind.GGUF_MODEL, ArtifactKind.HUGGINGFACE_MODEL},
+        )
         self.trace.wall_seconds.value = f"{suggested_limits.wall_seconds:g}"
         self.trace.memory_mib.value = str(
             suggested_limits.memory_bytes // (1024 * 1024)
@@ -2244,6 +2284,7 @@ class Shell:
         self._saved_revision_id = None
         self.activations.reset()
         self.gguf_panel.reset()
+        self.hf_panel.reset()
         self.trace.reset()
         # Pins and overlay severities belong to the outgoing session.
         self.watch.reset()
@@ -2686,7 +2727,10 @@ class Shell:
         # The Model section always mirrors the open document; the inspector
         # list below shows only what the selection is.
         self.model_info.controls = overview.model_overview_controls(
-            document, palette=self.palette, gguf_panel=self.gguf_panel
+            document,
+            palette=self.palette,
+            gguf_panel=self.gguf_panel,
+            hf_panel=self.hf_panel,
         )
         self._sync_info_sections()
         rows: list[ft.Control] = []
@@ -2726,7 +2770,7 @@ class Shell:
                         group.members, owner_id=node_id
                     )
                 )
-                if document.artifact_kind is ArtifactKind.GGUF_MODEL:
+                if _is_weight_container(document):
                     rows.extend(
                         self.activations.tensor_rows_for_ids(
                             viewmodel.group_tensor_ids(
@@ -2750,7 +2794,7 @@ class Shell:
                 rows.extend(
                     self.activations.group_activation_rows(members, owner_id=node_id)
                 )
-                if document.artifact_kind is ArtifactKind.GGUF_MODEL:
+                if _is_weight_container(document):
                     rows.extend(
                         self.activations.tensor_rows_for_ids(
                             viewmodel.group_tensor_ids(
@@ -2805,6 +2849,12 @@ class Shell:
                     hint = (
                         "Nothing is selected. The Model section is the GGUF "
                         "container — header, metadata, tensors, and tokenizer. "
+                        "Click a tensor there to inspect its bytes here."
+                    )
+                elif document.artifact_kind is ArtifactKind.HUGGINGFACE_MODEL:
+                    hint = (
+                        "Nothing is selected. The Model section is the Hugging "
+                        "Face snapshot — files, config, tensors, and tokenizer. "
                         "Click a tensor there to inspect its bytes here."
                     )
                 else:
@@ -3530,6 +3580,28 @@ class Shell:
         text = row.value if isinstance(row.value, str) else str(row.value)
         self._show_gguf_text_dialog(row.key, text)
 
+    def _on_hf_expand_config(self, row: HfConfigRow) -> None:
+        if isinstance(row.value, str):
+            text = row.value
+        else:
+            text = json.dumps(row.value, indent=2)
+        self._show_gguf_text_dialog(row.key, text)
+
+    def _on_hf_preview_tokenizer(self) -> None:
+        if self.session is None:
+            return
+        try:
+            items, total = preview_tokenizer_vocab(
+                self.session.document.source.path, limit=32
+            )
+        except Exception as error:
+            self._show_error(f"Could not preview tokenizer.json: {error}")
+            return
+        lines = [f"{index:>4}  {item}" for index, item in enumerate(items)]
+        if total > len(items):
+            lines.append(f"… {total - len(items):,} more not loaded")
+        self._show_gguf_text_dialog("tokenizer.json", "\n".join(lines))
+
     def _show_gguf_text_dialog(self, title: str, body: str) -> None:
         dialog = ft.AlertDialog(
             data=f"gguf-dialog:{title}",
@@ -3565,7 +3637,12 @@ class Shell:
         name = tensor_ids[0].rsplit("#", 1)[-1] if tensor_ids else "tensor"
         title = name if len(tensor_ids) == 1 else f"{len(tensor_ids)} tensors"
         self.inspector_title.value = title
-        self.inspector_subtitle.value = "GGUF tensor"
+        kind = (
+            self.session.document.artifact_kind.value
+            if self.session is not None
+            else "tensor"
+        )
+        self.inspector_subtitle.value = f"{kind.replace('_', ' ')} tensor"
         owner_id = tensor_ids[0] if tensor_ids else ""
         self.inspector.controls = self.activations.tensor_rows_for_ids(
             tensor_ids, owner_id=owner_id
