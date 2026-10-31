@@ -90,17 +90,20 @@ StableHLO does not imply that NNEditor can write the dialect back. Unavailable
 actions explain the format-specific reason directly in the interface.
 
 Ternary Bonsai 2 files using the `qwen35` hybrid decoder, Prism `PQ2_0` or
-`PTQ1_0` packed weights, and Hadamard activation transforms currently support
-inspection only. NNEditor's trace runtime does not implement those execution
-paths. The trace panel lists the missing runtime support beside the disabled
-run button; assigning a prompt does not enable unsupported models.
+`PTQ1_0` packed weights, and version 1 Hadamard transforms support desktop
+tracing. The decoder implements gated full attention, partial text MRoPE,
+causal convolution, and GatedDeltaNet recurrence. Weights stream in bounded
+chunks, including the vocabulary projection; recurrent states reset for each
+prompt. Select **Prepare prompt input**, generate or assign token IDs, then
+select **Approve & run trace**. Word-hash inputs exercise the network; use
+IDs from the model's tokenizer for a faithful text prompt.
 
 ## Installation
 
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.6.1
+python -m pip install nneditor==1.7.0
 ```
 
 Start the desktop application with either command:
@@ -235,10 +238,17 @@ Runtime or NNEditor's axis-aware reference evaluator. GGUF and Hugging Face
 traces use a numpy decoder-only worker that streams one layer at a time
 (Llama-style RMSNorm, RoPE, grouped-query attention, and SwiGLU, plus
 GPT-2-style fused projections where tensor names allow). Packed ggml types
-without a decoder, SSM blocks, scaled RoPE, sliding-window attention, pickle
-shards, and in-memory edits are refused before execution. Unsupported models
+without a decoder, other SSM architectures, scaled RoPE, sliding-window
+attention, pickle shards, and in-memory edits are refused before execution. Unsupported models
 remain available for inspection. Captures stream to disk as layers complete;
 the trace panel guides prompt preparation and shows the CPU backend.
+
+GGUF Qwen3.5 dense text traces also support Prism's g128 ternary packings,
+explicit Hadamard signs, inverse embedding transforms, and grouped recurrent
+output projections. Matrix products use decoded float32 weights and activations;
+results can differ from optimized runtimes that additionally quantize activations.
+Multimodal inputs, MoE decoders, and Prism version 2 tied output transforms are
+not implemented.
 The approved memory ceiling limits host RAM; device memory remains
 under the accelerator provider and driver. A failed or cancelled run publishes
 no trace.

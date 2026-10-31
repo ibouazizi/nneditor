@@ -209,10 +209,24 @@ def _global_layers(
     return layers
 
 
-def _block_layers(grouped: dict[int, dict[str, list[str]]]) -> list[LayerSpec]:
+def _block_layers(
+    grouped: dict[int, dict[str, list[str]]], *, hybrid: bool = False
+) -> list[LayerSpec]:
     layers: list[LayerSpec] = []
     for block in sorted(grouped):
         kinds = grouped[block]
+        if hybrid:
+            # The recurrent projection and its pre-norm form one residual block.
+            # Qwen3.5's post-attention norm belongs to the following FFN.
+            kinds = {kind: list(names) for kind, names in kinds.items()}
+            post = [
+                n for n in kinds["extra"] if n.endswith(".post_attention_norm.weight")
+            ]
+            kinds["extra"] = [n for n in kinds["extra"] if n not in post]
+            kinds["ffn"].extend(post)
+            if kinds["ssm"]:
+                kinds["ssm"].extend(kinds["attn"])
+                kinds["attn"] = []
         for kind, op_type in (
             ("attn", "Attention"),
             ("ssm", "SSM"),
@@ -253,7 +267,7 @@ def plan_architecture(index: GgufIndex) -> ArchitecturePlan:
         else (max(grouped) + 1 if grouped else 0)
     )
     tied = "output.weight" not in tensors and "token_embd.weight" in tensors
-    block_specs = _block_layers(grouped)
+    block_specs = _block_layers(grouped, hybrid=architecture == "qwen35")
     global_specs = _global_layers(tensors, tied=tied)
     embed = [spec for spec in global_specs if spec.op_type == "Embedding"]
     tail = [spec for spec in global_specs if spec.op_type != "Embedding"]

@@ -2,7 +2,8 @@
 
 Copied from the ggml-org GGUF specification (magic, versions, KV types) and
 the live ``ggml_type`` / type-traits table. Fork-only ids such as PTQ1_0 and
-PQ2_0 are intentionally absent: they surface as ``gguf.type_<n>``.
+PQ2_0 are intentionally absent: they surface as ``gguf.type_<n>`` unless
+Prism extension metadata identifies the verified private layouts.
 """
 
 from __future__ import annotations

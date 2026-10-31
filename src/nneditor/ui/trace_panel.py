@@ -509,6 +509,17 @@ class TracePanel:
         self.device.value = TraceDevice.CPU.value if llm else TraceDevice.AUTO.value
         if llm:
             self.runtime_text.value = "NumPy decoder · CPU · weights load as needed."
+            session = self._session()
+            if session is not None:
+                metadata = dict(session.document.extensions).get("x-gguf.metadata")
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("general.architecture") == "qwen35"
+                ):
+                    self.runtime_text.value = (
+                        "Qwen3.5 · gated attention + recurrent layers · CPU. "
+                        "Weights stream in bounded chunks; state resets per prompt."
+                    )
             self.runtime_text.color = self.palette.muted
         elif self._cached_runtime_status is not None:
             self._render_runtime_status(self._cached_runtime_status)

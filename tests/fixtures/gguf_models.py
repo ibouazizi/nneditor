@@ -224,6 +224,8 @@ def _pack_value(layout: Any, type_id: int, value: Any) -> bytes:
         return bytes((1 if value else 0,))
     if type_id == KV_TYPE_UINT32:
         return _pack_u32(layout, int(value))
+    if type_id == 5:  # INT32, used by Prism's explicit sign vectors
+        return struct.pack(layout.struct_endian + "i", int(value))
     if type_id == KV_TYPE_FLOAT32:
         return struct.pack(layout.struct_endian + "f", float(value))
     if type_id == KV_TYPE_ARRAY:

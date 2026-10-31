@@ -1,4 +1,4 @@
-"""Explain why approval is disabled for unsupported Prism/Bonsai models."""
+"""Metadata preflight and prompt preparation for Prism/Bonsai tracing."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from nneditor.ir.capabilities import Availability, Capability
 from nneditor.storage.store import TensorStore
 from tests.fixtures.gguf_models import GgufFixtureTensor, write_gguf
 from tests.fixtures.huggingface_models import write_traceable_llama_snapshot
+from tests.fixtures.qwen35_models import write_qwen35
 from tests.unit.test_shell import make_shell
 
 
@@ -30,7 +31,7 @@ def _bonsai(path: Path, *, architecture: str = "qwen35", type_id: int = 142) -> 
     )
 
 
-def test_bonsai_reports_all_execution_requirements_without_reading_weights(
+def test_bonsai_declares_execution_without_reading_weights(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -38,16 +39,14 @@ def test_bonsai_reports_all_execution_requirements_without_reading_weights(
         pytest.fail("availability must not read model weights")
 
     monkeypatch.setattr(TensorStore, "read", unexpected_read)
-    document = open_gguf(_bonsai(tmp_path / "Bonsai-PQ2_0.gguf"))
+    path, _, _ = write_qwen35(tmp_path / "Bonsai-PQ2_0.gguf", packing=142)
+    document = open_gguf(path)
     status = document.capability(Capability.TRACING)
-    assert status.availability is Availability.UNAVAILABLE
-    assert "Qwen3.5" in status.reason and "GatedDeltaNet" in status.reason
-    assert "PQ2_0" in status.reason
-    assert "Hadamard activation transforms" in status.reason
+    assert status.availability is Availability.AVAILABLE
     assert (
         document.capability(Capability.WEIGHTS).availability is Availability.AVAILABLE
     )
-    assert next(iter(document.tensors.values())).element_type == "gguf.type_142"
+    assert next(iter(document.tensors.values())).element_type == "prism.pq2_0"
 
 
 @pytest.mark.parametrize("type_id,name", [(142, "PQ2_0"), (143, "PTQ1_0")])
@@ -64,7 +63,7 @@ def test_prism_requirements_also_apply_to_supported_decoder_families(
     assert "Hadamard" in reason
 
 
-def test_bonsai_disabled_run_has_visible_model_specific_explanation(
+def test_incomplete_bonsai_keeps_a_visible_explanation(
     tmp_path: Path,
 ) -> None:
     with ApplicationService(prewarm_layouts=False) as service:
@@ -76,11 +75,34 @@ def test_bonsai_disabled_run_has_visible_model_specific_explanation(
         assert not trace.run_settings.visible
         assert not trace.prepare_prompt.visible
         assert trace.blocker_title.value == "Tracing unavailable"
-        assert "PQ2_0" in str(trace.blocker_text.value)
-        assert "Qwen3.5" in str(trace.blocker_text.value)
-        assert "Hadamard" in str(trace.run_button.tooltip)
+        assert "metadata" in str(trace.blocker_text.value)
+        assert trace.run_button.tooltip
         assert trace.blocker_notice in trace.control.controls
         assert not trace.approval_notice.visible
+
+
+@pytest.mark.parametrize("packing", [142, 143])
+def test_bonsai_run_enables_after_assigning_prompt(
+    tmp_path: Path, packing: int
+) -> None:
+    import numpy as np
+
+    path, _, _ = write_qwen35(tmp_path / "Bonsai.gguf", packing=packing)
+    with ApplicationService(prewarm_layouts=False) as service:
+        shell, _ = make_shell(service)
+        session = service.open_model(path)
+        shell.show_session(session)
+        trace = shell.trace
+        assert trace.run_settings.visible
+        assert trace.prepare_prompt.visible and not trace.prepare_prompt.disabled
+        assert trace.blocker_title.value == "Prompt input required"
+        tokens = tmp_path / "tokens.npy"
+        np.save(tokens, np.array([[1, 2]], dtype=np.int64))
+        trace.bind_tensor("tokens", session.trace_tensor_input("tokens", tokens))
+        trace.refresh_actions()
+        assert not trace.run_button.disabled
+        assert not trace.blocker_notice.visible
+        assert trace.approval_notice.visible
 
 
 def test_prompt_prerequisite_is_distinct_from_runtime_support(tmp_path: Path) -> None:

@@ -248,6 +248,18 @@ _REGISTRY: Final[dict[str, DTypeInfo]] = {
             DTypeInfo(name, 0, None, False, None, _PACKED_GGUF_REASON)
             for name in _PACKED_GGUF_NAMES
         ),
+        *(
+            DTypeInfo(
+                name,
+                0,
+                None,
+                False,
+                None,
+                "Prism g128 ternary blocks; decoded by the LLM trace worker. "
+                "The weight inspector exposes packed bytes.",
+            )
+            for name in ("prism.pq2_0", "prism.ptq1_0")
+        ),
     )
 }
 

@@ -138,6 +138,8 @@ def _gguf_hyperparams(document: Document) -> LlmHyperparams:
                 architecture,
                 "attention.layer_norm_epsilon"
                 if gpt2
+                else "attention.layer_norm_rms_epsilon"
+                if architecture == "qwen35"
                 else "attention.layer_norm_rms_eps",
             ),
             1e-5,
@@ -554,6 +556,10 @@ def trace_document(
 
     validate_llm_trace(document)
     params = hyperparams_from_document(document)
+    if params.architecture == "qwen35":
+        from nneditor.tracing.llm_qwen35 import trace_qwen35
+
+        return trace_qwen35(document, feeds, store, params, capture)
     if min(params.n_embd, params.n_head, params.n_kv_head) <= 0:
         raise LlmTraceError("embedding width and head counts must be positive")
     if params.head_dim is None and params.n_embd % params.n_head:

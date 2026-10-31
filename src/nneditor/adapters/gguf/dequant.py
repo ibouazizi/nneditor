@@ -2,8 +2,7 @@
 
 GGUF stores some tensors as native IEEE values and others as block-quantized
 ggml layouts. The LLM worker needs float32 weights; this module is the one
-decoder for both. Fork-only ids such as PTQ1_0 stay unnamed here and fail
-with a clear error, matching the indexer.
+decoder for both. Prism names are assigned separately from public ggml IDs.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from nneditor.adapters.gguf.constants import GGML_IR_DTYPES, GGML_QUANT_SIZES, QK_K
+from nneditor.adapters.gguf.prism import decode_ternary
 
 __all__ = ["GgufDequantError", "dequantize", "supports_dequantization"]
 
@@ -113,6 +113,20 @@ def _decode_bf16(payload: bytes, n_elems: int, endian: str) -> Float32Array:
     out = np.empty(n_elems, dtype=np.float32)
     out.view(np.uint32)[:] = bits.astype(np.uint32) << 16
     return out
+
+
+def _decode_pq2(payload: bytes, n_elems: int, endian: str) -> Float32Array:
+    try:
+        return decode_ternary(payload, n_elems, endian, dense=False)
+    except ValueError as error:
+        raise GgufDequantError(str(error)) from error
+
+
+def _decode_ptq1(payload: bytes, n_elems: int, endian: str) -> Float32Array:
+    try:
+        return decode_ternary(payload, n_elems, endian, dense=True)
+    except ValueError as error:
+        raise GgufDequantError(str(error)) from error
 
 
 def _fp16_at(payload: bytes, offset: int, endian: str) -> float:
@@ -302,6 +316,8 @@ def _fill_q6_k_block(
 
 
 _DECODERS: dict[str, _Decoder] = {
+    "prism.pq2_0": _decode_pq2,
+    "prism.ptq1_0": _decode_ptq1,
     "float32": _decode_f32,
     "float16": _decode_f16,
     "float64": _decode_f64,

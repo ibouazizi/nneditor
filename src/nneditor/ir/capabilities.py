@@ -654,9 +654,10 @@ _CONTRACTS: tuple[ArtifactContract, ...] = (
             Capability.EXECUTION: (
                 Availability.PARTIAL,
                 "A numpy decoder-only forward pass runs in an isolated worker "
-                "for Llama-style and GPT-2-style graphs; packed ggml types "
-                "without a decoder, SSM blocks, and in-memory edits are not "
-                "executed.",
+                "for Llama, GPT-2, and Qwen3.5 dense text decoders, including "
+                "Prism ternary weights and Hadamard transforms for Qwen3.5; "
+                "unsupported architectures, codecs, and in-memory edits "
+                "are not executed.",
             ),
             Capability.TRACING: (
                 Availability.AVAILABLE,

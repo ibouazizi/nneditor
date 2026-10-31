@@ -37,12 +37,14 @@ def _special_runtime_requirements(document: Document) -> tuple[str, ...]:
         return ()
     requirements: list[str] = []
     if metadata.get("general.architecture") == "qwen35":
-        requirements.append("Qwen3.5 hybrid decoder with GatedDeltaNet layers")
+        return ()
     if any(key.startswith("prism.hadamard.") for key in metadata):
         types = {tensor.element_type for tensor in document.tensors.values()}
-        for dtype, name in (("gguf.type_142", "PQ2_0"), ("gguf.type_143", "PTQ1_0")):
+        for dtype, name in (("prism.pq2_0", "PQ2_0"), ("prism.ptq1_0", "PTQ1_0")):
             if dtype in types:
-                requirements.append(f"Prism {name} packed-weight decoding")
+                requirements.append(
+                    f"Prism {name} projection execution for this decoder"
+                )
         requirements.append("Prism Hadamard activation transforms")
     return tuple(requirements)
 
@@ -84,6 +86,12 @@ def _roles(document: Document, node: Node, *, layer_norm: bool) -> set[str]:
 
 def validate_llm_trace(document: Document) -> None:
     """Reject unsupported semantics before allocating or reading any weights."""
+    metadata = dict(document.extensions).get("x-gguf.metadata", {})
+    if isinstance(metadata, dict) and metadata.get("general.architecture") == "qwen35":
+        from nneditor.tracing.llm_qwen35 import validate_qwen35
+
+        validate_qwen35(document, hyperparams_from_document(document))
+        return
     if requirements := _special_runtime_requirements(document):
         raise LlmTraceError(
             "NNEditor cannot trace this model yet. Missing runtime support:\n"

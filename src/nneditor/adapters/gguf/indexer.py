@@ -54,6 +54,7 @@ from nneditor.adapters.gguf.constants import (
     packed_nbytes,
 )
 from nneditor.adapters.gguf.index import GgufIndex, GgufKvEntry, GgufTensorIndex
+from nneditor.adapters.gguf.prism import PRISM_LAYOUTS, PRISM_TYPES
 from nneditor.cancellation import CancellationToken
 from nneditor.diagnostics import DiagnosticLog, Severity
 from nneditor.ir.core import JsonValue, Storage
@@ -476,8 +477,12 @@ def _payload_length(
     n_elems: int,
     log: DiagnosticLog,
     tensor_id: str,
+    *,
+    prism: bool = False,
 ) -> int | None:
     sizes = GGML_QUANT_SIZES.get(raw.ggml_type)
+    if prism and raw.ggml_type in PRISM_TYPES:
+        sizes = PRISM_LAYOUTS[PRISM_TYPES[raw.ggml_type]]
     if sizes is None:
         reason = (
             "removed from GGUF"
@@ -500,6 +505,8 @@ def _payload_length(
             f"multiple of block size {block_size}",
             tensor_id,
         )
+    if prism and raw.ggml_type in PRISM_TYPES:
+        return n_elems // sizes[0] * sizes[1] if n_elems % sizes[0] == 0 else None
     return packed_nbytes(raw.ggml_type, n_elems)
 
 
@@ -540,7 +547,10 @@ def _absent_tensor(raw: _RawTensor, tensor_id: str, n_elems: int) -> GgufTensorI
 
 
 def _describe_raw_tensor(
-    raw: _RawTensor, log: DiagnosticLog
+    raw: _RawTensor,
+    log: DiagnosticLog,
+    *,
+    prism: bool = False,
 ) -> tuple[GgufTensorIndex, int | None, bool]:
     """Return (partial tensor, known nbytes, refuse_payload)."""
     tensor_id = initializer_id(ROOT_GRAPH_ID, raw.name)
@@ -561,13 +571,15 @@ def _describe_raw_tensor(
             tensor_id,
         )
         return _absent_tensor(raw, tensor_id, n_elems), None, True
-    n_bytes = _payload_length(raw, n_elems, log, tensor_id)
+    n_bytes = _payload_length(raw, n_elems, log, tensor_id, prism=prism)
     return (
         GgufTensorIndex(
             tensor_id,
             raw.name,
             raw.ggml_type,
-            element_type_name(raw.ggml_type),
+            PRISM_TYPES.get(raw.ggml_type, element_type_name(raw.ggml_type))
+            if prism
+            else element_type_name(raw.ggml_type),
             raw.dims,
             n_elems,
             raw.relative_offset,
@@ -600,8 +612,10 @@ def _locate_payloads(
     data_start: int,
     file_size: int,
     log: DiagnosticLog,
+    *,
+    prism: bool = False,
 ) -> list[GgufTensorIndex]:
-    described = [_describe_raw_tensor(raw, log) for raw in raw_tensors]
+    described = [_describe_raw_tensor(raw, log, prism=prism) for raw in raw_tensors]
     gaps = _gap_lengths(raw_tensors, data_start, file_size)
     located: list[GgufTensorIndex] = []
     ranges: list[tuple[int, int, int]] = []
@@ -742,7 +756,8 @@ def _index_open(reader: ArtifactReader, token: CancellationToken | None) -> Gguf
             f"{reader.size}-byte file"
         )
     content_hash = cursor.finish_identity(data_start, reader.size)
-    tensors = _locate_payloads(raw_tensors, data_start, reader.size, log)
+    prism = any(entry.key == "prism.hadamard.version" for entry in kv_entries)
+    tensors = _locate_payloads(raw_tensors, data_start, reader.size, log, prism=prism)
     _note_shards(reader.path, kv_entries, log)
     stats = reader.stats
     return GgufIndex(
