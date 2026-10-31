@@ -44,6 +44,7 @@ class ArtifactKind(StrEnum):
     ORBAX_CHECKPOINT = "orbax_checkpoint"
     QUALCOMM_DLC = "qualcomm_dlc"
     COREML_PACKAGE = "coreml_package"
+    GGUF_MODEL = "gguf_model"
 
 
 class Capability(StrEnum):
@@ -617,6 +618,52 @@ _CONTRACTS: tuple[ArtifactContract, ...] = (
                 Availability.UNAVAILABLE,
                 "No Core ML writer exists, and blob weights carry no "
                 "parameter names a labelled weights-only export would need.",
+            ),
+        },
+    ),
+    _contract(
+        ArtifactKind.GGUF_MODEL,
+        "GGUF model",
+        ("model.gguf", "sharded GGUF plus split.count metadata"),
+        (LoadingMode.SAFE_ARTIFACT, LoadingMode.REMOTE_REPOSITORY),
+        ExportFidelity.UNAVAILABLE,
+        {
+            Capability.TOPOLOGY: (
+                Availability.PARTIAL,
+                "A synthetic LLM graph is derived from tensor names and "
+                "architecture metadata; GGUF stores weights, not operators.",
+            ),
+            Capability.WEIGHTS: (
+                Availability.AVAILABLE,
+                "Each tensor is an aligned byte range in the data section, "
+                "read on demand without hashing or decoding the payloads.",
+            ),
+            Capability.METADATA: (
+                Availability.AVAILABLE,
+                "GGUF key-value metadata is part of the container; large "
+                "tokenizer arrays are retained as byte ranges rather than "
+                "parsed at open.",
+            ),
+            Capability.EDITING: (
+                Availability.PARTIAL,
+                "Tensor-level edits apply when the payload is range-readable; "
+                "there is no native GGUF writer, so a committed revision "
+                "cannot be saved back as GGUF.",
+            ),
+            Capability.EXECUTION: (
+                Availability.UNAVAILABLE,
+                "GGUF is a weight container; running it needs a separate "
+                "runtime that this desktop does not ship.",
+            ),
+            Capability.TRACING: (
+                Availability.UNAVAILABLE,
+                "There is no isolated GGUF execution adapter whose "
+                "intermediate values could be captured.",
+            ),
+            Capability.EXPORT: (
+                Availability.UNAVAILABLE,
+                "No GGUF writer is implemented, so edited tensors cannot be "
+                "re-serialized in this container.",
             ),
         },
     ),

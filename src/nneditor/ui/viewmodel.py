@@ -67,6 +67,7 @@ def humanize_identifier(value: str) -> str:
     """Turn schema identifiers into compact product-facing labels."""
     acronyms = {
         "fx": "FX",
+        "gguf": "GGUF",
         "jax": "JAX",
         "onnx": "ONNX",
         "pytorch": "PyTorch",
@@ -232,6 +233,21 @@ def model_summary(document: Document) -> tuple[tuple[str, str], ...]:
         )
         if producer.strip():
             lines.append(("Producer", producer.strip()))
+    gguf_extension = dict(document.extensions).get("x-gguf.model")
+    if isinstance(gguf_extension, dict):
+        architecture = gguf_extension.get("architecture")
+        if isinstance(architecture, str) and architecture:
+            lines.append(("Architecture", architecture))
+        gguf_name = gguf_extension.get("name")
+        if isinstance(gguf_name, str) and gguf_name:
+            lines.append(("Name", gguf_name))
+        version = gguf_extension.get("version")
+        if isinstance(version, int) and not isinstance(version, bool):
+            endian = gguf_extension.get("endian")
+            label = f"v{version}"
+            if isinstance(endian, str) and endian:
+                label = f"{label} ({endian}-endian)"
+            lines.append(("GGUF", label))
     return tuple(lines)
 
 

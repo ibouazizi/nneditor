@@ -19,6 +19,7 @@ MODEL_FILE_EXTENSION_GROUPS: Final[Mapping[str, tuple[str, ...]]] = MappingProxy
         "Safetensors": ("safetensors",),
         "StableHLO": ("mlir", "stablehlo"),
         "Qualcomm DLC": ("dlc",),
+        "GGUF": ("gguf",),
     }
 )
 """Extension hints grouped by the artifact family shown to the user."""

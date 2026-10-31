@@ -228,6 +228,17 @@ class TestConsistencyWithAdapterTables:
             assert info is not None, name
             assert info.byte_width is not None and info.decoder is not None, name
 
+    def test_gguf_names_agree_with_the_registry(self) -> None:
+        from nneditor.adapters.gguf.constants import GGML_IR_DTYPES, element_type_name
+
+        for type_id, name in GGML_IR_DTYPES.items():
+            assert element_type_name(type_id) == name
+            assert dtype_info(name) is not None, name
+        unknown = dtype_info("gguf.type_143")
+        assert unknown is not None
+        assert unknown.decoder is None
+        assert "GGUF" in (unknown.unavailable_reason or "")
+
     def test_jax_names_agree_with_the_registry(self) -> None:
         from nneditor.adapters.jax.mlir_text import _ELEMENT_TYPES
 

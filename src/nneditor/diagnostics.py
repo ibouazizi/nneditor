@@ -444,12 +444,94 @@ _COREML_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
     ),
 )
 
+_GGUF_DESCRIPTORS: tuple[CodeDescriptor, ...] = (
+    CodeDescriptor(
+        "gguf.unknown-tensor-type",
+        DiagnosticCategory.UNSUPPORTED,
+        "Undocumented GGUF tensor type",
+        "The tensor declares a ggml type id this build does not publish. "
+        "Its name is recorded as gguf.type_<n> and its length is inferred "
+        "from neighbouring offsets when possible.",
+    ),
+    CodeDescriptor(
+        "gguf.tensor-range-out-of-bounds",
+        DiagnosticCategory.TENSOR_REFERENCE,
+        "GGUF tensor range exceeds the file",
+        "The declared data offset and length do not fit inside the artifact, "
+        "so the tensor is listed without bytes.",
+    ),
+    CodeDescriptor(
+        "gguf.tensor-range-overlap",
+        DiagnosticCategory.TENSOR_REFERENCE,
+        "GGUF tensor payloads overlap",
+        "Two tensors claim overlapping bytes; both are listed without data "
+        "so an edit cannot corrupt a neighbor.",
+    ),
+    CodeDescriptor(
+        "gguf.tensor-length-mismatch",
+        DiagnosticCategory.TENSOR_REFERENCE,
+        "GGUF tensor length disagrees with shape",
+        "The element count is not a multiple of the ggml block size; the "
+        "payload is still located but decoding would be invalid.",
+    ),
+    CodeDescriptor(
+        "gguf.duplicate-tensor-name",
+        DiagnosticCategory.IDENTITY,
+        "Duplicate GGUF tensor name",
+        "A later tensor reuses a name; the later entry is ignored so "
+        "identifiers stay unique.",
+    ),
+    CodeDescriptor(
+        "gguf.duplicate-kv-key",
+        DiagnosticCategory.IDENTITY,
+        "Duplicate GGUF metadata key",
+        "A later key-value pair reuses a key; the later value is kept.",
+    ),
+    CodeDescriptor(
+        "gguf.kv-value-elided",
+        DiagnosticCategory.METADATA_LOSS,
+        "Large GGUF metadata value retained as a range",
+        "Tokenizer arrays and other large values are hashed with the header "
+        "but not parsed at open; the byte range remains addressable.",
+    ),
+    CodeDescriptor(
+        "gguf.shard-incomplete",
+        DiagnosticCategory.EXTERNAL_DATA,
+        "GGUF split is missing shards",
+        "split.count names more files than sit next to the opened artifact; "
+        "weight_bytes covers this file only.",
+    ),
+    CodeDescriptor(
+        "gguf.implausible-shape",
+        DiagnosticCategory.SHAPE,
+        "Implausible GGUF tensor shape",
+        "A dimension is negative or the element count is absurd; the tensor "
+        "is listed without data.",
+    ),
+    CodeDescriptor(
+        "gguf.bad-alignment",
+        DiagnosticCategory.METADATA_LOSS,
+        "GGUF alignment is not a power of two",
+        "general.alignment is missing or invalid; the 32-byte default is "
+        "used to locate the data section.",
+    ),
+    CodeDescriptor(
+        "gguf.big-endian",
+        DiagnosticCategory.METADATA_LOSS,
+        "GGUF file is big-endian",
+        "Version 3 allows big-endian layout, inferred from the version word. "
+        "Multi-byte fields are decoded with swapped byte order.",
+    ),
+)
+
+
 _DESCRIPTORS: tuple[CodeDescriptor, ...] = (
     _PYTORCH_DESCRIPTORS
     + _HIERARCHY_DESCRIPTORS
     + _JAX_DESCRIPTORS
     + _DLC_DESCRIPTORS
     + _COREML_DESCRIPTORS
+    + _GGUF_DESCRIPTORS
     + (
         CodeDescriptor(
             "onnx.custom-domain",

@@ -13,6 +13,7 @@ import struct
 import zipfile
 from pathlib import Path
 
+from nneditor.adapters.gguf.constants import GGUF_MAGIC_BYTES
 from nneditor.ir.capabilities import ArtifactKind
 
 __all__ = ["DetectionError", "detect_artifact_kind"]
@@ -93,6 +94,8 @@ def detect_artifact_kind(path: Path | str) -> ArtifactKind:
         raise DetectionError(f"{target.name} is empty")
     if prefix.startswith(_ZIP_MAGIC):
         return _zip_kind(target)
+    if prefix.startswith(GGUF_MAGIC_BYTES):
+        return ArtifactKind.GGUF_MODEL
     # safetensors: an 8-byte little-endian header length that fits inside
     # the file, followed immediately by '{'. Without the length check any
     # file with a '{' at offset 8 would claim the format.

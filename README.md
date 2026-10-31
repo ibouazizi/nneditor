@@ -11,7 +11,7 @@
 </p>
 
 NNEditor 1.0 is a capability-aware neural-network workspace for ONNX, PyTorch,
-safetensors, and textual StableHLO artifacts. It combines semantic graph
+safetensors, GGUF, and textual StableHLO artifacts. It combines semantic graph
 navigation, lazy tensor access, reversible editing, validated export, and
 desktop activation tracing in one application.
 
@@ -80,6 +80,7 @@ workflow available for each artifact.
 | Textual StableHLO | Functions, regions, operations, attributes | Inspection only | Unavailable | Unavailable |
 | Qualcomm DLC container | Decoded graph, typed weights, quantization encodings, container index | Unavailable | Unavailable | Unavailable |
 | Core ML package (.mlpackage) | Manifest, model header, feature names, typed weight blobs | Unavailable | Unavailable | Unavailable |
+| GGUF (v1, v2, v3, including big-endian) | Synthetic LLM graph, lazy weights, architecture metadata | Tensor-level changes | Unavailable | Unavailable |
 
 Support is intentionally capability-specific. For example, opening a checkpoint
 does not imply that NNEditor can reconstruct a model graph, and reading
@@ -91,7 +92,7 @@ actions explain the format-specific reason directly in the interface.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.3.4
+python -m pip install nneditor==1.5.0
 ```
 
 Start the desktop application with either command:
@@ -112,7 +113,7 @@ nneditor path/to/model.onnx
 
 On Windows, select **File types** in the top bar to register NNEditor for
 `.onnx`, `.pb`, `.pt2`, `.pt`, `.pth`, `.ckpt`, `.bin`, `.safetensors`,
-`.mlir`, `.stablehlo`, and `.dlc` files. NNEditor then opens Windows Default apps,
+`.mlir`, `.stablehlo`, `.dlc`, and `.gguf` files. NNEditor then opens Windows Default apps,
 where you choose which extensions should launch it. Registration is per-user
 and never replaces a protected Windows default without that explicit choice.
 

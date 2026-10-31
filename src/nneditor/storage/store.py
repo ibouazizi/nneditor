@@ -25,6 +25,7 @@ every reader it opened.
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
@@ -48,6 +49,54 @@ _READ_CHUNK: Final = 4 * 1024 * 1024
 
 DEFAULT_CACHE_BUDGET: Final = 64 * 1024 * 1024
 DEFAULT_TYPED_BUDGET: Final = 32 * 1024 * 1024
+DEFAULT_GROUP_MAX_GAP: Final = 32
+DEFAULT_GROUP_MAX_SPAN: Final = 64 * 1024 * 1024
+
+
+def _is_whole_file_digest(content_hash: str) -> bool:
+    """Whether ``content_hash`` is a full-file digest this store can recompute.
+
+    Header-only identities such as ``gguf-index:`` must not trigger a
+    whole-file hash: that would read every weight at first tensor access.
+    """
+    algorithm, separator, digest = content_hash.partition(":")
+    return bool(separator) and algorithm == "sha256" and bool(digest)
+
+
+def _coalesce_payloads(
+    located: list[tuple[str, Path, int, int]],
+    max_gap: int,
+    max_span: int,
+) -> list[list[tuple[str, Path, int, int]]]:
+    """Group same-file payloads whose gaps fit ``max_gap`` and ``max_span``."""
+    by_path: dict[Path, list[tuple[str, Path, int, int]]] = {}
+    for item in located:
+        by_path.setdefault(item[1], []).append(item)
+    groups: list[list[tuple[str, Path, int, int]]] = []
+    for path in sorted(by_path, key=str):
+        ordered = sorted(by_path[path], key=lambda item: (item[2], item[0]))
+        current: list[tuple[str, Path, int, int]] = []
+        start = 0
+        end = 0
+        for item in ordered:
+            offset = item[2]
+            stop = offset + item[3]
+            if not current:
+                current = [item]
+                start, end = offset, stop
+                continue
+            gap = offset - end
+            span = max(stop, end) - start
+            if 0 <= gap <= max_gap and span <= max_span:
+                current.append(item)
+                end = max(end, stop)
+                continue
+            groups.append(current)
+            current = [item]
+            start, end = offset, stop
+        if current:
+            groups.append(current)
+    return groups
 
 
 class TensorUnavailableError(ValueError):
@@ -280,6 +329,89 @@ class TensorStore:
         self._slice_cache.put(key, data)
         return data
 
+    def read_group(
+        self,
+        tensor_ids: Sequence[str],
+        *,
+        max_gap: int = DEFAULT_GROUP_MAX_GAP,
+        max_span: int = DEFAULT_GROUP_MAX_SPAN,
+        token: CancellationToken | None = None,
+    ) -> dict[str, bytes]:
+        """Read several tensors, coalescing adjacent same-file ranges.
+
+        Tensors whose payloads sit within ``max_gap`` bytes of each other and
+        whose combined span is at most ``max_span`` are fetched in one
+        bounded read. Anything else falls back to :meth:`read`.
+        """
+        if self._closed:
+            raise TensorUnavailableError("the tensor store is closed")
+        if max_gap < 0 or max_span <= 0:
+            raise TensorUnavailableError(
+                f"invalid coalescing bounds: max_gap={max_gap} max_span={max_span}"
+            )
+        results: dict[str, bytes] = {}
+        located: list[tuple[str, Path, int, int]] = []
+        for tensor_id in tensor_ids:
+            if token is not None:
+                token.raise_if_cancelled()
+            if self.materialization(tensor_id) is not Materialization.RANGE:
+                results[tensor_id] = self.read(tensor_id, token=token)
+                continue
+            tensor = self.metadata(tensor_id)
+            file_path, base_offset, total = self._locate(tensor)
+            located.append((tensor_id, file_path, base_offset, total))
+        for group in _coalesce_payloads(located, max_gap, max_span):
+            if len(group) == 1:
+                tensor_id, _path, _offset, _total = group[0]
+                results[tensor_id] = self.read(tensor_id, token=token)
+                continue
+            results.update(self._read_coalesced(group, token=token))
+        return results
+
+    def _read_coalesced(
+        self,
+        group: list[tuple[str, Path, int, int]],
+        *,
+        token: CancellationToken | None,
+    ) -> dict[str, bytes]:
+        file_path = group[0][1]
+        start = min(item[2] for item in group)
+        end = max(item[2] + item[3] for item in group)
+        span = end - start
+        hits: dict[str, bytes] = {}
+        missing: list[tuple[str, Path, int, int]] = []
+        for tensor_id, path, offset, total in group:
+            cached = self._slice_cache.get((tensor_id, 0, total))
+            if cached is not None:
+                hits[tensor_id] = cached
+            else:
+                missing.append((tensor_id, path, offset, total))
+        if not missing:
+            return hits
+        with self._path_lock(file_path):
+            still: list[tuple[str, Path, int, int]] = []
+            for tensor_id, path, offset, total in missing:
+                cached = self._slice_cache.peek((tensor_id, 0, total))
+                if cached is not None:
+                    hits[tensor_id] = cached
+                else:
+                    still.append((tensor_id, path, offset, total))
+            if not still:
+                return hits
+            reader = self._reader(file_path, token=token)
+            try:
+                blob = reader.read(start, span)
+            except RangeReadError as error:
+                raise TensorUnavailableError(
+                    f"coalesced read of {len(still)} tensors past the end of "
+                    f"{file_path.name}: {error}"
+                ) from error
+        for tensor_id, _path, offset, total in still:
+            slice_bytes = blob[offset - start : offset - start + total]
+            self._slice_cache.put((tensor_id, 0, total), slice_bytes)
+            hits[tensor_id] = slice_bytes
+        return hits
+
     def _read_typed(
         self,
         tensor: TensorRef,
@@ -399,7 +531,7 @@ class TensorStore:
         except OSError as error:
             raise TensorUnavailableError(f"cannot open {path.name}: {error}") from error
         try:
-            if expected is not None:
+            if expected is not None and _is_whole_file_digest(expected):
                 actual = reader.content_hash(token=token)
                 if actual != expected:
                     raise TensorUnavailableError(

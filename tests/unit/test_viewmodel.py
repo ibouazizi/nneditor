@@ -133,6 +133,7 @@ def test_overview_formatting_is_headless_and_consistent() -> None:
     assert humanize_identifier("pytorch_exported_program") == (
         "PyTorch Exported Program"
     )
+    assert humanize_identifier("gguf_model") == "GGUF Model"
     assert compact_bytes(999) == "999 B"
     assert compact_bytes(1024) == "1 KiB"
     assert compact_bytes(1536) == "1.5 KiB"

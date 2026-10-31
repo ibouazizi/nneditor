@@ -148,6 +148,42 @@ _SUB_BYTE_REASON: Final = (
 _COMPLEX_REASON: Final = (
     "complex elements do not reduce to single real values and are not yet decodable"
 )
+_PACKED_GGUF_REASON: Final = (
+    "packed GGUF block quantization; values are not decoded in this build"
+)
+_UNKNOWN_GGUF_REASON: Final = (
+    "undocumented or removed GGUF type; values are not decoded in this build"
+)
+_GGUF_TYPE_PREFIX: Final = "gguf.type_"
+_PACKED_GGUF_NAMES: Final = (
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q8_0",
+    "q8_1",
+    "q2_k",
+    "q3_k",
+    "q4_k",
+    "q5_k",
+    "q6_k",
+    "q8_k",
+    "iq2_xxs",
+    "iq2_xs",
+    "iq3_xxs",
+    "iq1_s",
+    "iq4_nl",
+    "iq3_s",
+    "iq2_s",
+    "iq4_xs",
+    "iq1_m",
+    "tq1_0",
+    "tq2_0",
+    "mxfp4",
+    "nvfp4",
+    "q1_0",
+    "q2_0",
+)
 
 _REGISTRY: Final[dict[str, DTypeInfo]] = {
     info.name: info
@@ -208,6 +244,10 @@ _REGISTRY: Final[dict[str, DTypeInfo]] = {
             None,
             "the artifact does not declare an element type",
         ),
+        *(
+            DTypeInfo(name, 0, None, False, None, _PACKED_GGUF_REASON)
+            for name in _PACKED_GGUF_NAMES
+        ),
     )
 }
 
@@ -216,5 +256,14 @@ DTYPES: Final[Mapping[str, DTypeInfo]] = MappingProxyType(_REGISTRY)
 
 
 def dtype_info(name: str) -> DTypeInfo | None:
-    """The registry record for a canonical element-type name, or ``None``."""
-    return DTYPES.get(name)
+    """The registry record for a canonical element-type name, or ``None``.
+
+    Unknown GGUF type ids are synthesized as ``gguf.type_<n>`` so inspectors
+    can always name the dtype and explain why values are not decoded.
+    """
+    info = DTYPES.get(name)
+    if info is not None:
+        return info
+    if name.startswith(_GGUF_TYPE_PREFIX) and name[len(_GGUF_TYPE_PREFIX) :].isdigit():
+        return DTypeInfo(name, 0, None, False, None, _UNKNOWN_GGUF_REASON)
+    return None

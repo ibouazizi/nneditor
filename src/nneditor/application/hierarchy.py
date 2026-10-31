@@ -20,7 +20,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Final, cast
 
-from nneditor.analysis.detectors import DetectionPipeline
+from nneditor.analysis.detectors import DetectionPipeline, SourceHierarchyDetector
 from nneditor.analysis.hierarchy import (
     CandidateKind,
     DetectionEvidence,
@@ -42,6 +42,7 @@ __all__ = [
     "HierarchySidecarStore",
     "ManualGroup",
     "OrganizationMode",
+    "pipeline_for_document",
 ]
 
 SIDECAR_VERSION: Final = 2
@@ -50,6 +51,23 @@ SIDECAR_VERSION: Final = 2
 # fully understood by this code (mode simply defaults to AUTO), so they load
 # rather than being discarded like a genuinely newer, unknown version.
 _READABLE_SIDECAR_VERSIONS: Final = frozenset((1, SIDECAR_VERSION))
+
+_LLM_DETECTORS: Final = (SourceHierarchyDetector(),)
+
+
+def pipeline_for_document(document: Document) -> DetectionPipeline:
+    """Detectors for one artifact.
+
+    A GGUF import synthesizes an LLM graph whose block structure lives in
+    ``source_name``. Pattern and repeated scans would only rediscover that
+    chain, so they stay off when provenance records the synthesis.
+    """
+    if any(
+        entry.operation == "synthesize-llm-architecture"
+        for entry in document.provenance
+    ):
+        return DetectionPipeline(_LLM_DETECTORS)
+    return DetectionPipeline()
 
 
 class OrganizationMode(StrEnum):
@@ -365,7 +383,7 @@ class HierarchyController:
         # Every detector runs exactly once per document; organization modes
         # only filter this pool before reconciliation, so switching modes is
         # a re-reconcile, never a re-detect.
-        active = pipeline or DetectionPipeline()
+        active = pipeline or pipeline_for_document(document)
         # Detectors report the analysis they declined to run (a graph over a
         # scan bound, say) so the shell can explain missing blocks instead of
         # showing an unexplained gap.

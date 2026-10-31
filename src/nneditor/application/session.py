@@ -131,6 +131,16 @@ switch otherwise pays the full base-layout-plus-semantic-slice cost cold —
 hundreds of milliseconds on large models, well past the interaction budget."""
 
 
+def _capped_detail(document: Document, detail_level: DetailLevel) -> DetailLevel:
+    """GGUF's finest useful view is LAYER; OPERATOR would duplicate it."""
+    if (
+        document.artifact_kind is ArtifactKind.GGUF_MODEL
+        and detail_level is DetailLevel.OPERATOR
+    ):
+        return DetailLevel.LAYER
+    return detail_level
+
+
 @dataclass(frozen=True, slots=True)
 class ExportPlan:
     """How the current artifact can be exported by the application."""
@@ -301,7 +311,7 @@ class ModelSession:
                 settings,
                 revision_id=self.editing.current_revision_id,
                 hierarchy=controller.hierarchy(resolved),
-                detail_level=detail_level,
+                detail_level=_capped_detail(document, detail_level),
                 root_group=root_group,
                 viewport=viewport,
             )
@@ -330,8 +340,13 @@ class ModelSession:
                 revision_id = self.editing.current_revision_id
                 graph_id = document.entry_graph
                 hierarchy = self.hierarchy.hierarchy(graph_id)
+                levels = _PREWARM_DETAIL_LEVELS
+                if document.artifact_kind is ArtifactKind.GGUF_MODEL:
+                    levels = tuple(
+                        level for level in levels if level is not DetailLevel.OPERATOR
+                    )
             warmed: list[GraphSlice] = []
-            for level in _PREWARM_DETAIL_LEVELS:
+            for level in levels:
                 # Checkpoint between levels: closing the session cancels
                 # this job, and the walk stops before its next level.
                 token.raise_if_cancelled()
