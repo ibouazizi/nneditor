@@ -56,7 +56,7 @@ from nneditor.prompt_inputs import prompt_settings_for_document
 from nneditor.rendering import create_flet_renderer
 from nneditor.rendering.contract import InteractiveGraphRenderer, RendererFactory
 from nneditor.rendering.scene import NodeGlyph, Scene, Viewport
-from nneditor.tracing.contracts import TraceDevice
+from nneditor.tracing.contracts import TraceDevice, TraceResult
 from nneditor.tracing.runner import recommended_trace_limits
 from nneditor.transformations.engine import (
     TransformationProposal,
@@ -72,6 +72,7 @@ from nneditor.ui.hf_view import HfConfigRow
 from nneditor.ui.hierarchy_panel import HierarchyPanel, natural_key
 from nneditor.ui.trace_graph import build_trace_graph
 from nneditor.ui.trace_panel import TracePanel, uses_automatic_mask
+from nneditor.ui.trace_workspace import TraceWorkspace
 from nneditor.ui.transformation_panel import TransformationPanel
 from nneditor.ui.watch_panel import WatchPanel
 
@@ -646,6 +647,23 @@ class Shell:
             clear_error=self._clear_error,
             watch_text_focus=self._watch_text_focus,
             prepare_inputs=self._prepare_prompt_input,
+            on_trace_ready=self._on_trace_ready,
+        )
+        self.traced_model = TraceWorkspace(
+            page=page,
+            palette=self.palette,
+            session=lambda: self.session,
+            active_trace=lambda: self.trace.active_trace_id,
+            open_tensor=self.activations.open_tensor,
+            configure_trace=self._prepare_trace,
+            select_trace=self._select_captured_trace,
+            graph_slice=lambda: self.current_slice,
+            graph_id=lambda: self.current_graph,
+            show_group=self.show_group,
+            show_parent=self._on_back_to_parent,
+            set_detail=self._set_trace_detail,
+            renderer_factory=renderer_factory,
+            watch_text_focus=self._watch_text_focus,
         )
 
         self._edit_controls = self.edit_panel.control
@@ -1244,6 +1262,10 @@ class Shell:
                                 label="Generate test input",
                                 icon=ft.Icons.SCIENCE_ROUNDED,
                             ),
+                            ft.Tab(
+                                label="Traced model",
+                                icon=ft.Icons.ACCOUNT_TREE_OUTLINED,
+                            ),
                         ],
                         scrollable=False,
                         indicator_color=self.palette.accent,
@@ -1251,15 +1273,20 @@ class Shell:
                         unselected_label_color=self.palette.muted,
                     ),
                     ft.TabBarView(
-                        controls=[model_workspace, generator_workspace],
+                        controls=[
+                            model_workspace,
+                            generator_workspace,
+                            self.traced_model.control,
+                        ],
                         expand=True,
                     ),
                 ],
                 expand=True,
                 spacing=0,
             ),
-            length=2,
+            length=3,
             selected_index=selected_tab,
+            on_change=self._on_workspace_changed,
             expand=True,
         )
         root = ft.Column(
@@ -1311,6 +1338,11 @@ class Shell:
         self._refresh_panel_toggles()
 
     def _refresh_panel_toggles(self) -> None:
+        model_graph = (
+            not hasattr(self, "workspace_tabs")
+            or self.workspace_tabs.selected_index == 0
+        )
+        self.left_toggle.visible = self.right_toggle.visible = model_graph
         self.left_toggle.content = (
             "Hide panels" if self.left_panel.visible else "Show panels"
         )
@@ -1348,6 +1380,8 @@ class Shell:
         )
         # These panels re-render from `self.palette` on their next refresh.
         self.activations.palette = self.palette
+        self.traced_model.palette = self.palette
+        self.traced_model.refresh()
         self.gguf_panel.set_palette(self.palette)
         self.hf_panel.set_palette(self.palette)
         self.trace.palette = self.palette
@@ -1504,7 +1538,47 @@ class Shell:
 
     def _prepare_prompt_input(self) -> None:
         self.workspace_tabs.selected_index = 1
+        self._refresh_panel_toggles()
         self._close_operations_drawer()
+        self.page.update()
+
+    def _prepare_trace(self) -> None:
+        self.workspace_tabs.selected_index = 0
+        self._refresh_panel_toggles()
+        self._active_operation = "trace"
+        self._sync_operations_drawer()
+        self.page.update()
+
+    def _on_trace_ready(self, result: TraceResult) -> None:
+        self.activations.close_overlay()
+        self.traced_model.refresh(trace_id=result.id)
+        self._close_operations_drawer()
+        self.workspace_tabs.selected_index = 2
+        self._refresh_panel_toggles()
+
+    def _set_trace_detail(self, detail: DetailLevel) -> None:
+        self.current_detail, self.auto_detail = detail, False
+        self._replace_current_representation()
+        self._sync_detail_controls()
+
+    def _select_captured_trace(self, trace_id: str) -> None:
+        if self.session is None:
+            return
+        self.activations.close_overlay()
+        result = self.session.trace(trace_id)
+        self.trace.active_trace_id = trace_id
+        self.trace.active_comparison = None
+        self._set_trace_device(result.execution_device, result.execution_provider)
+        self._redraw_scene()
+        self.trace.refresh_actions()
+
+    def _on_workspace_changed(self, event: ft.Event[ft.Tabs]) -> None:
+        self._refresh_panel_toggles()
+        if self.workspace_tabs.selected_index == 2:
+            self.traced_model.refresh()
+            selected = self.traced_model.trace_picker.value
+            if selected is not None and selected != self.trace.active_trace_id:
+                self._select_captured_trace(selected)
         self.page.update()
 
     # -- event handlers ----------------------------------------------------
@@ -1689,6 +1763,7 @@ class Shell:
         self.pending_transformation = None
         self.pending_target = None
         self.trace.reset()
+        self.traced_model.reset()
         # Pins and overlay severities are per-session state.
         self.watch.reset()
         self._reset_overlay()
@@ -2023,7 +2098,7 @@ class Shell:
         self._set_status(f"Opened {next_level.value} view")
         self.page.update()
 
-    def _on_back_to_parent(self, event: ft.Event[ft.TextButton]) -> None:
+    def _on_back_to_parent(self, event: ft.Event[ft.TextButton] | None = None) -> None:
         if (
             self.session is None
             or self.current_graph is None
@@ -2327,6 +2402,8 @@ class Shell:
         self._show_committed_diff()
         self.trace.refresh_actions()
         self._refresh_generator_targets()
+
+        self.traced_model.reset()
 
     def _refresh_graph_list(self) -> None:
         assert self.session is not None
@@ -3756,6 +3833,12 @@ class Shell:
 
     def on_keyboard(self, event: ft.KeyboardEvent) -> None:
         """Global shortcuts plus arrow-key navigation over the visible scene."""
+        if self.activations.value_overlay.dialog is not None:
+            if event.key == "Escape":
+                self.activations.close_overlay()
+                self._text_input_active = False
+                self.page.update()
+            return
         if self._text_input_active:
             # A focused TextField owns the caret; acting on its keystrokes
             # would tear the field down mid-edit and discard the pending text.
@@ -3763,6 +3846,8 @@ class Shell:
         if self._handle_command_shortcut(event):
             return
         if self._handle_view_shortcut(event):
+            return
+        if self.workspace_tabs.selected_index != 0:
             return
         if (
             self.session is None
@@ -3809,7 +3894,12 @@ class Shell:
                 self._on_redo_edit(None)
             return True
         if key == "F":
-            self._start_async(self.search_field.focus)
+            field = (
+                self.traced_model.search
+                if self.workspace_tabs.selected_index == 2
+                else self.search_field
+            )
+            self._start_async(field.focus)
             return True
         return False
 
@@ -3823,6 +3913,11 @@ class Shell:
             # operations drawer, and only then the selection itself.
             if self.activations.close_overlay():
                 self.page.update()
+            elif (
+                self.workspace_tabs.selected_index == 2
+                and self.traced_model._close_chooser()
+            ):
+                self.page.update()
             elif self._close_operations_drawer():
                 self.page.update()
             else:
@@ -3830,6 +3925,19 @@ class Shell:
                 self._on_selected(frozenset())
             return True
         if self.session is None:
+            return False
+        if self.workspace_tabs.selected_index == 2:
+            if key in {"+", "=", "Numpad Add"}:
+                self.traced_model.zoom(1.1)
+                return True
+            if key in {"-", "Numpad Subtract"}:
+                self.traced_model.zoom(0.9)
+                return True
+            if key in {"0", "Numpad 0"}:
+                self.traced_model.fit(readable=True)
+                return True
+            return False
+        if self.workspace_tabs.selected_index != 0:
             return False
         if key in {"+", "=", "Numpad Add"}:
             self._zoom_about_center(1.1)

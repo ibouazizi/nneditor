@@ -165,6 +165,7 @@ class TracePanel:
         clear_error: Callable[[], None],
         watch_text_focus: Callable[[ft.TextField], ft.TextField],
         prepare_inputs: Callable[[], None] | None = None,
+        on_trace_ready: Callable[[TraceResult], None] | None = None,
     ) -> None:
         self.page = page
         self.picker = picker
@@ -186,6 +187,7 @@ class TracePanel:
         self._on_status = on_status
         self._on_device = on_device
         self._clear_error = clear_error
+        self._on_trace_ready = on_trace_ready
 
         self.job: Job[TraceResult] | None = None
         self.active_trace_id: str | None = None
@@ -1663,6 +1665,8 @@ class TracePanel:
                         self._rebuild_minimap()
                     self._autoload_activation_views(self._inspected_ids())
                     self._refresh_inspector(self._inspected_ids())
+                    if self._on_trace_ready is not None:
+                        self._on_trace_ready(result)
                 elif job.state.value == "cancelled":
                     self._on_device(None, "Idle")
                     self._on_status("Trace cancelled; no partial trace was saved")

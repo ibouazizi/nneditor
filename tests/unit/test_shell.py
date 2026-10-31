@@ -115,7 +115,7 @@ def test_shell_uses_the_injected_renderer_factory(
         return renderer
 
     shell = Shell(cast(ft.Page, page), service, renderer_factory=factory)
-    assert created == [shell.renderer]
+    assert created == [shell.renderer, shell.traced_model.renderer]
     assert shell.renderer_control is shell.renderer.control
 
 

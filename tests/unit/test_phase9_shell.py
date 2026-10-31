@@ -504,7 +504,7 @@ def test_generator_tab_saves_and_assigns_to_selected_graph_input(
         shell.show_session(session)
         generator = shell.input_generator
 
-        assert shell.workspace_tabs.length == 2
+        assert shell.workspace_tabs.length == 3
         assert generator.target_input.value == "input"
         assert not generator.generate_and_assign_button.disabled
         shell.workspace_tabs.selected_index = 1

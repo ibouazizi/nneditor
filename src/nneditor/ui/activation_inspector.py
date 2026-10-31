@@ -30,6 +30,7 @@ from nneditor.tracing.contracts import ActivationRecord
 from nneditor.tracing.visualization import ActivationVisualization
 from nneditor.ui import overview, tensor_tools, viewmodel
 from nneditor.ui.activation_layers import build_activation_layer_viewer
+from nneditor.ui.activation_overlay import ActivationOverlay
 from nneditor.ui.shell_layout import ShellPalette
 
 __all__ = ["ActivationInspector", "build_activation_plot"]
@@ -118,6 +119,17 @@ class ActivationInspector:
         # The large-view dialog currently shown, so Escape can close exactly
         # this overlay and nothing else the page may have stacked.
         self._overlay_dialog: ft.AlertDialog | None = None
+        self.value_overlay = ActivationOverlay(
+            page=page,
+            palette=palette,
+            session=session,
+            statistics=self.activation_statistics,
+            get_views=lambda key: self.activation_visualizations.get(key),
+            put_views=lambda key, views: self.activation_visualizations.put(key, views),
+            save_array=self._save_activation_handler,
+            save_plot=self._save_view_png_handler,
+            on_statistics_ready=on_statistics_ready,
+        )
 
     def _new_visualization_cache(
         self,
@@ -130,6 +142,7 @@ class ActivationInspector:
 
     def reset(self) -> None:
         """Drop every per-session cache, consent, and draft."""
+        self.close_overlay()
         self.typed_preview_consent.clear()
         self.hex_offsets.clear()
         self.hex_drafts.clear()
@@ -1040,6 +1053,8 @@ class ActivationInspector:
 
     def close_overlay(self) -> bool:
         """Close the large activation view if it is open; report whether it was."""
+        if self.value_overlay.close():
+            return True
         dialog = self._overlay_dialog
         self._overlay_dialog = None
         if dialog is None or not getattr(dialog, "open", False):
@@ -1049,6 +1064,14 @@ class ActivationInspector:
 
     def _close_overlay(self, event: ft.Event[ft.TextButton]) -> None:
         self.close_overlay()
+
+    def open_tensor(
+        self, trace_id: str, value_id: str, *, title: str | None = None
+    ) -> None:
+        """Inspect a port without changing the graph's current selection."""
+        self.close_overlay()
+        self.value_overlay.palette = self.palette
+        self.value_overlay.open(trace_id, value_id, title=title)
 
     # -- export affordances ------------------------------------------------
 

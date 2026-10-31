@@ -103,7 +103,7 @@ IDs from the model's tokenizer for a faithful text prompt.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.8.0
+python -m pip install nneditor==1.9.0
 ```
 
 Start the desktop application with either command:
@@ -193,12 +193,25 @@ snapshots.
    ONNX Runtime is not a backend for those formats.
 3. Select **Approve & run trace**. This click creates an approval bound to the
    current model, inputs, and limits for that run only.
-4. Click any operator, semantic block, visible connection, model input, or model
-   output. NNEditor automatically builds the corresponding bounded activation
-   views and shows them in the inspector.
-5. Select **Open large view** on an activation card for a scrollable overlay
-   containing its histogram, line view, heatmap, feature-map grid, or attention
-   view, as applicable.
+4. A successful trace opens the **Traced model** pane. It keeps the model graph's
+   block structure and connections, adding small clickable ellipse ports:
+   inputs on top of each block and outputs below. Hover over a port for its
+   tensor name, shape, and capture status. Click a block to open its contents;
+   **Parent block** returns through the same hierarchy as **Model graph**.
+5. Click a port to open its tensor overlay. **View** shows a bounded table of
+   values with row, column, and leading-axis slice controls. **Statistics** and
+   **Visualization** load on demand and reuse cached results. Visualizations
+   include histograms, line views, heatmaps, feature maps, and attention views
+   where applicable. Export captured values as `.npy` and raster views as PNG.
+
+Use the trace picker to revisit a captured run. Drag the graph to pan, scroll
+to zoom, or search for a block or tensor and press Enter to jump to a match.
+**Fit graph** shows the whole structure; **Readable view** restores a closer
+view. Wide block signatures collect extra tensors into a `+` port that opens
+a tensor chooser. Preview and unavailable captures are marked explicitly.
+After a model edit, older traces remain inspectable in **Captured tensors**;
+run another trace to show ports on the changed graph. The **Model graph**
+inspector and its existing activation views also remain available.
 
 The top-right device indicator shows the provider that actually completed the
 latest trace. NNEditor recognizes ONNX Runtime's CUDA, TensorRT, DirectML,
