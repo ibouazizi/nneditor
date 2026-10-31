@@ -730,8 +730,10 @@ def _index_open(reader: ArtifactReader, token: CancellationToken | None) -> Gguf
             reader.path.name,
         )
     kv_entries = _read_kv_entries(cursor, n_kv, token, log)
+    kv_end = cursor.pos
     alignment = _alignment_from_kv(kv_entries, log)
     raw_tensors = _read_tensor_table(cursor, n_tensors, token, log)
+    tensor_table_end = cursor.pos
     remainder = cursor.pos % alignment
     data_start = cursor.pos if remainder == 0 else cursor.pos + (alignment - remainder)
     if data_start > reader.size:
@@ -750,6 +752,8 @@ def _index_open(reader: ArtifactReader, token: CancellationToken | None) -> Gguf
         alignment=alignment,
         n_tensors=n_tensors,
         n_kv=n_kv,
+        kv_end=kv_end,
+        tensor_table_end=tensor_table_end,
         data_start=data_start,
         file_size=reader.size,
         content_hash=content_hash,

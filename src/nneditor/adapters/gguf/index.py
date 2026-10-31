@@ -58,6 +58,8 @@ class GgufIndex:
     alignment: int
     n_tensors: int
     n_kv: int
+    kv_end: int
+    tensor_table_end: int
     data_start: int
     file_size: int
     content_hash: str

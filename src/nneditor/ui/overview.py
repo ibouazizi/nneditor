@@ -8,12 +8,17 @@ module bakes a theme-specific hex value.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import flet as ft
 
 from nneditor.ir.core import Document
 from nneditor.ui import viewmodel
+from nneditor.ui.gguf_view import GgufContainerSummary, gguf_container_summary
 from nneditor.ui.shell_layout import ShellPalette
+
+if TYPE_CHECKING:
+    from nneditor.ui.gguf_inspector import GgufContainerPanel
 
 __all__ = [
     "metadata_section",
@@ -440,23 +445,13 @@ def _finding_card(
     )
 
 
-def model_overview_controls(
+def _default_metrics(
     document: Document,
+    summary: dict[str, str],
     *,
     palette: ShellPalette,
-) -> list[ft.Control]:
-    summary = dict(viewmodel.model_summary(document))
-    artifact_path = summary["Artifact"]
-    artifact_items: list[tuple[str, str]] = [
-        ("File", Path(artifact_path).name or artifact_path),
-        ("Location", artifact_path),
-        ("Format", viewmodel.humanize_identifier(summary["Kind"])),
-    ]
-    if producer := summary.get("Producer"):
-        artifact_items.append(("Producer", producer))
-    artifact_items.append(("Fingerprint", summary["Content hash"]))
-
-    metrics = ft.ResponsiveRow(
+) -> ft.ResponsiveRow:
+    return ft.ResponsiveRow(
         data="model-overview-metrics",
         controls=[
             _metric_card(
@@ -487,6 +482,100 @@ def model_overview_controls(
         spacing=8,
         run_spacing=8,
     )
+
+
+def _gguf_metrics(
+    gguf: GgufContainerSummary, *, palette: ShellPalette
+) -> ft.ResponsiveRow:
+    cards = [
+        _metric_card(
+            "Architecture",
+            gguf.architecture,
+            ft.Icons.ACCOUNT_TREE_ROUNDED,
+            palette=palette,
+        ),
+        _metric_card(
+            "Blocks",
+            f"{gguf.block_count:,}",
+            ft.Icons.LAYERS_ROUNDED,
+            palette=palette,
+        ),
+        _metric_card(
+            "Tensors",
+            f"{gguf.n_tensors:,}",
+            ft.Icons.GRID_VIEW_ROUNDED,
+            palette=palette,
+        ),
+        _metric_card(
+            "Weights",
+            viewmodel.compact_bytes(gguf.payload_bytes),
+            ft.Icons.DATA_OBJECT_ROUNDED,
+            palette=palette,
+        ),
+    ]
+    if gguf.vocab_size is not None:
+        cards.append(
+            _metric_card(
+                "Vocab",
+                f"{gguf.vocab_size:,}",
+                ft.Icons.TEXT_FIELDS_ROUNDED,
+                palette=palette,
+            )
+        )
+    if gguf.context_length is not None:
+        cards.append(
+            _metric_card(
+                "Context",
+                f"{gguf.context_length:,}",
+                ft.Icons.HISTORY_ROUNDED,
+                palette=palette,
+            )
+        )
+    metrics: list[ft.Control] = list(cards)
+    return ft.ResponsiveRow(
+        data="model-overview-metrics",
+        controls=metrics,
+        spacing=8,
+        run_spacing=8,
+    )
+
+
+def _artifact_items(
+    document: Document, summary: dict[str, str]
+) -> list[tuple[str, str]]:
+    artifact_path = summary["Artifact"]
+    items: list[tuple[str, str]] = [
+        ("File", Path(artifact_path).name or artifact_path),
+        ("Location", artifact_path),
+        ("Format", viewmodel.humanize_identifier(summary["Kind"])),
+    ]
+    if producer := summary.get("Producer"):
+        items.append(("Producer", producer))
+    for key in ("Architecture", "Name", "GGUF", "Blocks", "Vocab", "Metadata keys"):
+        if value := summary.get(key):
+            items.append((key, value))
+    items.append(("Fingerprint", summary["Content hash"]))
+    gguf = gguf_container_summary(document)
+    if gguf is not None:
+        items.extend(gguf.extras)
+        if gguf.tied_embeddings:
+            items.append(("Embeddings", "tied to the output head"))
+    return items
+
+
+def model_overview_controls(
+    document: Document,
+    *,
+    palette: ShellPalette,
+    gguf_panel: GgufContainerPanel | None = None,
+) -> list[ft.Control]:
+    summary = dict(viewmodel.model_summary(document))
+    gguf = gguf_container_summary(document)
+    metrics = (
+        _gguf_metrics(gguf, palette=palette)
+        if gguf is not None
+        else _default_metrics(document, summary, palette=palette)
+    )
     controls: list[ft.Control] = [
         ft.Column(
             data="model-overview-summary",
@@ -501,9 +590,16 @@ def model_overview_controls(
             spacing=8,
             tight=True,
         ),
-        metadata_section(tuple(artifact_items), palette=palette),
-        _capabilities_section(viewmodel.capability_lines(document), palette=palette),
     ]
+    if gguf_panel is not None and gguf is not None:
+        gguf_panel.refresh(document)
+        controls.append(gguf_panel.root)
+    controls.append(
+        metadata_section(tuple(_artifact_items(document, summary)), palette=palette)
+    )
+    controls.append(
+        _capabilities_section(viewmodel.capability_lines(document), palette=palette)
+    )
     findings = viewmodel.diagnostic_lines(document)
     if findings:
         controls.append(

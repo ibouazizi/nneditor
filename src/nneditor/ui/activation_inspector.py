@@ -154,6 +154,12 @@ class ActivationInspector:
             tensor_ids = viewmodel.node_tensor_ids(session.document, graph_id, node_id)
         except KeyError:
             return []
+        return self.tensor_rows_for_ids(tensor_ids, owner_id=node_id)
+
+    def tensor_rows_for_ids(
+        self, tensor_ids: Sequence[str], *, owner_id: str
+    ) -> list[ft.Control]:
+        """Inspector rows for an explicit tensor list, e.g. a GGUF block."""
         if not tensor_ids:
             return []
         rows: list[ft.Control] = [
@@ -168,7 +174,7 @@ class ActivationInspector:
         rows.extend(
             self._tensor_card(
                 tensor_id,
-                node_id,
+                owner_id,
                 # The first card starts open; after that the user's own
                 # expand/collapse choices survive every inspector rebuild.
                 expanded=self.tensor_card_expanded.get(tensor_id, position == 0),

@@ -30,6 +30,7 @@ from typing import Any, Final, Protocol, runtime_checkable
 import flet as ft
 import flet.canvas as cv
 
+from nneditor.adapters.gguf.preview import preview_kv_array
 from nneditor.analysis.hierarchy import Group, Hierarchy
 from nneditor.analysis.lod import DetailLevel, detail_for_scale
 from nneditor.application.editing import SidecarPersistenceError
@@ -61,6 +62,8 @@ from nneditor.transformations.engine import (
 from nneditor.ui import input_workspace, overview, shell_layout, viewmodel
 from nneditor.ui.activation_inspector import ActivationInspector
 from nneditor.ui.edit_panel import EditPanel
+from nneditor.ui.gguf_inspector import GgufContainerPanel
+from nneditor.ui.gguf_view import GgufKvRow, tensor_owner_node_id
 from nneditor.ui.hierarchy_panel import HierarchyPanel, natural_key
 from nneditor.ui.trace_graph import build_trace_graph
 from nneditor.ui.trace_panel import TracePanel, uses_automatic_mask
@@ -395,6 +398,15 @@ class Shell:
             on_reset=self._on_reset_groups,
             on_navigate=self._navigate_hierarchy_group,
             refresh=self._refresh_hierarchy,
+            update=page.update,
+        )
+        self._gguf_dialog: ft.AlertDialog | None = None
+        self.gguf_panel = GgufContainerPanel(
+            palette=self.palette,
+            on_select_tensor=self._on_gguf_tensor,
+            on_select_block=self._on_gguf_block,
+            on_preview_kv=self._on_gguf_preview_kv,
+            on_expand_kv=self._on_gguf_expand_kv,
             update=page.update,
         )
         # Compatibility aliases keep the shell's existing public test and
@@ -1316,6 +1328,7 @@ class Shell:
         )
         # These panels re-render from `self.palette` on their next refresh.
         self.activations.palette = self.palette
+        self.gguf_panel.set_palette(self.palette)
         self.trace.palette = self.palette
         self.input_generator.palette = self.palette
         self.watch.palette = self.palette
@@ -1634,6 +1647,7 @@ class Shell:
         self.minimap_model = None
         self._minimap_view_rect = None
         self.activations.reset()
+        self.gguf_panel.reset()
         self._inspected_ids = frozenset()
         self.pending_edit = None
         self.pending_transformation = None
@@ -2229,6 +2243,7 @@ class Shell:
         )
         self._saved_revision_id = None
         self.activations.reset()
+        self.gguf_panel.reset()
         self.trace.reset()
         # Pins and overlay severities belong to the outgoing session.
         self.watch.reset()
@@ -2671,7 +2686,7 @@ class Shell:
         # The Model section always mirrors the open document; the inspector
         # list below shows only what the selection is.
         self.model_info.controls = overview.model_overview_controls(
-            document, palette=self.palette
+            document, palette=self.palette, gguf_panel=self.gguf_panel
         )
         self._sync_info_sections()
         rows: list[ft.Control] = []
@@ -2684,6 +2699,9 @@ class Shell:
             if traced_rows is not None:
                 self.inspector.controls = traced_rows
                 self._refresh_edit_actions()
+                return
+            if node_id in document.tensors:
+                self._render_gguf_tensor_selection((node_id,))
                 return
             hierarchy = self.session.graph_hierarchy(self.current_graph)
             show_tensors = False
@@ -2708,6 +2726,17 @@ class Shell:
                         group.members, owner_id=node_id
                     )
                 )
+                if document.artifact_kind is ArtifactKind.GGUF_MODEL:
+                    rows.extend(
+                        self.activations.tensor_rows_for_ids(
+                            viewmodel.group_tensor_ids(
+                                document,
+                                self.current_graph,
+                                tuple(group.members),
+                            ),
+                            owner_id=node_id,
+                        )
+                    )
             elif node_id.startswith("grp:overview:") and self.current_slice is not None:
                 members = self.current_slice.members_by_glyph[node_id]
                 self.inspector_title.value = "Architecture region"
@@ -2721,6 +2750,15 @@ class Shell:
                 rows.extend(
                     self.activations.group_activation_rows(members, owner_id=node_id)
                 )
+                if document.artifact_kind is ArtifactKind.GGUF_MODEL:
+                    rows.extend(
+                        self.activations.tensor_rows_for_ids(
+                            viewmodel.group_tensor_ids(
+                                document, self.current_graph, tuple(members)
+                            ),
+                            owner_id=node_id,
+                        )
+                    )
             else:
                 details = viewmodel.node_details(document, self.current_graph, node_id)
                 graph = document.graphs[self.current_graph]
@@ -2763,11 +2801,21 @@ class Shell:
                     f"{viewmodel.humanize_identifier(document.artifact_kind.value)}"
                     f" · {node_count:,} operators"
                 )
-                rows.append(
-                    ft.Text(
+                if document.artifact_kind is ArtifactKind.GGUF_MODEL:
+                    hint = (
+                        "Nothing is selected. The Model section is the GGUF "
+                        "container — header, metadata, tensors, and tokenizer. "
+                        "Click a tensor there to inspect its bytes here."
+                    )
+                else:
+                    hint = (
                         "Nothing is selected. Click a block or operator to "
                         "inspect it here; model-level details live in the "
-                        "Model section above.",
+                        "Model section above."
+                    )
+                rows.append(
+                    ft.Text(
+                        hint,
                         size=10,
                         color=self.palette.muted,
                     )
@@ -3409,6 +3457,120 @@ class Shell:
         self.show_group(group_id)
         self._refresh_inspector(frozenset({group_id}))
         self.page.update()
+
+    def _on_gguf_tensor(self, tensor_id: str) -> None:
+        if self.session is None:
+            return
+        document = self.session.document
+        self.activations.tensor_card_expanded.clear()
+        self.activations.tensor_card_expanded[tensor_id] = True
+        owner = tensor_owner_node_id(document, tensor_id)
+        if owner is not None:
+            self.focus_node(owner)
+            return
+        self.renderer.set_selection(frozenset())
+        self.logical_selection = frozenset()
+        self._refresh_inspector(frozenset({tensor_id}))
+        self.page.update()
+
+    def _on_gguf_block(self, block: int) -> None:
+        if self.session is None or self.current_graph is None:
+            return
+        label = f"block-{block:03d}"
+        hierarchy = self.session.graph_hierarchy(self.current_graph)
+        for group in hierarchy.groups:
+            if group.label == label:
+                self._navigate_hierarchy_group(group.id)
+                return
+        self._set_status(f"No hierarchy group named {label}")
+        self.page.update()
+
+    def _on_gguf_preview_kv(self, row: GgufKvRow) -> None:
+        if self.session is None:
+            return
+        document = self.session.document
+        model = dict(document.extensions).get("x-gguf.model")
+        recorded = row.value
+        if not isinstance(model, dict) or not isinstance(recorded, dict):
+            self._show_error(f"{row.key} has no previewable byte range")
+            return
+        offset = recorded.get("offset")
+        length = recorded.get("length")
+        version = model.get("version")
+        endian = model.get("endian")
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or isinstance(length, bool)
+            or not isinstance(length, int)
+            or isinstance(version, bool)
+            or not isinstance(version, int)
+            or not isinstance(endian, str)
+        ):
+            self._show_error(f"{row.key} has no previewable byte range")
+            return
+        try:
+            items, total = preview_kv_array(
+                document.source.path,
+                offset=offset,
+                length=length,
+                version=version,
+                endian=endian,
+                limit=32,
+            )
+        except Exception as error:
+            self._show_error(f"Could not preview {row.key}: {error}")
+            return
+        lines = [f"{index:>4}  {item}" for index, item in enumerate(items)]
+        if total > len(items):
+            lines.append(f"… {total - len(items):,} more not loaded")
+        self._show_gguf_text_dialog(row.key, "\n".join(lines))
+
+    def _on_gguf_expand_kv(self, row: GgufKvRow) -> None:
+        text = row.value if isinstance(row.value, str) else str(row.value)
+        self._show_gguf_text_dialog(row.key, text)
+
+    def _show_gguf_text_dialog(self, title: str, body: str) -> None:
+        dialog = ft.AlertDialog(
+            data=f"gguf-dialog:{title}",
+            modal=True,
+            title=ft.Text(title, weight=ft.FontWeight.W_700, selectable=True),
+            content=ft.Container(
+                width=520,
+                height=360,
+                content=ft.ListView(
+                    controls=[ft.Text(body, size=11, selectable=True)],
+                    expand=True,
+                ),
+            ),
+            actions=[
+                ft.TextButton(
+                    content="Close",
+                    icon=ft.Icons.CLOSE_ROUNDED,
+                    on_click=self._close_gguf_dialog,
+                )
+            ],
+        )
+        self._gguf_dialog = dialog
+        self.page.show_dialog(dialog)
+
+    def _close_gguf_dialog(self, _event: ft.Event[ft.TextButton] | None = None) -> None:
+        dialog = self._gguf_dialog
+        self._gguf_dialog = None
+        if dialog is None or not getattr(dialog, "open", False):
+            return
+        self.page.pop_dialog()
+
+    def _render_gguf_tensor_selection(self, tensor_ids: tuple[str, ...]) -> None:
+        name = tensor_ids[0].rsplit("#", 1)[-1] if tensor_ids else "tensor"
+        title = name if len(tensor_ids) == 1 else f"{len(tensor_ids)} tensors"
+        self.inspector_title.value = title
+        self.inspector_subtitle.value = "GGUF tensor"
+        owner_id = tensor_ids[0] if tensor_ids else ""
+        self.inspector.controls = self.activations.tensor_rows_for_ids(
+            tensor_ids, owner_id=owner_id
+        )
+        self._refresh_edit_actions()
 
     def _refresh_breadcrumbs(self) -> None:
         if self.session is None or self.current_graph is None:

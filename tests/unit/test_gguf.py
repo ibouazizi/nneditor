@@ -203,6 +203,12 @@ def test_synthetic_graph_and_source_hierarchy(tmp_path: Path) -> None:
     model = dict(document.extensions)["x-gguf.model"]
     assert model["architecture"] == "llama"
     assert model["tied_embeddings"] is True
+    assert model["kv_end"] > 0
+    assert model["tensor_table_end"] >= model["kv_end"]
+    kv_records = dict(document.extensions)["x-gguf.kv"]
+    assert isinstance(kv_records, list)
+    keys = {item["key"] for item in kv_records if isinstance(item, dict)}
+    assert "general.architecture" in keys
 
 
 def test_operator_detail_caps_to_layer(tmp_path: Path) -> None:

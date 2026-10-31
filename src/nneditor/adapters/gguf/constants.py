@@ -22,6 +22,7 @@ __all__ = [
     "GGUF_SUPPORTED_VERSIONS",
     "GGUF_VALUE_TYPE_WIDTH",
     "KV_TYPE_ARRAY",
+    "KV_TYPE_NAMES",
     "KV_TYPE_STRING",
     "MAX_GGUF_KV_ENTRIES",
     "MAX_GGUF_KV_VALUE_BYTES",
@@ -35,6 +36,8 @@ __all__ = [
     "REMOVED_GGML_TYPE_IDS",
     "GgufWireLayout",
     "element_type_name",
+    "header_nbytes",
+    "kv_type_name",
     "layout_for",
     "packed_nbytes",
 ]
@@ -89,6 +92,12 @@ def layout_for(version: int, endian: str) -> GgufWireLayout:
     return GgufWireLayout(version, endian, width, width)
 
 
+def header_nbytes(version: int) -> int:
+    """Bytes in the GGUF magic, version word, and the two count fields."""
+    layout = layout_for(version, "little")
+    return 8 + 2 * layout.count_size
+
+
 GGML_MAX_DIMS: Final = 4
 MAX_TENSOR_NAME: Final = 64
 """ggml tensor names, including the trailing NUL in the C layout."""
@@ -132,6 +141,30 @@ GGUF_VALUE_TYPE_WIDTH: Final[MappingProxyType[int, int]] = MappingProxyType(
         KV_TYPE_FLOAT64: 8,
     }
 )
+
+KV_TYPE_NAMES: Final[MappingProxyType[int, str]] = MappingProxyType(
+    {
+        KV_TYPE_UINT8: "uint8",
+        KV_TYPE_INT8: "int8",
+        KV_TYPE_UINT16: "uint16",
+        KV_TYPE_INT16: "int16",
+        KV_TYPE_UINT32: "uint32",
+        KV_TYPE_INT32: "int32",
+        KV_TYPE_FLOAT32: "float32",
+        KV_TYPE_BOOL: "bool",
+        KV_TYPE_STRING: "string",
+        KV_TYPE_ARRAY: "array",
+        KV_TYPE_UINT64: "uint64",
+        KV_TYPE_INT64: "int64",
+        KV_TYPE_FLOAT64: "float64",
+    }
+)
+
+
+def kv_type_name(type_id: int) -> str:
+    """Human name for a GGUF value-type id, or ``type_<n>`` when unknown."""
+    return KV_TYPE_NAMES.get(type_id, f"type_{type_id}")
+
 
 # Historical ggml_type ids that GGUF no longer writes.
 REMOVED_GGML_TYPE_IDS: Final = frozenset({4, 5, 31, 32, 33, 36, 37, 38})

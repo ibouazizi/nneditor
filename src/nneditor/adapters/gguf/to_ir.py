@@ -74,6 +74,20 @@ def _json_kv(index: GgufIndex) -> dict[str, JsonValue]:
     return {entry.key: entry.value for entry in index.kv}
 
 
+def _kv_records(index: GgufIndex) -> list[JsonValue]:
+    return [
+        {
+            "key": entry.key,
+            "type_id": entry.type_id,
+            "offset": entry.offset,
+            "length": entry.length,
+            "elided": entry.elided,
+            "value": entry.value,
+        }
+        for entry in index.kv
+    ]
+
+
 def _model_extension(index: GgufIndex, plan: ArchitecturePlan) -> dict[str, JsonValue]:
     return {
         "version": index.version,
@@ -81,6 +95,8 @@ def _model_extension(index: GgufIndex, plan: ArchitecturePlan) -> dict[str, Json
         "alignment": index.alignment,
         "n_tensors": index.n_tensors,
         "n_kv": index.n_kv,
+        "kv_end": index.kv_end,
+        "tensor_table_end": index.tensor_table_end,
         "data_start": index.data_start,
         "architecture": plan.architecture,
         "name": plan.name,
@@ -258,6 +274,7 @@ def index_to_document(index: GgufIndex) -> Document:
         extensions=[
             ("x-gguf.model", _model_extension(index, plan)),
             ("x-gguf.metadata", _json_kv(index)),
+            ("x-gguf.kv", _kv_records(index)),
         ],
     )
 

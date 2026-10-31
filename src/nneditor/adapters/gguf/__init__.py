@@ -11,6 +11,7 @@ from nneditor.adapters.gguf.blocks import (
 )
 from nneditor.adapters.gguf.index import GgufIndex, GgufKvEntry, GgufTensorIndex
 from nneditor.adapters.gguf.indexer import GgufIndexError, index_gguf
+from nneditor.adapters.gguf.preview import preview_kv_array
 from nneditor.adapters.gguf.to_ir import index_to_document, open_gguf
 
 __all__ = [
@@ -23,5 +24,6 @@ __all__ = [
     "index_to_document",
     "load_block_tensors",
     "open_gguf",
+    "preview_kv_array",
     "tensor_source_name",
 ]

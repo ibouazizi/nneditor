@@ -39,6 +39,7 @@ __all__ = [
     "compact_bytes",
     "diagnostic_lines",
     "graph_entries",
+    "group_tensor_ids",
     "histogram_rows",
     "humanize_identifier",
     "model_summary",
@@ -248,6 +249,18 @@ def model_summary(document: Document) -> tuple[tuple[str, str], ...]:
             if isinstance(endian, str) and endian:
                 label = f"{label} ({endian}-endian)"
             lines.append(("GGUF", label))
+        alignment = gguf_extension.get("alignment")
+        if isinstance(alignment, int) and not isinstance(alignment, bool):
+            lines.append(("Alignment", f"{alignment} bytes"))
+        n_kv = gguf_extension.get("n_kv")
+        if isinstance(n_kv, int) and not isinstance(n_kv, bool):
+            lines.append(("Metadata keys", f"{n_kv:,}"))
+        block_count = gguf_extension.get("block_count")
+        if isinstance(block_count, int) and not isinstance(block_count, bool):
+            lines.append(("Blocks", f"{block_count:,}"))
+        vocab_size = gguf_extension.get("vocab_size")
+        if isinstance(vocab_size, int) and not isinstance(vocab_size, bool):
+            lines.append(("Vocab", f"{vocab_size:,}"))
     return tuple(lines)
 
 
@@ -314,6 +327,8 @@ def node_details(
             (f"Output {position}", f"{value.name}: {dtype} {_shape_text(value)}")
         )
     for attribute in node.attributes:
+        if attribute.referenced_tensor_ids():
+            continue
         lines.append((f"Attr {attribute.name}", _attribute_text(attribute)))
     for subgraph_id in node.subgraphs:
         lines.append(("Subgraph", subgraph_id))
@@ -321,28 +336,28 @@ def node_details(
         lines.append(
             (f"{note.capability.value} {note.availability.value}", note.reason)
         )
-    # Initializer-backed inputs get their storage summarized so the user sees
-    # weight locations without a single tensor byte being read.
-    for value_id in node.inputs:
-        if not graph.has_value(value_id):
-            continue
-        value = graph.value(value_id)
-        for tensor_id in graph.initializers:
-            tensor = document.tensors[tensor_id]
-            if tensor.id.endswith(f"#{value.name}") and value.name:
-                where = {
-                    Storage.EMBEDDED_RAW: "embedded",
-                    Storage.EMBEDDED_TYPED: "embedded (typed)",
-                    Storage.EXTERNAL: "external",
-                    Storage.GENERATED: "generated revision data",
-                    Storage.ABSENT: "absent",
-                }[tensor.storage]
-                lines.append(
-                    (
-                        f"Weight {value.name}",
-                        f"{tensor.element_type} {list(tensor.dims)} ({where})",
-                    )
-                )
+    # Weights are initializer-backed inputs or TENSOR attributes. Locations
+    # are summarized so the user sees where bytes live without reading them.
+    storage_names = {
+        Storage.EMBEDDED_RAW: "embedded",
+        Storage.EMBEDDED_TYPED: "embedded (typed)",
+        Storage.EXTERNAL: "external",
+        Storage.GENERATED: "generated revision data",
+        Storage.ABSENT: "absent",
+    }
+    for tensor_id in node_tensor_ids(document, graph_id, node_id):
+        tensor = document.tensors[tensor_id]
+        name = tensor_id.rsplit("#", 1)[-1]
+        where = storage_names[tensor.storage]
+        location = ""
+        if tensor.payload is not None:
+            location = f" @ {tensor.payload.offset:,}"
+        lines.append(
+            (
+                f"Weight {name}",
+                f"{tensor.element_type} {list(tensor.dims)} ({where}){location}",
+            )
+        )
     return tuple(lines)
 
 
@@ -394,7 +409,12 @@ def activation_array(
 
 
 def node_tensor_ids(document: Document, graph_id: str, node_id: str) -> tuple[str, ...]:
-    """Initializer tensors feeding one node, in input-port order."""
+    """Weight tensors bound to one node, in input then attribute order.
+
+    ONNX-style graphs feed weights as named initializer inputs. GGUF and
+    similar containers attach them as TENSOR attributes instead; both are
+    listed so the inspector can open the bytes.
+    """
     graph = document.graphs[graph_id]
     node = graph.node(node_id)
     found: list[str] = []
@@ -406,6 +426,29 @@ def node_tensor_ids(document: Document, graph_id: str, node_id: str) -> tuple[st
             continue
         for tensor_id in graph.initializers:
             if tensor_id.endswith(f"#{value.name}") and tensor_id not in found:
+                found.append(tensor_id)
+    for attribute in node.attributes:
+        for tensor_id in attribute.referenced_tensor_ids():
+            if tensor_id not in found:
+                found.append(tensor_id)
+    return tuple(found)
+
+
+def group_tensor_ids(
+    document: Document, graph_id: str, member_ids: Sequence[str]
+) -> tuple[str, ...]:
+    """Weight tensors bound to any operator in a hierarchy group."""
+    found: list[str] = []
+    if graph_id not in document.graphs:
+        return ()
+    graph = document.graphs[graph_id]
+    for node_id in member_ids:
+        try:
+            graph.node(node_id)
+        except KeyError:
+            continue
+        for tensor_id in node_tensor_ids(document, graph_id, node_id):
+            if tensor_id not in found:
                 found.append(tensor_id)
     return tuple(found)
 
@@ -442,6 +485,9 @@ def tensor_lines(
     if byte_length is not None:
         lines.append(("Bytes", f"{byte_length:,}"))
         lines.append(("Est. memory", f"{byte_length / (1024 * 1024):.2f} MiB"))
+    if tensor.payload is not None:
+        lines.append(("File offset", f"{tensor.payload.offset:,}"))
+        lines.append(("Payload", f"{tensor.payload.length:,} bytes"))
     if tensor.external is not None:
         lines.append(("Location", tensor.external.location))
     # Quantization and layout metadata are not modelled until Phase 5; saying
