@@ -23,6 +23,28 @@ class TensorScriptError(ValueError):
     """A script could not run within its selected limits."""
 
 
+class _WorkerScratch(tempfile.TemporaryDirectory[str]):
+    """Scratch directory that survives a just-killed Windows worker.
+
+    ``process.wait()`` can return while the worker still holds
+    ``worker-stderr.log``. The stock cleanup then raises ``PermissionError``
+    and hides the timeout or cancellation error that just occurred.
+    """
+
+    def cleanup(self) -> None:
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                super().cleanup()
+                return
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    self._ignore_cleanup_errors = True
+                    super().cleanup()
+                    return
+                time.sleep(0.05)
+
+
 @dataclass(frozen=True, slots=True)
 class TensorScriptResult:
     stdout: str
@@ -53,7 +75,7 @@ def run_tensor_script(
         raise TensorScriptError(
             "Choose a timeout of 1-3600 seconds and RAM of 128-65536 MiB."
         )
-    with tempfile.TemporaryDirectory(prefix="nneditor-tensor-script-") as directory:
+    with _WorkerScratch(prefix="nneditor-tensor-script-") as directory:
         scratch = Path(directory)
         payload = scratch / "tensor.bin"
         with payload.open("wb") as handle:

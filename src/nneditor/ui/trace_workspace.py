@@ -534,12 +534,18 @@ class TraceWorkspace:
         self.page.show_dialog(self._chooser)
 
     def _close_chooser(self) -> bool:
-        if self._chooser is not None:
-            self._chooser.open = False
-            self._chooser = None
-            self.page.update()
-            return True
-        return False
+        chooser = self._chooser
+        self._chooser = None
+        if chooser is None:
+            return False
+        # Setting open=False and updating the page leaves the dialog in
+        # Flet's dialog stack. Each later chooser is another mounted tree,
+        # and every page update walks all of them.
+        if chooser.open and hasattr(self.page, "pop_dialog"):
+            self.page.pop_dialog()
+        else:
+            chooser.open = False
+        return True
 
     def _on_selected(self, ids: frozenset[str]) -> None:
         session, graph_id = self._session(), self._graph_id()

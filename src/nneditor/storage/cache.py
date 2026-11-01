@@ -29,7 +29,27 @@ from collections import OrderedDict
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 
-__all__ = ["BudgetedCache", "CacheSnapshot", "CacheStats"]
+__all__ = ["BoundedMap", "BudgetedCache", "CacheSnapshot", "CacheStats"]
+
+
+class BoundedMap[K: Hashable, V](OrderedDict[K, V]):
+    """Insertion-ordered map that forgets the oldest entry past ``limit``.
+
+    Used where a plain dict would retain every tensor the user inspects for
+    the life of the session. Re-setting a key refreshes it as recently used.
+    """
+
+    def __init__(self, limit: int) -> None:
+        if limit < 1:
+            raise ValueError(f"map limit must be positive, got {limit}")
+        super().__init__()
+        self.limit = limit
+
+    def __setitem__(self, key: K, value: V) -> None:
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > self.limit:
+            self.popitem(last=False)
 
 
 class CacheStats:

@@ -355,6 +355,7 @@ def test_dismissed_overlay_cancels_jobs_and_ignores_late_completion(
             state=SimpleNamespace(is_terminal=False, value="running"),
             cancel=lambda: cancelled.append(True),
             wait=lambda: True,
+            release_result=lambda: None,
         )
         monkeypatch.setattr(
             ModelSession, "compute_activation_statistics_async", lambda *_: fake

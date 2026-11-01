@@ -25,7 +25,7 @@ from nneditor.analysis.statistics import TensorStatistics, element_width
 from nneditor.application.session import ModelSession
 from nneditor.application.slices import GraphSlice
 from nneditor.ir.core import Storage
-from nneditor.storage.cache import BudgetedCache
+from nneditor.storage.cache import BoundedMap, BudgetedCache
 from nneditor.tracing.contracts import ActivationRecord
 from nneditor.tracing.visualization import ActivationVisualization
 from nneditor.ui import overview, tensor_tools, viewmodel
@@ -46,6 +46,9 @@ _VISUALIZATION_CACHE_BUDGET = 128 * 1024 * 1024
 # jobs behind those workers and starve every manual request, so automatic
 # view-building stops here and later records keep their build button.
 _AUTOLOAD_VIEW_LIMIT = 6
+_STATISTICS_LIMIT = 256
+_VISUALIZATION_ERROR_LIMIT = 128
+_HEX_DRAFT_LIMIT = 32
 
 
 def _visualization_cost(views: tuple[ActivationVisualization, ...]) -> int:
@@ -106,15 +109,19 @@ class ActivationInspector:
 
         self.typed_preview_consent: set[str] = set()
         self.hex_offsets: dict[str, int] = {}
-        self.hex_drafts: dict[tuple[str, int], str] = {}
+        self.hex_drafts: BoundedMap[tuple[str, int], str] = BoundedMap(_HEX_DRAFT_LIMIT)
         self.hex_errors: dict[str, str] = {}
         # Expansion state per tensor card, so a hex-pager or statistics
         # interaction does not re-collapse every card the user opened.
         self.tensor_card_expanded: dict[str, bool] = {}
-        self.activation_statistics: dict[tuple[str, str], TensorStatistics] = {}
+        self.activation_statistics: BoundedMap[tuple[str, str], TensorStatistics] = (
+            BoundedMap(_STATISTICS_LIMIT)
+        )
         self._visualization_cache_budget = visualization_cache_budget
         self.activation_visualizations = self._new_visualization_cache()
-        self.activation_visualization_errors: dict[tuple[str, str], str] = {}
+        self.activation_visualization_errors: BoundedMap[tuple[str, str], str] = (
+            BoundedMap(_VISUALIZATION_ERROR_LIMIT)
+        )
         self.activation_loading: set[tuple[str, str, str]] = set()
         # The large-view dialog currently shown, so Escape can close exactly
         # this overlay and nothing else the page may have stacked.
@@ -839,20 +846,23 @@ class ActivationInspector:
             self.page.update()
 
             def wait() -> None:
-                job.wait()
-                self.activation_loading.discard(loading)
-                if job.state.value == "succeeded":
-                    self.activation_statistics[(trace_id, value_id)] = job.result()
-                elif job.state.value == "failed":
-                    self._on_error(f"Activation statistics failed: {job.error}")
-                if self._inspected_ids() == frozenset({node_id}):
-                    self._refresh_inspector(self._inspected_ids())
-                if self._on_statistics_ready is not None:
-                    # The watch strip and anomaly overlay tint from computed
-                    # statistics; every landing must reach them, whichever
-                    # panel started the job.
-                    self._on_statistics_ready()
-                self.page.update()
+                try:
+                    job.wait()
+                    self.activation_loading.discard(loading)
+                    if job.state.value == "succeeded":
+                        self.activation_statistics[(trace_id, value_id)] = job.result()
+                    elif job.state.value == "failed":
+                        self._on_error(f"Activation statistics failed: {job.error}")
+                    if self._inspected_ids() == frozenset({node_id}):
+                        self._refresh_inspector(self._inspected_ids())
+                    if self._on_statistics_ready is not None:
+                        # The watch strip and anomaly overlay tint from computed
+                        # statistics; every landing must reach them, whichever
+                        # panel started the job.
+                        self._on_statistics_ready()
+                    self.page.update()
+                finally:
+                    job.release_result()
 
             self.page.run_thread(wait)
 
@@ -895,19 +905,24 @@ class ActivationInspector:
             return False
 
         def wait() -> None:
-            job.wait()
-            self.activation_loading.discard(loading)
-            active = self._session() is session and self._active_trace_id() == trace_id
-            if active and job.state.value == "succeeded":
-                self.activation_visualizations.put(key, job.result())
-                self.activation_visualization_errors.pop(key, None)
-            elif active and job.state.value == "failed":
-                self.activation_visualization_errors[key] = str(job.error)
-                self._on_status(f"Activation view failed: {job.error}")
-            if active and self._inspected_ids() == frozenset({owner_id}):
-                self._refresh_inspector(self._inspected_ids())
-            if active:
-                self.page.update()
+            try:
+                job.wait()
+                self.activation_loading.discard(loading)
+                active = (
+                    self._session() is session and self._active_trace_id() == trace_id
+                )
+                if active and job.state.value == "succeeded":
+                    self.activation_visualizations.put(key, job.result())
+                    self.activation_visualization_errors.pop(key, None)
+                elif active and job.state.value == "failed":
+                    self.activation_visualization_errors[key] = str(job.error)
+                    self._on_status(f"Activation view failed: {job.error}")
+                if active and self._inspected_ids() == frozenset({owner_id}):
+                    self._refresh_inspector(self._inspected_ids())
+                if active:
+                    self.page.update()
+            finally:
+                job.release_result()
 
         self.page.run_thread(wait)
         return True

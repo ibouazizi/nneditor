@@ -34,6 +34,7 @@ import flet.canvas as cv
 from nneditor.adapters.gguf.preview import preview_kv_array
 from nneditor.adapters.huggingface import preview_tokenizer_vocab
 from nneditor.analysis.hierarchy import Group, Hierarchy
+from nneditor.analysis.llm_layers import layer_label, layer_owner, layer_tensor_ids
 from nneditor.analysis.lod import DetailLevel, detail_for_scale
 from nneditor.application.editing import SidecarPersistenceError
 from nneditor.application.hierarchy import OrganizationMode
@@ -1716,6 +1717,9 @@ class Shell:
             except Exception as error:
                 self._show_error(f"Could not present the model: {error}")
             finally:
+                # The shell holds the live session. The open job must not
+                # also retain it, or every previous model stays in memory.
+                job.release_result()
                 self.loading_overlay.visible = False
                 if self.open_job is job:
                     self.open_job = None
@@ -1921,7 +1925,7 @@ class Shell:
         if hit is None:
             if self.hover_card.visible:
                 self._hide_hover_card()
-                self.page.update()
+                self._update_control(self.hover_card)
             return
         if hit == self._hovered_id:
             return
@@ -1943,7 +1947,7 @@ class Shell:
                 max(position.y + 16, 12), max(self.surface_size[1] - 100, 12)
             )
             self.hover_card.visible = True
-            self.page.update()
+            self._update_control(self.hover_card)
             return
         hierarchy = self.session.graph_hierarchy(self.current_graph)
         glyph = scene.node(hit)
@@ -1976,12 +1980,12 @@ class Shell:
             max(position.y + 16, 12), max(self.surface_size[1] - 100, 12)
         )
         self.hover_card.visible = True
-        self.page.update()
+        self._update_control(self.hover_card)
 
     def _on_surface_exit(self, event: ft.PointerEvent[ft.GestureDetector]) -> None:
         if self.hover_card.visible:
             self._hide_hover_card()
-            self.page.update()
+            self._update_control(self.hover_card)
 
     def _hide_hover_card(self) -> None:
         self._hovered_id = None
@@ -2821,6 +2825,11 @@ class Shell:
         if len(ids) == 1 and self.current_graph is not None:
             self.inspector.spacing = 14
             (node_id,) = ids
+            layer_stem: str | None = None
+            if self.current_slice is not None:
+                found = layer_owner(self.current_slice.members_by_glyph, node_id)
+                if found is not None:
+                    node_id, layer_stem = found
             traced_rows = self.trace.glyph_inspector(node_id)
             if traced_rows is not None:
                 self.inspector.controls = traced_rows
@@ -2889,10 +2898,16 @@ class Shell:
                 details = viewmodel.node_details(document, self.current_graph, node_id)
                 graph = document.graphs[self.current_graph]
                 node = graph.node(node_id)
-                self.inspector_title.value = node.source_name or node.op_type
-                self.inspector_subtitle.value = (
-                    f"{node.qualified_op_type} · Operator metadata"
-                )
+                if layer_stem is not None:
+                    self.inspector_title.value = layer_label(layer_stem)
+                    self.inspector_subtitle.value = (
+                        f"Layer · {node.source_name or node.op_type}"
+                    )
+                else:
+                    self.inspector_title.value = node.source_name or node.op_type
+                    self.inspector_subtitle.value = (
+                        f"{node.qualified_op_type} · Operator metadata"
+                    )
                 rows.append(
                     overview.metadata_section(
                         details,
@@ -2911,7 +2926,16 @@ class Shell:
                         on_click=self._copy_node_json_handler(node_id),
                     )
                 )
-                show_tensors = True
+                if layer_stem is not None:
+                    rows.extend(
+                        self.activations.tensor_rows_for_ids(
+                            layer_tensor_ids(node, layer_stem),
+                            owner_id=node_id,
+                        )
+                    )
+                    rows.extend(self.activations.activation_rows(node_id))
+                else:
+                    show_tensors = True
             if show_tensors:
                 rows.extend(self.activations.tensor_rows(node_id))
                 rows.extend(self.activations.activation_rows(node_id))
@@ -3428,35 +3452,38 @@ class Shell:
         self._refresh_edit_actions()
 
         def wait() -> None:
-            job.wait()
-            active = self.session is session and not session.closed
-            if job.state.value == "succeeded":
-                outcome = job.result()
+            try:
+                job.wait()
+                active = self.session is session and not session.closed
+                if job.state.value == "succeeded":
+                    outcome = job.result()
+                    if active:
+                        detail = (
+                            f"; report: {outcome.report_path.name}"
+                            if outcome.report_path is not None
+                            else ""
+                        )
+                        current_revision = session.editing.current_revision_id
+                        newer = ""
+                        if current_revision == revision_id:
+                            self._saved_revision_id = revision_id
+                        else:
+                            newer = "; newer changes remain unsaved"
+                        self._set_status(
+                            f"Exported {len(outcome.written_files)} artifact file(s) "
+                            f"({outcome.fidelity.value}){detail}{newer}"
+                        )
+                elif job.state.value == "cancelled" and active:
+                    self._set_status("Export cancelled")
+                elif active:
+                    self._show_error(f"Export failed: {job.error}")
+                if self.export_job is job:
+                    self.export_job = None
                 if active:
-                    detail = (
-                        f"; report: {outcome.report_path.name}"
-                        if outcome.report_path is not None
-                        else ""
-                    )
-                    current_revision = session.editing.current_revision_id
-                    newer = ""
-                    if current_revision == revision_id:
-                        self._saved_revision_id = revision_id
-                    else:
-                        newer = "; newer changes remain unsaved"
-                    self._set_status(
-                        f"Exported {len(outcome.written_files)} artifact file(s) "
-                        f"({outcome.fidelity.value}){detail}{newer}"
-                    )
-            elif job.state.value == "cancelled" and active:
-                self._set_status("Export cancelled")
-            elif active:
-                self._show_error(f"Export failed: {job.error}")
-            if self.export_job is job:
-                self.export_job = None
-            if active:
-                self._refresh_edit_actions()
-                self.page.update()
+                    self._refresh_edit_actions()
+                    self.page.update()
+            finally:
+                job.release_result()
 
         self.page.run_thread(wait)
         self.page.update()

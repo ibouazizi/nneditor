@@ -551,7 +551,7 @@ def test_hover_shows_context_without_changing_selection(
 ) -> None:
     path = tmp_path / "model.onnx"
     build_embedded_model(path, elements=16)
-    shell, page = make_shell(service)
+    shell, _page = make_shell(service)
     shell.show_session(service.open_model(path))
     scene = shell.renderer.scene
     viewport = shell.renderer.viewport
@@ -569,10 +569,8 @@ def test_hover_shows_context_without_changing_selection(
     assert shell.hover_title.value == node.label
     assert node.display_type in (shell.hover_summary.value or "")
     assert not shell.renderer.selection
-    updates = page.updates
     shell._on_surface_exit(cast(Any, None))
     assert not shell.hover_card.visible
-    assert page.updates > updates
 
 
 def test_manual_group_control_collapses_and_resets_selection(

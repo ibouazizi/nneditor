@@ -271,7 +271,7 @@ class ModelSession:
             self._hierarchy_store = hierarchy_store
             self._navigation = NavigationModel()
             self._jobs = jobs
-            self._prewarm_job: Job[tuple[GraphSlice, ...]] | None = None
+            self._prewarm_job: Job[int] | None = None
             self._activation_store = activation_store
             self._input_store = input_store
             self._stats_sidecar = stats_sidecar
@@ -436,7 +436,7 @@ class ModelSession:
         if self._jobs is None or self._closed:
             return
 
-        def work(token: CancellationToken) -> tuple[GraphSlice, ...]:
+        def work(token: CancellationToken) -> int:
             # Capture once, briefly. The walk below runs without
             # _state_lock: holding it across multi-hundred-millisecond
             # layouts would block UI reads and close().
@@ -454,7 +454,7 @@ class ModelSession:
                         for level in _PREWARM_DETAIL_LEVELS
                         if level is not DetailLevel.OPERATOR
                     )
-            warmed: list[GraphSlice] = []
+            warmed = 0
             for level in levels:
                 # Checkpoint between levels: closing the session cancels
                 # this job, and the walk stops before its next level.
@@ -466,18 +466,18 @@ class ModelSession:
                 # hierarchy edit or organization-mode change mid-walk only
                 # changes *future* keys — entries computed here are at
                 # worst unused until evicted, never served stale, and need
-                # no invalidation.
-                warmed.append(
-                    self._slicer.slice_graph(
-                        document,
-                        graph_id,
-                        revision_id=revision_id,
-                        hierarchy=hierarchy,
-                        detail_level=level,
-                        root_group=None,
-                    )
+                # no invalidation. The returned count is all the job keeps:
+                # the scenes themselves stay in the bounded slicer cache.
+                self._slicer.slice_graph(
+                    document,
+                    graph_id,
+                    revision_id=revision_id,
+                    hierarchy=hierarchy,
+                    detail_level=level,
+                    root_group=None,
                 )
-            return tuple(warmed)
+                warmed += 1
+            return warmed
 
         # Best-effort: a service already shutting down skips the warmup
         # rather than failing the open.

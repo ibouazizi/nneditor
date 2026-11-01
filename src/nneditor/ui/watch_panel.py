@@ -22,6 +22,7 @@ import flet as ft
 
 from nneditor.analysis.statistics import TensorStatistics
 from nneditor.application.session import ModelSession
+from nneditor.storage.cache import BoundedMap
 from nneditor.tracing.comparison import ActivationError, TraceComparison
 from nneditor.tracing.contracts import ActivationRecord, TraceResult
 from nneditor.ui import overview, viewmodel
@@ -103,9 +104,9 @@ class WatchPanel:
         self._statistics_errors: dict[tuple[str, str], str] = {}
         # One comparison per (base, active) trace pair, indexed per value at
         # render time; recomputing per row would repeat the streaming pass.
-        self._comparisons: dict[tuple[str, str], TraceComparison] = {}
+        self._comparisons: BoundedMap[tuple[str, str], TraceComparison] = BoundedMap(32)
         self._comparison_loading: set[tuple[str, str]] = set()
-        self._comparison_errors: dict[tuple[str, str], str] = {}
+        self._comparison_errors: BoundedMap[tuple[str, str], str] = BoundedMap(32)
         self.strip = ft.Column(spacing=8, tight=True, data="watch-strip")
         self.refresh()
 
@@ -424,16 +425,19 @@ class WatchPanel:
             return False
 
         def wait() -> None:
-            job.wait()
-            self._statistics_loading().discard(marker)
-            if self._session() is session:
-                if job.state.value == "succeeded":
-                    self._statistics()[key] = job.result()
-                    self._statistics_errors.pop(key, None)
-                elif job.state.value == "failed":
-                    self._statistics_errors[key] = str(job.error)
-            self._on_statistics_ready()
-            self.page.update()
+            try:
+                job.wait()
+                self._statistics_loading().discard(marker)
+                if self._session() is session:
+                    if job.state.value == "succeeded":
+                        self._statistics()[key] = job.result()
+                        self._statistics_errors.pop(key, None)
+                    elif job.state.value == "failed":
+                        self._statistics_errors[key] = str(job.error)
+                self._on_statistics_ready()
+                self.page.update()
+            finally:
+                job.release_result()
 
         self.page.run_thread(wait)
         return True
@@ -453,17 +457,20 @@ class WatchPanel:
             return
 
         def wait() -> None:
-            job.wait()
-            self._comparison_loading.discard(key)
-            if self._session() is session:
-                if job.state.value == "succeeded":
-                    self._comparisons[key] = job.result()
-                    self._comparison_errors.pop(key, None)
-                elif job.state.value == "failed":
-                    self._comparison_errors[key] = str(job.error)
-                    self._on_error(f"Trace comparison failed: {job.error}")
-                self.refresh()
-            self.page.update()
+            try:
+                job.wait()
+                self._comparison_loading.discard(key)
+                if self._session() is session:
+                    if job.state.value == "succeeded":
+                        self._comparisons[key] = job.result()
+                        self._comparison_errors.pop(key, None)
+                    elif job.state.value == "failed":
+                        self._comparison_errors[key] = str(job.error)
+                        self._on_error(f"Trace comparison failed: {job.error}")
+                    self.refresh()
+                self.page.update()
+            finally:
+                job.release_result()
 
         self.page.run_thread(wait)
 

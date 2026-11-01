@@ -993,6 +993,34 @@ class TracePanel:
                     border_radius=18,
                 )
             )
+        # Panning calls this on every frame. Replacing the stack allocates a
+        # new control per input each time and makes the diff walk grow for the
+        # rest of the session. The same visible inputs only move.
+        previous = self.graph_actions.controls
+        if (
+            controls
+            and len(previous) == len(controls)
+            and all(
+                isinstance(old, ft.Container)
+                and isinstance(new, ft.Container)
+                and old.data == new.data
+                for old, new in zip(previous, controls, strict=True)
+            )
+        ):
+            for old, new in zip(previous, controls, strict=True):
+                assert isinstance(old, ft.Container)
+                assert isinstance(new, ft.Container)
+                old.left = new.left
+                old.top = new.top
+                old_button = old.content
+                new_button = new.content
+                if isinstance(old_button, ft.IconButton) and isinstance(
+                    new_button, ft.IconButton
+                ):
+                    old_button.icon = new_button.icon
+                    old_button.icon_color = new_button.icon_color
+                    old_button.tooltip = new_button.tooltip
+            return
         self.graph_actions.controls = controls
 
     # -- input bindings ----------------------------------------------------
@@ -1666,6 +1694,8 @@ class TracePanel:
                 job.wait()
                 if job.state.value == "succeeded":
                     result = job.result()
+                    if result is None:
+                        return
                     self.active_trace_id = result.id
                     self.active_comparison = None
                     self._on_device(
@@ -1699,6 +1729,7 @@ class TracePanel:
                     self.job = None
                 self.refresh_actions()
                 self.page.update()
+                job.release_result()
 
         self.page.run_thread(wait)
 
@@ -1734,22 +1765,27 @@ class TracePanel:
         self.compare_button.disabled = True
 
         def wait() -> None:
-            job.wait()
-            if job.state.value == "succeeded":
-                self.active_comparison = job.result()
-                if self._current_slice() is not None:
-                    self._redraw_scene()
-                    self.refresh_graph_actions()
-                self.status.value = (
-                    f"Compared {len(self.active_comparison.nodes)} node(s); "
-                    "overlay shows maximum absolute error"
-                )
-                self._on_status("Trace comparison overlay active")
-            elif job.state.value == "cancelled":
-                self._on_status("Trace comparison cancelled")
-            else:
-                self._on_error(f"Trace comparison failed: {job.error}")
-            self.refresh_actions()
-            self.page.update()
+            try:
+                job.wait()
+                if job.state.value == "succeeded":
+                    self.active_comparison = job.result()
+                    if self._current_slice() is not None:
+                        self._redraw_scene()
+                        self.refresh_graph_actions()
+                    compared = self.active_comparison
+                    count = len(compared.nodes) if compared is not None else 0
+                    self.status.value = (
+                        f"Compared {count} node(s); "
+                        "overlay shows maximum absolute error"
+                    )
+                    self._on_status("Trace comparison overlay active")
+                elif job.state.value == "cancelled":
+                    self._on_status("Trace comparison cancelled")
+                else:
+                    self._on_error(f"Trace comparison failed: {job.error}")
+                self.refresh_actions()
+                self.page.update()
+            finally:
+                job.release_result()
 
         self.page.run_thread(wait)

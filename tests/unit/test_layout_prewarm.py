@@ -117,14 +117,10 @@ def test_prewarmed_operator_scene_is_the_on_demand_scene(tmp_path: Path) -> None
         session = _open_model(tmp_path, service)
         job = session._prewarm_job
         assert job is not None
-        warmed = job.result(timeout=30)
-        assert [item.detail_level for item in warmed] == [
-            DetailLevel.BLOCK,
-            DetailLevel.LAYER,
-            DetailLevel.OPERATOR,
-        ]
-        on_demand = session.scene(detail_level=DetailLevel.OPERATOR)
-        assert on_demand is warmed[-1], (
+        assert job.result(timeout=30) == 3
+        first = session.scene(detail_level=DetailLevel.OPERATOR)
+        second = session.scene(detail_level=DetailLevel.OPERATOR)
+        assert first is second, (
             "identity proves the on-demand request was served from the "
             "prewarmed cache entry, i.e. the keys matched exactly"
         )

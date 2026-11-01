@@ -522,25 +522,28 @@ class ActivationOverlay:
         self.page.update()
 
         def wait() -> None:
-            job.wait()
-            if (
-                epoch != self._epoch
-                or self._session() is not session
-                or self.dialog is None
-            ):
-                return
-            self._jobs.pop("decode", None)
-            self.decode_button.disabled = False
-            if job.state.value != "succeeded":
-                self.decode_result.controls = [
-                    ft.Text(
-                        str(job.error or "Decoding cancelled."),
-                        color=self.palette.warning,
-                    )
-                ]
-            else:
-                self._show_decoded(job.result())
-            self.page.update()
+            try:
+                job.wait()
+                if (
+                    epoch != self._epoch
+                    or self._session() is not session
+                    or self.dialog is None
+                ):
+                    return
+                self._jobs.pop("decode", None)
+                self.decode_button.disabled = False
+                if job.state.value != "succeeded":
+                    self.decode_result.controls = [
+                        ft.Text(
+                            str(job.error or "Decoding cancelled."),
+                            color=self.palette.warning,
+                        )
+                    ]
+                else:
+                    self._show_decoded(job.result())
+                self.page.update()
+            finally:
+                job.release_result()
 
         self.page.run_thread(wait)
 
@@ -637,27 +640,31 @@ class ActivationOverlay:
         self.page.update()
 
         def wait() -> None:
-            job.wait()
-            if (
-                epoch != self._epoch
-                or self._session() is not session
-                or self.dialog is None
-            ):
-                return
-            self._jobs.pop("script", None)
-            self.script_run.disabled, self.script_cancel.disabled = False, True
-            self.script_clear.disabled = self.script_example.disabled = (
-                self.script_editor.disabled
-            ) = False
-            if job.state.value == "succeeded":
-                self._show_script_result(job.result())
-            else:
-                self.script_output.controls = [
-                    ft.Text(
-                        str(job.error or "Script stopped."), color=self.palette.warning
-                    )
-                ]
-            self.page.update()
+            try:
+                job.wait()
+                if (
+                    epoch != self._epoch
+                    or self._session() is not session
+                    or self.dialog is None
+                ):
+                    return
+                self._jobs.pop("script", None)
+                self.script_run.disabled, self.script_cancel.disabled = False, True
+                self.script_clear.disabled = self.script_example.disabled = (
+                    self.script_editor.disabled
+                ) = False
+                if job.state.value == "succeeded":
+                    self._show_script_result(job.result())
+                else:
+                    self.script_output.controls = [
+                        ft.Text(
+                            str(job.error or "Script stopped."),
+                            color=self.palette.warning,
+                        )
+                    ]
+                self.page.update()
+            finally:
+                job.release_result()
 
         self.page.run_thread(wait)
 
@@ -828,24 +835,27 @@ class ActivationOverlay:
         self._render_analysis(kind)
 
         def wait() -> None:
-            job.wait()
-            if (
-                epoch != self._epoch
-                or self._session() is not session
-                or self.dialog is None
-            ):
-                return
-            self._jobs.pop(kind, None)
-            if job.state.value == "succeeded":
-                if kind == "statistics":
-                    self._statistics[key] = cast(TensorStatistics, job.result())
-                    if self._on_statistics_ready:
-                        self._on_statistics_ready()
+            try:
+                job.wait()
+                if (
+                    epoch != self._epoch
+                    or self._session() is not session
+                    or self.dialog is None
+                ):
+                    return
+                self._jobs.pop(kind, None)
+                if job.state.value == "succeeded":
+                    if kind == "statistics":
+                        self._statistics[key] = cast(TensorStatistics, job.result())
+                        if self._on_statistics_ready:
+                            self._on_statistics_ready()
+                    else:
+                        self._put_views(key, cast(Views, job.result()))
                 else:
-                    self._put_views(key, cast(Views, job.result()))
-            else:
-                self._errors[kind] = str(job.error or "The request was cancelled.")
-            self._render_analysis(kind)
-            self.page.update()
+                    self._errors[kind] = str(job.error or "The request was cancelled.")
+                self._render_analysis(kind)
+                self.page.update()
+            finally:
+                job.release_result()
 
         self.page.run_thread(wait)

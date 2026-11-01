@@ -6,7 +6,17 @@ import threading
 
 import pytest
 
-from nneditor.storage.cache import BudgetedCache
+from nneditor.storage.cache import BoundedMap, BudgetedCache
+
+
+def test_bounded_map_forgets_the_oldest_entry() -> None:
+    remembered: BoundedMap[str, bytes] = BoundedMap(2)
+    remembered["a"] = b"a"
+    remembered["b"] = b"b"
+    remembered["a"] = b"aa"
+    remembered["c"] = b"c"
+    assert list(remembered) == ["a", "c"]
+    assert remembered["a"] == b"aa"
 
 
 class TestBasics:

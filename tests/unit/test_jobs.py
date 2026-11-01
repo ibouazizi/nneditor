@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 import threading
+import weakref
 
 import pytest
 
@@ -19,6 +21,25 @@ def test_a_job_runs_and_returns_its_result() -> None:
         assert job.error is None
     finally:
         with_manager.close()
+
+
+def test_release_result_drops_the_payload() -> None:
+    class Payload:
+        pass
+
+    payload = Payload()
+    handle = weakref.ref(payload)
+    manager = JobManager(max_workers=1)
+    try:
+        job = manager.submit("keep", lambda token, kept=payload: kept)
+        assert job.result(timeout=5) is payload
+        del payload
+        assert handle() is not None
+        job.release_result()
+        gc.collect()
+        assert handle() is None
+    finally:
+        manager.close()
 
 
 def test_a_failing_job_reports_its_error() -> None:

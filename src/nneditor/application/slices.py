@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from nneditor.analysis.hierarchy import Hierarchy
 from nneditor.analysis.layout import LayoutResult, LayoutSettings, layout_graph
+from nneditor.analysis.llm_layers import expand_llm_layers
 from nneditor.analysis.lod import DetailLevel, SemanticScene, semantic_scene
 from nneditor.application.navigation import NavigationModel, SearchHit
 from nneditor.ir.core import Document
@@ -135,6 +136,7 @@ class GraphSlicer:
                     detail_level,
                     root_group=root_group,
                 )
+                semantic = expand_llm_layers(semantic, graph)
                 result = self._to_slice(
                     base,
                     semantic,

@@ -87,6 +87,17 @@ class Job[T]:
         assert self._error is not None
         raise self._error
 
+    def release_result(self) -> None:
+        """Drop a finished payload once the caller has stored it elsewhere.
+
+        The manager keeps completed jobs so the UI can observe them. That
+        history must not also keep layout scenes, activation rasters, or a
+        closed model alive.
+        """
+        with self._lock:
+            self._result = None
+            self._future = None
+
     def wait(self, timeout: float | None = None) -> bool:
         """Wait for completion without consuming the result."""
         return self._done.wait(timeout)
