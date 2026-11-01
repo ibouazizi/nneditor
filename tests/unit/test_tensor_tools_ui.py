@@ -75,6 +75,9 @@ def test_decoded_tokens_and_predictions_use_the_gguf_vocabulary(tmp_path: Path) 
         assert overlay.decode_panel.visible
         overlay._decode_text(cast(Any, SimpleNamespace()))
         assert "Hello world!" in texts(overlay.decode_result)
+        assert "GGUF embedded vocabulary: llama.gguf" in " ".join(
+            texts(overlay.decode_result)
+        )
         shell.activations.open_tensor(trace_id, graph.outputs[0])
         overlay._decode_text(cast(Any, SimpleNamespace()))
         assert "Greedy next-token" in " ".join(texts(overlay.decode_result))

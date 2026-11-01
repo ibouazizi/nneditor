@@ -49,6 +49,47 @@ def test_byte_bpe_reassembles_unicode_across_token_boundaries() -> None:
     assert bert.decode(range(5)) == "hellos, world"
 
 
+@pytest.mark.parametrize(
+    "algorithm,pieces,expected",
+    [
+        ("gpt2", ("custom", "Ġcheckpoint"), "custom checkpoint"),
+        ("llama", ("▁custom", "▁checkpoint"), "custom checkpoint"),
+        ("t5", ("▁custom", "▁checkpoint"), "custom checkpoint"),
+        ("bert", ("custom", "##checkpoint"), "customcheckpoint"),
+    ],
+)
+def test_gguf_decoder_uses_the_open_files_vocabulary(
+    tmp_path: Path, algorithm: str, pieces: tuple[str, str], expected: str
+) -> None:
+    path = write_gguf(
+        tmp_path / "my-model.gguf",
+        version=3,
+        kv=(
+            ("general.architecture", 8, "llama"),
+            ("tokenizer.ggml.model", 8, algorithm),
+            ("tokenizer.ggml.tokens", 9, (8, pieces)),
+        ),
+    )
+    decoder = decoder_for_document(open_gguf(path))
+    assert decoder.decode([0, 1]) == expected
+    assert decoder.piece(0) == pieces[0]
+    assert "GGUF embedded vocabulary: my-model.gguf" in decoder.name
+    assert f"2 tokens; {algorithm} decoding" in decoder.name
+
+
+def test_gguf_without_a_vocabulary_does_not_fall_back_to_gpt2(tmp_path: Path) -> None:
+    path = write_gguf(
+        tmp_path / "missing-vocabulary.gguf",
+        version=3,
+        kv=(
+            ("general.architecture", 8, "llama"),
+            ("tokenizer.ggml.model", 8, "gpt2"),
+        ),
+    )
+    with pytest.raises(DetokenizationError, match="no usable token vocabulary"):
+        decoder_for_document(open_gguf(path))
+
+
 def test_native_json_decoder_and_missing_or_invalid_tokenizer(tmp_path: Path) -> None:
     path = tmp_path / "tokenizer.json"
     tokenizer = Tokenizer(

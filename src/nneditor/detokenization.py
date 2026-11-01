@@ -77,8 +77,16 @@ class JsonDecoder:
 @dataclass(frozen=True, slots=True)
 class VocabularyDecoder:
     vocabulary: tuple[str, ...]
-    name: str
+    algorithm: str
     special_ids: frozenset[int] = frozenset()
+    source_name: str = ""
+
+    @property
+    def name(self) -> str:
+        source = "GGUF embedded vocabulary"
+        if self.source_name:
+            source += f": {self.source_name}"
+        return f"{source} ({len(self.vocabulary):,} tokens; {self.algorithm} decoding)"
 
     def piece(self, token_id: int) -> str:
         if token_id < 0 or token_id >= len(self.vocabulary):
@@ -96,7 +104,7 @@ class VocabularyDecoder:
             for i in values
             if not skip_special or i not in self.special_ids
         ]
-        if self.name == "bert":
+        if self.algorithm == "bert":
             from tokenizers.decoders import WordPiece
 
             return str(WordPiece().decode(pieces))
@@ -106,18 +114,18 @@ class VocabularyDecoder:
             fallback = re.fullmatch(r"<0x([0-9a-fA-F]{2})>", piece)
             if fallback:
                 raw.append(int(fallback[1], 16))
-            elif self.name == "gpt2" and all(char in inverse for char in piece):
+            elif self.algorithm == "gpt2" and all(char in inverse for char in piece):
                 raw.extend(inverse[char] for char in piece)
             else:
                 raw.extend(
                     (
                         piece.replace("▁", " ")
-                        if self.name in {"llama", "t5"}
+                        if self.algorithm in {"llama", "t5"}
                         else piece
                     ).encode("utf-8")
                 )
         text = raw.decode("utf-8", errors="replace")
-        if self.name in {"llama", "t5"} and pieces and pieces[0].startswith("▁"):
+        if self.algorithm in {"llama", "t5"} and pieces and pieces[0].startswith("▁"):
             text = text[1:]
         return text
 
@@ -186,7 +194,10 @@ def decoder_for_document(document: Document) -> Decoder:
             if kind in (3, 5)
         )
         return VocabularyDecoder(
-            tuple(str(v) for v in vocabulary), str(name), frozenset(special)
+            tuple(str(v) for v in vocabulary),
+            str(name),
+            frozenset(special),
+            Path(document.source.path).name,
         )
     raise DetokenizationError(
         "Text decoding needs the model's GGUF or Hugging Face tokenizer."

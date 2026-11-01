@@ -226,6 +226,10 @@ top token probabilities for a complete captured vocabulary row. This is a
 forward-pass prediction, rather than an autoregressively generated response.
 Missing tokenizer data and incomplete logit rows are reported explicitly.
 Hashed-word smoke-test inputs cannot recover their original prompt text.
+For GGUF models, the overlay identifies the file and its embedded vocabulary
+size. A `gpt2` decoding label means the byte-decoding algorithm declared by the
+file; token IDs still use that GGUF's own `tokenizer.ggml.tokens` table, including
+model-specific Qwen or Bonsai tokens. No external GPT-2 vocabulary is substituted.
 
 Use the trace picker to revisit a captured run. Drag the graph to pan, scroll
 to zoom, or search for a block or tensor and press Enter to jump to a match.

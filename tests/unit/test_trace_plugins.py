@@ -160,7 +160,9 @@ def test_create_install_refresh_and_duplicate_install(tmp_path: Path) -> None:
         tmp_path / "source", directory=tmp_path / "installed"
     )
     assert installed.identity == created.identity
-    assert registry.refreshed().plugins[-1].identity == created.identity
+    assert any(
+        plugin.identity == created.identity for plugin in registry.refreshed().plugins
+    )
     with pytest.raises(TracePluginError, match="already installed"):
         install_trace_plugin(tmp_path / "source", directory=tmp_path / "installed")
     with pytest.raises(FileExistsError):

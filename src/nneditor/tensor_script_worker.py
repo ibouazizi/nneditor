@@ -10,6 +10,7 @@ import json
 import math
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,13 @@ def run(request_path: Path) -> None:
     if os.environ.get("NNEDITOR_TRACE_WORKER") != "1":
         raise ValueError("Tensor scripts must be launched by NNEditor.")
     request = json.loads(request_path.read_text(encoding="utf-8"))
-    _limit_process(request)
+    # RLIMIT_CPU counts startup CPU too. Leave the parent's wall-clock timer
+    # time to report expiration before the CPU fuse can kill the worker.
+    limits = dict(request)
+    limits["wall_seconds"] = (
+        math.ceil(time.process_time() + float(request.get("wall_seconds", 120))) + 1
+    )
+    _limit_process(limits)
     scratch = request_path.parent
     output, errors = BoundedOutput(), BoundedOutput()
     response: dict[str, Any] = {"plots": [], "result": "", "error": None}
