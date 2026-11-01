@@ -142,15 +142,15 @@ def test_whole_model_plugins_do_not_get_streaming_weight_memory_defaults(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from nneditor.tracing.runner import recommended_trace_limits
     from nneditor.ui import app
     from tests.fixtures.huggingface_models import write_traceable_llama_snapshot
 
-    original = app.recommended_trace_limits
     flags: list[bool] = []
 
     def recommend(size: int, *, streaming_weights: bool = False) -> Any:
         flags.append(streaming_weights)
-        return original(size, streaming_weights=streaming_weights)
+        return recommended_trace_limits(size, streaming_weights=streaming_weights)
 
     monkeypatch.setattr(app, "recommended_trace_limits", recommend)
     with ApplicationService(prewarm_layouts=False) as service:
