@@ -1,0 +1,168 @@
+{
+  "recording_date": "2026-11-01",
+  "source_commit": "683966c91fe985910866e258a847df4954642321",
+  "capture": "Native NNEditor Windows desktop window recorded with FFmpeg gdigrab. Model execution and captured outputs are real.",
+  "editing": "Idle time and native file dialogs are omitted. Prompt controls are shown before the save step. Other steps follow their recorded order. Instructions are burned into a separate caption area below the app. No narration.",
+  "video": "assets/videos/bonsai-native-walkthrough.mp4",
+  "video_duration_seconds": 123.0,
+  "video_resolution": [
+    1280,
+    768
+  ],
+  "video_frame_rate": 20,
+  "video_inference_speed_multiplier": 16,
+  "model": "Ternary-Bonsai-2-27B-PQ2_0.gguf",
+  "model_relative_to_checkout": "../npu/models/bonsai2-27b/Ternary-Bonsai-2-27B-PQ2_0.gguf",
+  "model_size_bytes": 7206168928,
+  "artifact_index_hash": "gguf-index:0a02adec81ce261ad3806049c1b2040b8f14498ff16142aabe286641dc13f721",
+  "architecture": "qwen35",
+  "decoder_blocks": 64,
+  "embedded_vocabulary_entries": 248320,
+  "prompt": "The quick brown fox jumps over the lazy dog.",
+  "input_archive": "examples/bonsai/bonsai27b-pangram.npz",
+  "input_archive_sha256": "6f9518682a50d9c4587ffa57aa732077f2be3cbfe2d3ebae9d726c061f610f24",
+  "archive_key": "tokens",
+  "token_ids": [
+    760,
+    3841,
+    13477,
+    37550,
+    33075,
+    888,
+    279,
+    15217,
+    5388,
+    13
+  ],
+  "input_dtype": "int64",
+  "input_shape": [
+    1,
+    10
+  ],
+  "runtime": "numpy-llm",
+  "tracer": "builtin.numpy-llm@2.0.0",
+  "execution_device": "cpu",
+  "execution_provider": "numpy",
+  "limits": {
+    "wall_seconds": 1620,
+    "memory_mib": 8192,
+    "capture_mib": 256,
+    "chunk_kib": 1024
+  },
+  "activations": 132,
+  "capture_states": {
+    "complete": 132
+  },
+  "diagnostics": [],
+  "logits_shape": [
+    1,
+    10,
+    248320
+  ],
+  "logits_dtype": "float32",
+  "logits_sha256": "dd0957929bdf753c2e4951b5c0d814aa1a6bf542ffa0b08f3191da6bcc245555",
+  "logits_all_finite": true,
+  "prediction_batch": 0,
+  "prediction_position": 9,
+  "top_token_ids": [
+    271,
+    198,
+    1061,
+    561,
+    248046,
+    3437,
+    1358,
+    1049,
+    220,
+    4558
+  ],
+  "top_probabilities": [
+    0.2800353142740165,
+    0.21720520994299844,
+    0.11624749059793243,
+    0.049828630519046006,
+    0.04878267570018248,
+    0.016472783610462952,
+    0.015893519826196086,
+    0.012189738665803558,
+    0.011251174360884308,
+    0.00994346369346301
+  ],
+  "chapters": [
+    {
+      "start_seconds": 0,
+      "duration_seconds": 7.0,
+      "caption": "1 / Open model: Ternary-Bonsai-2-27B-PQ2_0.gguf\nLocal folder: ../npu/models/bonsai2-27b/"
+    },
+    {
+      "start_seconds": 7.0,
+      "duration_seconds": 6.0,
+      "caption": "2 / Generate test input\nUse Text tokens and GGUF embedded vocabulary (open model)."
+    },
+    {
+      "start_seconds": 13.0,
+      "duration_seconds": 10.0,
+      "caption": "Choose the Pangram sample.\nThe quick brown fox jumps over the lazy dog."
+    },
+    {
+      "start_seconds": 23.0,
+      "duration_seconds": 5.5,
+      "caption": "3 / Save and assign tokens\nLeave sequence length blank. Use NT layout, int64, and npz."
+    },
+    {
+      "start_seconds": 28.5,
+      "duration_seconds": 7.0,
+      "caption": "Choose Generate, save & assign. Save bonsai27b-pangram.npz.\nThe generated tokens are assigned to the next trace."
+    },
+    {
+      "start_seconds": 35.5,
+      "duration_seconds": 10.0,
+      "caption": "4 / Review Trace settings\nCPU NumPy decoder. Capture all 132 values within the chosen limits."
+    },
+    {
+      "start_seconds": 45.5,
+      "duration_seconds": 9.0,
+      "caption": "Choose Approve & run trace.\nThe worker runs a forward pass using the assigned prompt."
+    },
+    {
+      "start_seconds": 54.5,
+      "duration_seconds": 8.5,
+      "caption": "CPU inference in progress | 16x speed\nThis is a real run of the local 27B checkpoint."
+    },
+    {
+      "start_seconds": 63.0,
+      "duration_seconds": 5.0,
+      "caption": "Trace complete: 132 readable activations.\nThe Traced model view preserves the block connections."
+    },
+    {
+      "start_seconds": 68.0,
+      "duration_seconds": 12.0,
+      "caption": "5 / Search for logits. Click the output port below Language model head.\nThe green port opens the captured tensor."
+    },
+    {
+      "start_seconds": 80.0,
+      "duration_seconds": 8.0,
+      "caption": "The logits are float32 with shape (1, 10, 248320).\nEach prompt position has one score per vocabulary entry."
+    },
+    {
+      "start_seconds": 88.0,
+      "duration_seconds": 11.0,
+      "caption": "6 / Inspect next-token predictions\nAt the last prompt position, token 271 has 28.00% probability."
+    },
+    {
+      "start_seconds": 99.0,
+      "duration_seconds": 8.0,
+      "caption": "Statistics shows the numerical distribution.\nThis capture contains no NaN or infinite values."
+    },
+    {
+      "start_seconds": 107.0,
+      "duration_seconds": 7.0,
+      "caption": "Visualization displays the captured activation layer.\nThe spatial preview is sampled for display."
+    },
+    {
+      "start_seconds": 114.0,
+      "duration_seconds": 9.0,
+      "caption": "Scroll down to the value distribution.\nAll captured finite values contribute to this histogram."
+    }
+  ]
+}

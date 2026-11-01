@@ -18,6 +18,39 @@ desktop activation tracing in one application.
 
 ## NNEditor in action
 
+### Bonsai 27B: native Windows quick start
+
+This video records the Windows desktop app using the checkpoint at
+`../npu/models/bonsai2-27b/Ternary-Bonsai-2-27B-PQ2_0.gguf`.
+Install the current checkout with `python -m pip install -e .`, then launch
+`python -m nneditor`.
+
+[![Watch the native Bonsai walkthrough](assets/screenshots/bonsai-native-walkthrough.jpg)](assets/videos/bonsai-native-walkthrough.mp4)
+
+**[Watch or download the native walkthrough (MP4, 2:03)](assets/videos/bonsai-native-walkthrough.mp4)**
+| [Captions](assets/videos/bonsai-native-walkthrough.srt)
+| [Recorded results](examples/bonsai/native-walkthrough.json)
+
+1. Choose **Open model** and select the Bonsai 27B GGUF above.
+2. Open **Generate test input**, select **Text tokens** and the **Pangram**
+   sample, and keep **GGUF embedded vocabulary (open model)** as the tokenizer.
+3. Leave the sequence length blank, use **NT** layout and **int64**, and choose
+   **npz**. Click **Generate, save & assign** to save the named `tokens` array.
+4. Return to **Model graph** and open **Trace**. Review the CPU tracer, capture
+   scope, time limit, and RAM limit, then choose **Approve & run trace**.
+5. In **Traced model**, search for `logits` and click the output port below
+   **Language model head**. Use **Inspect next-token predictions**,
+   **Statistics**, and **Visualization** to examine the captured output.
+
+The [saved input](examples/bonsai/bonsai27b-pangram.npz) contains the prompt
+`The quick brown fox jumps over the lazy dog.` as an `int64` array of shape
+`(1, 10)`. Generate fresh token IDs when using a different checkpoint.
+
+This CPU NumPy run captured all **132 activations in full**. Its float32 logits
+have shape `(1, 10, 248320)`. The video omits idle time and native file dialogs,
+and shows the inference wait at **16x speed**, with instructions below the app.
+The predictions describe a single forward pass at the last prompt position.
+
 ### Ternary Bonsai 2 27B: from GGUF to captured logits
 
 The embedded-tokenizer and NPZ workflow shown here is available in the current

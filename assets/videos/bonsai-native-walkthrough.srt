@@ -1,0 +1,74 @@
+1
+00:00:00,000 --> 00:00:07,000
+1 / Open model: Ternary-Bonsai-2-27B-PQ2_0.gguf
+Local folder: ../npu/models/bonsai2-27b/
+
+2
+00:00:07,000 --> 00:00:13,000
+2 / Generate test input
+Use Text tokens and GGUF embedded vocabulary (open model).
+
+3
+00:00:13,000 --> 00:00:23,000
+Choose the Pangram sample.
+The quick brown fox jumps over the lazy dog.
+
+4
+00:00:23,000 --> 00:00:28,500
+3 / Save and assign tokens
+Leave sequence length blank. Use NT layout, int64, and npz.
+
+5
+00:00:28,500 --> 00:00:35,500
+Choose Generate, save & assign. Save bonsai27b-pangram.npz.
+The generated tokens are assigned to the next trace.
+
+6
+00:00:35,500 --> 00:00:45,500
+4 / Review Trace settings
+CPU NumPy decoder. Capture all 132 values within the chosen limits.
+
+7
+00:00:45,500 --> 00:00:54,500
+Choose Approve & run trace.
+The worker runs a forward pass using the assigned prompt.
+
+8
+00:00:54,500 --> 00:01:03,000
+CPU inference in progress | 16x speed
+This is a real run of the local 27B checkpoint.
+
+9
+00:01:03,000 --> 00:01:08,000
+Trace complete: 132 readable activations.
+The Traced model view preserves the block connections.
+
+10
+00:01:08,000 --> 00:01:20,000
+5 / Search for logits. Click the output port below Language model head.
+The green port opens the captured tensor.
+
+11
+00:01:20,000 --> 00:01:28,000
+The logits are float32 with shape (1, 10, 248320).
+Each prompt position has one score per vocabulary entry.
+
+12
+00:01:28,000 --> 00:01:39,000
+6 / Inspect next-token predictions
+At the last prompt position, token 271 has 28.00% probability.
+
+13
+00:01:39,000 --> 00:01:47,000
+Statistics shows the numerical distribution.
+This capture contains no NaN or infinite values.
+
+14
+00:01:47,000 --> 00:01:54,000
+Visualization displays the captured activation layer.
+The spatial preview is sampled for display.
+
+15
+00:01:54,000 --> 00:02:03,000
+Scroll down to the value distribution.
+All captured finite values contribute to this histogram.
