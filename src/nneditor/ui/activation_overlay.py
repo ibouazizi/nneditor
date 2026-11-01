@@ -11,6 +11,8 @@ import flet as ft
 from nneditor.analysis.statistics import TensorStatistics
 from nneditor.application.jobs import Job
 from nneditor.application.session import ModelSession
+from nneditor.detokenization import DecodedActivation, text_activation_kind
+from nneditor.tensor_scripting import TensorScriptResult
 from nneditor.tracing.contracts import ActivationRecord, CaptureState
 from nneditor.tracing.visualization import ActivationVisualization
 from nneditor.ui import overview, viewmodel
@@ -19,6 +21,14 @@ from nneditor.ui.tensor_page import PAGE_COLUMNS, PAGE_ROWS, read_tensor_page
 
 Key = tuple[str, str]
 Views = tuple[ActivationVisualization, ...]
+DEFAULT_SCRIPT = """print("shape:", tensor.shape, "dtype:", tensor.dtype)
+values = np.asarray(tensor).ravel()[:100_000]
+values = values[np.isfinite(values)]
+print("sample mean:", values.mean() if values.size else "no finite values")
+plt.hist(values, bins=64)
+plt.title("Captured tensor values (first 100,000)")
+plt.tight_layout()
+"""
 
 
 class ActivationOverlay:
@@ -51,6 +61,7 @@ class ActivationOverlay:
         self._epoch = 0
         self._jobs: dict[str, Job[Any]] = {}
         self._errors: dict[str, str] = {}
+        self._script_draft = DEFAULT_SCRIPT
 
     def open(self, trace_id: str, value_id: str, *, title: str | None = None) -> None:
         session = self._session()
@@ -82,11 +93,133 @@ class ActivationOverlay:
             label="First column", value="0", dense=True, width=120
         )
         self.leading.visible = record is not None and len(record.shape) > 2
+        kind = text_activation_kind(session.document, record) if record else None
+        self.decode_batch = ft.TextField(
+            label="Batch", value="0", width=100, dense=True
+        )
+        self.decode_position = ft.TextField(
+            label="Token position",
+            value="",
+            width=150,
+            dense=True,
+            hint_text="Latest captured" if kind == "logits" else "Start at 0",
+        )
+        self.decode_skip = ft.Checkbox(
+            label="Hide special tokens in text", value=True, width=220
+        )
+        self.decode_button = ft.FilledTonalButton(
+            content="Inspect next-token predictions"
+            if kind == "logits"
+            else "Decode captured tokens",
+            icon=ft.Icons.TEXT_FIELDS_ROUNDED,
+            on_click=self._decode_text,
+        )
+        self.decode_result = ft.Column(spacing=8)
+        self.decode_panel = ft.Container(
+            data="activation-detokenizer",
+            visible=kind is not None,
+            bgcolor=self.palette.accent_soft,
+            padding=12,
+            border_radius=10,
+            content=ft.Column(
+                spacing=8,
+                controls=[
+                    ft.Text("Decoded text", weight=ft.FontWeight.W_600),
+                    ft.Row(
+                        wrap=True,
+                        controls=[
+                            self.decode_batch,
+                            self.decode_position,
+                            self.decode_skip,
+                            self.decode_button,
+                        ],
+                    ),
+                    self.decode_result,
+                ],
+            ),
+        )
         self.view_area = ft.ListView(spacing=12, expand=True)
         self.statistics_area = ft.ListView(spacing=12, expand=True)
         self.visualization_area = ft.ListView(spacing=14, expand=True)
+        self.script_editor = ft.TextField(
+            label="Python script",
+            value=self._script_draft,
+            multiline=True,
+            min_lines=10,
+            max_lines=18,
+            text_style=ft.TextStyle(font_family="monospace", size=12),
+            on_change=self._on_script_change,
+        )
+        self.script_timeout = ft.TextField(
+            label="Timeout (s)", value="120", width=120, dense=True
+        )
+        self.script_memory = ft.TextField(
+            label="RAM (MiB)", value="4096", width=130, dense=True
+        )
+        self.script_run = ft.FilledButton(
+            content="Run script",
+            icon=ft.Icons.PLAY_ARROW_ROUNDED,
+            on_click=self.run_script,
+        )
+        self.script_cancel = ft.TextButton(
+            content="Stop",
+            icon=ft.Icons.STOP_ROUNDED,
+            disabled=True,
+            on_click=self._cancel_script,
+        )
+        self.script_clear = ft.TextButton(
+            content="Clear", on_click=lambda _: self._set_script("")
+        )
+        self.script_example = ft.TextButton(
+            content="Example", on_click=lambda _: self._set_script(DEFAULT_SCRIPT)
+        )
+        self.script_output = ft.Column(spacing=10)
+        self.script_area = ft.ListView(
+            spacing=12,
+            expand=True,
+            controls=[
+                ft.Text(
+                    "Preloaded: tensor, metadata, np, math, scipy, sklearn "
+                    "(also scikit), matplotlib, and plt. "
+                    "Print output, return a final expression, "
+                    "or create Matplotlib figures. Ctrl+Enter runs the script.",
+                    size=12,
+                ),
+                ft.Text(
+                    "Only the captured prefix is available. tensor is a flat array; "
+                    "metadata['shape'] contains the original shape.",
+                    visible=bool(
+                        record and record.stored_byte_length < record.full_byte_length
+                    ),
+                    color=self.palette.warning,
+                ),
+                self.script_editor,
+                ft.Row(
+                    wrap=True,
+                    controls=[
+                        self.script_timeout,
+                        self.script_memory,
+                        self.script_run,
+                        self.script_cancel,
+                        self.script_clear,
+                        self.script_example,
+                    ],
+                ),
+                self.script_output,
+            ],
+        )
+        if not record or not record.readable:
+            self.script_run.disabled = True
+            unavailable = self._unavailable()
+            if unavailable:
+                self.script_output.controls = [unavailable]
+        if getattr(self.page, "web", False):
+            self.script_run.disabled = True
+            self.script_output.controls = [
+                ft.Text("Python scripting is available in the desktop app.")
+            ]
         self.tabs = ft.Tabs(
-            length=3,
+            length=4,
             selected_index=0,
             expand=True,
             on_change=self._on_tab,
@@ -95,6 +228,7 @@ class ActivationOverlay:
                 spacing=10,
                 controls=[
                     ft.TabBar(
+                        scrollable=True,
                         tabs=[
                             ft.Tab(label="View", icon=ft.Icons.TABLE_VIEW_ROUNDED),
                             ft.Tab(
@@ -104,13 +238,15 @@ class ActivationOverlay:
                                 label="Visualization",
                                 icon=ft.Icons.INSERT_CHART_OUTLINED_ROUNDED,
                             ),
-                        ]
+                            ft.Tab(label="Python", icon=ft.Icons.CODE_ROUNDED),
+                        ],
                     ),
                     ft.TabBarView(
                         controls=[
                             self.view_area,
                             self.statistics_area,
                             self.visualization_area,
+                            self.script_area,
                         ],
                         expand=True,
                     ),
@@ -229,6 +365,7 @@ class ActivationOverlay:
         session, record = self._session(), self.record
         assert session is not None and record is not None
         controls: list[ft.Control] = [
+            self.decode_panel,
             ft.Row(
                 wrap=True,
                 controls=[
@@ -239,7 +376,7 @@ class ActivationOverlay:
                         content="Apply slice", on_click=self._apply_slice
                     ),
                 ],
-            )
+            ),
         ]
         try:
             leading = tuple(
@@ -349,6 +486,214 @@ class ActivationOverlay:
             if isinstance(value, float)
             else str(value)
         )
+
+    def _decode_text(self, _: ft.Event[ft.Button]) -> None:
+        session = self._session()
+        if session is None or self.dialog is None or "decode" in self._jobs:
+            return
+        try:
+            batch = int(self.decode_batch.value or "0")
+            position = (
+                int(self.decode_position.value) if self.decode_position.value else None
+            )
+        except ValueError:
+            self.decode_result.controls = [
+                ft.Text(
+                    "Use whole numbers for batch and token position.",
+                    color=self.palette.danger,
+                )
+            ]
+            self.page.update()
+            return
+        job = session.decode_activation_async(
+            self.trace_id,
+            self.value_id,
+            batch=batch,
+            position=position,
+            skip_special=bool(self.decode_skip.value),
+        )
+        self._jobs["decode"] = job
+        self.decode_button.disabled = True
+        self.decode_result.controls = [
+            ft.ProgressRing(width=20, height=20),
+            ft.Text("Decoding…"),
+        ]
+        epoch = self._epoch
+        self.page.update()
+
+        def wait() -> None:
+            job.wait()
+            if (
+                epoch != self._epoch
+                or self._session() is not session
+                or self.dialog is None
+            ):
+                return
+            self._jobs.pop("decode", None)
+            self.decode_button.disabled = False
+            if job.state.value != "succeeded":
+                self.decode_result.controls = [
+                    ft.Text(
+                        str(job.error or "Decoding cancelled."),
+                        color=self.palette.warning,
+                    )
+                ]
+            else:
+                self._show_decoded(job.result())
+            self.page.update()
+
+        self.page.run_thread(wait)
+
+    def _show_decoded(self, result: DecodedActivation) -> None:
+        controls: list[ft.Control] = [
+            ft.Text(
+                result.text or "No printable text for these tokens.",
+                selectable=True,
+                size=16,
+            ),
+            ft.Text(f"{result.decoder} · {result.note}", size=11, selectable=True),
+        ]
+        if result.candidates:
+            controls.append(
+                ft.DataTable(
+                    columns=[
+                        ft.DataColumn(label=ft.Text("Token ID")),
+                        ft.DataColumn(label=ft.Text("Vocabulary piece")),
+                        ft.DataColumn(label=ft.Text("Probability")),
+                    ],
+                    rows=[
+                        ft.DataRow(
+                            cells=[
+                                ft.DataCell(
+                                    ft.Text(str(candidate.token_id), selectable=True)
+                                ),
+                                ft.DataCell(
+                                    ft.Text(repr(candidate.piece), selectable=True)
+                                ),
+                                ft.DataCell(ft.Text(f"{candidate.probability:.2%}")),
+                            ]
+                        )
+                        for candidate in result.candidates
+                    ],
+                )
+            )
+        else:
+            controls.append(
+                ft.Text(
+                    "Token IDs: " + ", ".join(map(str, result.ids)),
+                    size=11,
+                    selectable=True,
+                )
+            )
+        self.decode_result.controls = controls
+
+    def _on_script_change(self, _: ft.Event[ft.TextField]) -> None:
+        self._script_draft = self.script_editor.value or ""
+
+    def _set_script(self, source: str) -> None:
+        self._script_draft = source
+        self.script_editor.value = source
+        self.page.update()
+        if run_task := getattr(self.page, "run_task", None):
+            run_task(self.script_editor.focus)
+
+    def run_script(self, _: ft.Event[ft.Button] | None = None) -> None:
+        session = self._session()
+        if (
+            session is None
+            or self.dialog is None
+            or self.script_run.disabled
+            or "script" in self._jobs
+            or getattr(self.page, "web", False)
+        ):
+            return
+        try:
+            timeout = float(self.script_timeout.value or "120")
+            memory = int(self.script_memory.value or "4096") * 1024**2
+            self._script_draft = self.script_editor.value or ""
+            job = session.run_tensor_script_async(
+                self.trace_id,
+                self.value_id,
+                self._script_draft,
+                wall_seconds=timeout,
+                memory_bytes=memory,
+            )
+        except ValueError as error:
+            self.script_output.controls = [
+                ft.Text(str(error), color=self.palette.danger)
+            ]
+            self.page.update()
+            return
+        self._jobs["script"] = job
+        self.script_run.disabled, self.script_cancel.disabled = True, False
+        self.script_clear.disabled = self.script_example.disabled = (
+            self.script_editor.disabled
+        ) = True
+        self.script_output.controls = [
+            ft.ProgressRing(width=22, height=22),
+            ft.Text("Running Python…"),
+        ]
+        epoch = self._epoch
+        self.page.update()
+
+        def wait() -> None:
+            job.wait()
+            if (
+                epoch != self._epoch
+                or self._session() is not session
+                or self.dialog is None
+            ):
+                return
+            self._jobs.pop("script", None)
+            self.script_run.disabled, self.script_cancel.disabled = False, True
+            self.script_clear.disabled = self.script_example.disabled = (
+                self.script_editor.disabled
+            ) = False
+            if job.state.value == "succeeded":
+                self._show_script_result(job.result())
+            else:
+                self.script_output.controls = [
+                    ft.Text(
+                        str(job.error or "Script stopped."), color=self.palette.warning
+                    )
+                ]
+            self.page.update()
+
+        self.page.run_thread(wait)
+
+    def _cancel_script(self, _: ft.Event[ft.TextButton]) -> None:
+        if job := self._jobs.get("script"):
+            job.cancel()
+        self.script_cancel.disabled = True
+        self.page.update()
+
+    def _show_script_result(self, result: TensorScriptResult) -> None:
+        controls: list[ft.Control] = [
+            ft.Text(f"Finished in {result.seconds:.2f} s", size=11)
+        ]
+        for label, value, color in (
+            ("Output", result.stdout, self.palette.ink),
+            ("Result", result.result, self.palette.ink),
+            ("Messages", result.stderr, self.palette.warning),
+            ("Error", result.error, self.palette.danger),
+        ):
+            if value:
+                controls.extend(
+                    [
+                        ft.Text(label, weight=ft.FontWeight.W_600),
+                        ft.Text(
+                            value,
+                            selectable=True,
+                            font_family="monospace",
+                            size=12,
+                            color=color,
+                        ),
+                    ]
+                )
+        controls.extend(
+            ft.Image(src=png, fit=ft.BoxFit.CONTAIN) for png in result.plots
+        )
+        self.script_output.controls = controls
 
     def _move(self, rows: int, columns: int) -> None:
         try:

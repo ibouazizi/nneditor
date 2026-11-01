@@ -83,8 +83,10 @@ def architecture(document: Document) -> str:
         ("x-huggingface.config", "model_type"),
     ):
         value = dict(document.extensions).get(key)
-        if isinstance(value, dict) and isinstance(value.get(field), str):
-            return str(value[field])
+        if isinstance(value, dict):
+            name = value.get(field, value.get("_class_name"))
+            if isinstance(name, str):
+                return name
     return ""
 
 
@@ -102,6 +104,9 @@ class TracePlugin:
     entry_point: str = ""
     fingerprint: str = ""
     operators: tuple[str, ...] = ()
+    python_modules: tuple[str, ...] = ()
+    install_extra: str = ""
+    streaming_weights: bool = False
 
     @property
     def builtin(self) -> bool:
@@ -120,6 +125,9 @@ class TracePlugin:
             return (
                 f"{self.name} supports architectures: {', '.join(self.architectures)}"
             )
+        graph_error = dict(document.extensions).get("x-huggingface.trace-graph-error")
+        if isinstance(graph_error, str):
+            return graph_error
         if self.element_types:
             unsupported = {t.element_type for t in document.tensors.values()} - set(
                 self.element_types
@@ -188,6 +196,21 @@ def load_manifest(path: Path) -> TracePlugin:
         raise TracePluginError(str(error)) from error
     if TraceDevice.AUTO in devices:
         raise TracePluginError("Plugin devices must name concrete devices")
+    modules = _strings(raw, "python_modules")
+    if len(modules) > 32 or any(
+        not re.fullmatch(r"[A-Za-z_]\w{0,63}", module) for module in modules
+    ):
+        raise TracePluginError(
+            "python_modules must name at most 32 top-level Python modules"
+        )
+    extra = raw.get("install_extra", "")
+    if not isinstance(extra, str) or (
+        extra and not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", extra)
+    ):
+        raise TracePluginError("install_extra must be a Python package extra name")
+    streaming = raw.get("streaming_weights", False)
+    if not isinstance(streaming, bool):
+        raise TracePluginError("streaming_weights must be a boolean")
     return TracePlugin(
         id=raw["id"],
         name=raw["name"],
@@ -201,4 +224,7 @@ def load_manifest(path: Path) -> TracePlugin:
         entry_point=raw["entry_point"],
         fingerprint=_fingerprint(root),
         operators=_strings(raw, "operators"),
+        python_modules=modules,
+        install_extra=extra,
+        streaming_weights=streaming,
     )

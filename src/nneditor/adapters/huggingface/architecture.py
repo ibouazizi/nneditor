@@ -55,6 +55,7 @@ _OUTPUT_MARKERS: Final = (
     "output.weight",
 )
 _NORM_MARKERS: Final = (
+    "backbone.norm_f",
     "model.norm",
     "model.language_model.norm",
     "ln_f",
@@ -153,7 +154,7 @@ def _json_bool(config: Mapping[str, JsonValue], key: str) -> bool | None:
 
 
 def _architecture_name(config: Mapping[str, JsonValue]) -> str:
-    model_type = _json_str(config, "model_type")
+    model_type = _json_str(config, "model_type", "_class_name")
     if model_type:
         return model_type
     architectures = config.get("architectures")
@@ -311,6 +312,7 @@ def _global_layers(names: tuple[str, ...], *, tied: bool) -> list[LayerSpec]:
                     "word_embeddings.weight",
                     "tok_embeddings.weight",
                     "embed_in.weight",
+                    "embeddings.weight",
                 )
             )
         ][:1]
@@ -375,6 +377,18 @@ def plan_architecture(
     """Group Hugging Face tensors into a stable, source-named LLM chain."""
     dims = tensor_dims or {}
     grouped = _partition_blocks(tensor_names)
+    if _architecture_name(config) in {"mamba", "mamba2"}:
+        # A Mamba block includes its normalization, selective mixer, and
+        # residual. Capture the whole block as one SSM operation.
+        grouped = {
+            index: {
+                "attn": [],
+                "ffn": [],
+                "extra": [],
+                "ssm": sorted(name for group in kinds.values() for name in group),
+            }
+            for index, kinds in grouped.items()
+        }
     declared_blocks = _json_int(
         config, "num_hidden_layers", "n_layer", "num_layers", "n_layers"
     )

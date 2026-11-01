@@ -1513,10 +1513,7 @@ class Shell:
             self.input_generator.refresh_targets((), can_assign=False)
             return
         graph = session.document.main_graph
-        llm_kind = session.document.artifact_kind in {
-            ArtifactKind.GGUF_MODEL,
-            ArtifactKind.HUGGINGFACE_MODEL,
-        }
+        llm_kind = bool(graph.nodes and graph.nodes[0].domain == "nneditor.llm")
         settings = prompt_settings_for_document(session.document) if llm_kind else None
         targets = tuple(
             input_workspace.InputTarget(
@@ -2347,10 +2344,12 @@ class Shell:
             # session takes over; otherwise every reopen leaks all three.
             self.service.close_session(previous.id)
         self.session = session
+        preferred_tracer = session.trace_registry.preferred(session.document)
         suggested_limits = recommended_trace_limits(
             session.document.source.byte_size,
-            streaming_weights=session.document.artifact_kind
-            in {ArtifactKind.GGUF_MODEL, ArtifactKind.HUGGINGFACE_MODEL},
+            streaming_weights=bool(
+                preferred_tracer and preferred_tracer.streaming_weights
+            ),
         )
         self.trace.wall_seconds.value = f"{suggested_limits.wall_seconds:g}"
         self.trace.memory_mib.value = str(
@@ -3834,7 +3833,13 @@ class Shell:
     def on_keyboard(self, event: ft.KeyboardEvent) -> None:
         """Global shortcuts plus arrow-key navigation over the visible scene."""
         if self.activations.value_overlay.dialog is not None:
-            if event.key == "Escape":
+            if (
+                event.ctrl
+                and event.key == "Enter"
+                and self.activations.value_overlay.tabs.selected_index == 3
+            ):
+                self.activations.value_overlay.run_script()
+            elif event.key == "Escape":
                 self.activations.close_overlay()
                 self._text_input_active = False
                 self.page.update()
@@ -4126,7 +4131,13 @@ def cli(argv: Sequence[str] | None = None) -> None:
         "--create-tracer",
         type=Path,
         metavar="FOLDER",
-        help="create a working editable LLM tracer extension",
+        help="create an editable tracer extension",
+    )
+    parser.add_argument(
+        "--tracer-template",
+        choices=("llm", "ssm", "diffusion"),
+        default="llm",
+        help="template to use with --create-tracer",
     )
     actions.add_argument(
         "--install-tracer",
@@ -4175,7 +4186,9 @@ def cli(argv: Sequence[str] | None = None) -> None:
             )
 
             if arguments.create_tracer:
-                created = create_trace_plugin(arguments.create_tracer)
+                created = create_trace_plugin(
+                    arguments.create_tracer, template=arguments.tracer_template
+                )
                 print(
                     f"Created {created.name} at {arguments.create_tracer}. "
                     "Edit its manifest and tracer.py, then use --install-tracer."

@@ -1,0 +1,14 @@
+{
+  "api_version": 1,
+  "id": "nneditor.stable-diffusion",
+  "name": "Stable Diffusion UNet",
+  "version": "1.0.0",
+  "entry_point": "tracer.py:trace",
+  "artifact_kinds": ["huggingface_model"],
+  "architectures": ["UNet2DConditionModel", "UNet2DModel"],
+  "element_types": ["float32", "float16", "bfloat16"],
+  "devices": ["cpu"],
+  "python_modules": ["torch", "diffusers", "safetensors", "accelerate"],
+  "install_extra": "tracer-diffusion",
+  "description": "Trace a local Diffusers UNet folder, including SD 1.x/2.x and SDXL conditioning. Install nneditor[tracer-diffusion]. One denoising forward pass, with skip tensors captured."
+}

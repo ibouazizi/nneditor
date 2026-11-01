@@ -1,0 +1,14 @@
+{
+  "api_version": 1,
+  "id": "nneditor.mamba",
+  "name": "Mamba / Mamba2 SSM",
+  "version": "1.0.0",
+  "entry_point": "tracer.py:trace",
+  "artifact_kinds": ["huggingface_model"],
+  "architectures": ["mamba", "mamba2"],
+  "element_types": ["float32", "float16", "bfloat16"],
+  "devices": ["cpu"],
+  "python_modules": ["torch", "transformers", "safetensors"],
+  "install_extra": "tracer-ssm",
+  "description": "Trace local safetensors Mamba and Mamba2 checkpoints. Install nneditor[tracer-ssm]. Captures embeddings, SSM blocks, normalization, and logits."
+}

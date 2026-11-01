@@ -149,7 +149,7 @@ def test_unsupported_architecture_disables_trace_before_weight_reads(
 ) -> None:
     root = write_traceable_llama_snapshot(tmp_path / "hf")
     config = json.loads((root / "config.json").read_text())
-    config["model_type"] = "mamba"
+    config["model_type"] = "unsupported-test-architecture"
     (root / "config.json").write_text(json.dumps(config))
 
     def unexpected_read(*_args: Any, **_kwargs: Any) -> bytes:
@@ -160,7 +160,7 @@ def test_unsupported_architecture_disables_trace_before_weight_reads(
         session = service.open_model(root)
         status = session.capability(Capability.TRACING)
         assert status.availability is Availability.UNAVAILABLE
-        assert "mamba" in status.reason
+        assert "unsupported-test-architecture" in status.reason
         assert "inspect" in status.reason
 
 

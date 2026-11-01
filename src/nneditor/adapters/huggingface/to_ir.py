@@ -7,6 +7,7 @@ to show. Identity is the indexer's ``hf-index:`` digest.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from nneditor import __version__
@@ -15,6 +16,7 @@ from nneditor.adapters.huggingface.architecture import (
     LayerSpec,
     plan_architecture,
 )
+from nneditor.adapters.huggingface.diffusion import DIFFUSION_CLASSES, diffusion_graph
 from nneditor.adapters.huggingface.snapshot import (
     HfIndex,
     HfTensorIndex,
@@ -281,7 +283,25 @@ def index_to_document(index: HfIndex) -> Document:
     plan = plan_architecture(index.config, names, dims)
     tensors = [_tensor_from_index(tensor) for tensor in index.tensors]
     statuses, notes = _narrow_capabilities(tensors)
-    graph = _build_graph(index, plan)
+    model_class = index.config.get("_class_name")
+    diffusion = isinstance(model_class, str) and model_class in DIFFUSION_CLASSES
+    graph_error: str | None = None
+    if diffusion:
+        try:
+            graph = diffusion_graph(index)
+        except HuggingFaceError as error:
+            graph_error = str(error)
+            graph = _build_graph(index, plan)
+        plan = replace(
+            plan,
+            name=str(model_class),
+            block_count=sum(
+                node.op_type in {"UNetDown", "UNetMid", "UNetUp"}
+                for node in graph.nodes
+            ),
+        )
+    else:
+        graph = _build_graph(index, plan)
     tool_version = f"nneditor {__version__}"
     document = Document(
         source=ArtifactRef(
@@ -302,7 +322,9 @@ def index_to_document(index: HfIndex) -> Document:
                 source_artifact=index.content_hash,
             ),
             ProvenanceEntry(
-                operation="synthesize-llm-architecture",
+                operation="synthesize-diffusion-architecture"
+                if diffusion
+                else "synthesize-llm-architecture",
                 tool_version=tool_version,
                 target=ROOT_GRAPH_ID,
                 parameters=(
@@ -320,6 +342,11 @@ def index_to_document(index: HfIndex) -> Document:
             ("x-huggingface.members", _member_records(index)),
             ("x-huggingface.shards", _shard_records(index)),
             ("x-huggingface.tokenizer", dict(index.tokenizer)),
+            *(
+                ([("x-huggingface.trace-graph-error", graph_error)])
+                if graph_error
+                else []
+            ),
         ],
     )
     return with_trace_support(document)

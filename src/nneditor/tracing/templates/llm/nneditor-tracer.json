@@ -7,5 +7,6 @@
   "artifact_kinds": ["gguf_model", "huggingface_model"],
   "architectures": ["llama", "qwen2", "qwen3", "qwen35", "gpt2"],
   "devices": ["cpu"],
+  "streaming_weights": true,
   "description": "Editable starter that delegates to NNEditor's NumPy LLM decoder."
 }

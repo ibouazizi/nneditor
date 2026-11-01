@@ -59,6 +59,12 @@ from nneditor.application.persistence import SessionStateStore
 from nneditor.application.slices import GraphSlice, GraphSlicer
 from nneditor.application.statistics_store import StatisticsSidecarStore
 from nneditor.cancellation import CancellationToken, OperationCancelled
+from nneditor.detokenization import (
+    DecodedActivation,
+    Decoder,
+    decode_activation,
+    decoder_for_document,
+)
 from nneditor.editing.revisions import Revision
 from nneditor.editing.validation import EditRequest, EditTransaction
 from nneditor.ir.capabilities import (
@@ -72,6 +78,7 @@ from nneditor.ir.core import Document, Storage, TensorRef
 from nneditor.rendering.scene import Bounds, Scene, Viewport
 from nneditor.storage.cache import BudgetedCache
 from nneditor.storage.store import TensorStore, TensorUnavailableError
+from nneditor.tensor_scripting import TensorScriptResult, run_tensor_script
 from nneditor.tracing.comparison import (
     TraceComparison,
     compare_traces,
@@ -215,6 +222,7 @@ class ModelSession:
     __slots__ = (
         "_activation_store",
         "_closed",
+        "_detokenizer",
         "_edited_stats",
         "_hierarchy_store",
         "_input_store",
@@ -253,6 +261,7 @@ class ModelSession:
         self.id = session_id
         self._source_document = document
         self.store = TensorStore(document)
+        self._detokenizer: Decoder | None = None
         self._llm_preflight: tuple[Document, str | None] | None = None
         self._trace_registry = trace_registry or default_trace_registry()
         try:
@@ -814,6 +823,66 @@ class ModelSession:
             f"activation statistics {value_id}",
             lambda token: view.statistics(value_id, token=token),
         )
+
+    def run_tensor_script_async(
+        self,
+        trace_id: str,
+        value_id: str,
+        source: str,
+        *,
+        wall_seconds: float = 120,
+        memory_bytes: int = 4 * 1024**3,
+    ) -> Job[TensorScriptResult]:
+        self._ensure_open()
+        if self._jobs is None:
+            raise SessionError("this session has no job manager")
+        view = self.activations(trace_id)
+        record = view.metadata(value_id)
+        return self._jobs.submit(
+            f"tensor script {value_id}",
+            lambda token: run_tensor_script(
+                record,
+                view.read,
+                source,
+                token=token,
+                wall_seconds=wall_seconds,
+                memory_bytes=memory_bytes,
+            ),
+        )
+
+    def decode_activation_async(
+        self,
+        trace_id: str,
+        value_id: str,
+        *,
+        batch: int = 0,
+        position: int | None = None,
+        skip_special: bool = True,
+    ) -> Job[DecodedActivation]:
+        self._ensure_open()
+        if self._jobs is None:
+            raise SessionError("this session has no job manager")
+        view = self.activations(trace_id)
+        record = view.metadata(value_id)
+        document = self._source_document
+
+        def work(token: CancellationToken) -> DecodedActivation:
+            token.raise_if_cancelled()
+            if self._detokenizer is None:
+                self._detokenizer = decoder_for_document(document)
+            result = decode_activation(
+                document,
+                record,
+                view.read,
+                self._detokenizer,
+                batch=batch,
+                position=position,
+                skip_special=skip_special,
+            )
+            token.raise_if_cancelled()
+            return result
+
+        return self._jobs.submit(f"decode activation {value_id}", work)
 
     def activation_visualizations_async(
         self,

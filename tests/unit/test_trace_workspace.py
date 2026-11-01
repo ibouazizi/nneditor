@@ -52,7 +52,7 @@ def test_completed_trace_opens_own_pane_and_port_overlay(tmp_path: Path) -> None
         cast(Any, button.on_click)(_event())
         overlay = shell.activations.value_overlay
         assert overlay.dialog is page.dialogs[-1]
-        assert overlay.tabs.length == 3
+        assert overlay.tabs.length == 4
         assert shell.renderer.selection == selection
         assert shell.activations.close_overlay()
         assert not overlay.dialog

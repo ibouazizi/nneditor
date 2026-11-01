@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import os
 import shutil
 import tempfile
@@ -54,6 +56,7 @@ def _builtins() -> tuple[TracePlugin, ...]:
             __version__,
             (ArtifactKind.GGUF_MODEL, ArtifactKind.HUGGINGFACE_MODEL),
             description="Llama, GPT-2, Qwen and Bonsai decoders",
+            streaming_weights=True,
         ),
     )
 
@@ -84,6 +87,17 @@ class TraceRegistry:
     def reason(self, plugin: TracePlugin, document: Document) -> str | None:
         if reason := plugin.incompatibility(document):
             return reason
+        missing = [
+            module
+            for module in plugin.python_modules
+            if importlib.util.find_spec(module) is None
+        ]
+        if missing:
+            return (
+                f"Install nneditor[{plugin.install_extra}] to use {plugin.name}."
+                if plugin.install_extra
+                else "Install missing tracer dependencies: " + ", ".join(missing)
+            )
         if plugin.id == "builtin.numpy-llm":
             from nneditor.tracing.llm_support import trace_unavailable_reason
 
@@ -148,6 +162,12 @@ def default_trace_registry(roots: Iterable[Path] | None = None) -> TraceRegistry
     plugins: list[TracePlugin] = []
     errors: list[str] = []
     manifests: set[Path] = set()
+    for family in ("ssm", "diffusion"):
+        bundled = (
+            resources.files("nneditor.tracing") / "templates" / family / MANIFEST_NAME
+        )
+        if bundled.is_file():
+            manifests.add(Path(str(bundled)))
     for supplied in roots:
         try:
             root = Path(supplied).expanduser().resolve()
@@ -209,13 +229,20 @@ def install_trace_plugin(source: Path, *, directory: Path | None = None) -> Trac
     return load_manifest(destination / MANIFEST_NAME)
 
 
-def create_trace_plugin(destination: Path) -> TracePlugin:
+def create_trace_plugin(destination: Path, *, template: str = "llm") -> TracePlugin:
     """Create an editable working example without replacing an existing folder."""
-    template = resources.files("nneditor.tracing") / "templates" / "llm"
+    if template not in {"llm", "ssm", "diffusion"}:
+        raise TracePluginError("Choose an llm, ssm, or diffusion tracer template.")
+    source = resources.files("nneditor.tracing") / "templates" / template
     destination.mkdir(parents=True, exist_ok=False)
     try:
         for name in (MANIFEST_NAME, "tracer.py"):
-            (destination / name).write_bytes((template / name).read_bytes())
+            (destination / name).write_bytes((source / name).read_bytes())
+        if template != "llm":
+            manifest = destination / MANIFEST_NAME
+            raw = json.loads(manifest.read_text(encoding="utf-8"))
+            raw["id"] = raw["id"].replace("nneditor.", "example.", 1)
+            manifest.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
         return load_manifest(destination / MANIFEST_NAME)
     except BaseException:
         shutil.rmtree(destination)

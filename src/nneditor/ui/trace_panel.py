@@ -514,7 +514,12 @@ class TracePanel:
 
     def _is_llm(self) -> bool:
         session = self._session()
-        return session is not None and session.document.artifact_kind in LLM_KINDS
+        return (
+            session is not None
+            and session.document.artifact_kind in LLM_KINDS
+            and bool(session.document.main_graph.nodes)
+            and session.document.main_graph.nodes[0].domain == "nneditor.llm"
+        )
 
     def _configure_runtime(self) -> None:
         self._populate_tracers()
@@ -562,6 +567,7 @@ class TracePanel:
             self.runtime_text.value = "Open an artifact to see tracing availability."
         plugin = self._selected_tracer()
         if plugin is not None and not plugin.builtin:
+            self.runtime_refresh.visible = False
             self.backend.options = [
                 ft.DropdownOption(
                     key=TraceBackend.AUTO.value, text="Runtime provided by tracer"
@@ -579,6 +585,7 @@ class TracePanel:
                 plugin.description
                 or f"{plugin.name} {plugin.version} · isolated extension worker"
             )
+            self.runtime_text.color = self.palette.muted
 
     def _selected_tracer(self) -> TracePlugin | None:
         session = self._session()
@@ -613,6 +620,15 @@ class TracePanel:
             preferred = next(
                 (p for p in candidates if session.tracer_reason(p) is None), None
             )
+            if preferred is None:
+                preferred = next(
+                    (
+                        p
+                        for p in candidates
+                        if not p.builtin and p.incompatibility(session.document) is None
+                    ),
+                    None,
+                )
             self.tracer.value = (
                 preferred.identity
                 if preferred
@@ -700,7 +716,8 @@ class TracePanel:
     def _render_runtime_status(self, status: RuntimeStatus) -> None:
         """Show the probed providers, or the error naming nneditor[runtime]."""
         self._cached_runtime_status = status
-        if self._is_llm():
+        plugin = self._selected_tracer()
+        if self._is_llm() or (plugin is not None and not plugin.builtin):
             return
         if status.error is not None:
             self.runtime_text.value = f"ONNX Runtime unavailable: {status.error}."

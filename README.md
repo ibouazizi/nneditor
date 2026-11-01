@@ -103,7 +103,7 @@ IDs from the model's tokenizer for a faithful text prompt.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==1.9.0
+python -m pip install nneditor==1.10.0
 ```
 
 Start the desktop application with either command:
@@ -203,6 +203,24 @@ snapshots.
    **Visualization** load on demand and reuse cached results. Visualizations
    include histograms, line views, heatmaps, feature maps, and attention views
    where applicable. Export captured values as `.npy` and raster views as PNG.
+   **Python** provides a script editor with the captured `tensor`, `metadata`,
+   NumPy (`np`), `math`, SciPy (`scipy`), scikit-learn (`sklearn`, also `scikit`),
+   and Matplotlib (`matplotlib`, `plt`) preloaded. Printed output, the last
+   expression or a variable named `result`, and figures appear below the script.
+   **Run script** or Ctrl+Enter starts a fresh process; **Stop** cancels it.
+   Timeout and RAM controls bound a run. Scripts may import other installed
+   libraries and save files using absolute paths. In-place processing leaves the
+   captured tensor intact. A partial capture is exposed as a flat prefix, with
+   the original shape in `metadata['shape']`.
+
+The **View** tab also offers **Decode captured tokens** on token inputs and
+**Inspect next-token predictions** on language-model logits. It uses the model's
+GGUF vocabulary or Hugging Face `tokenizer.json`, supports batch and position
+selection, and can retain special tokens. Logits show the greedy candidate and
+top token probabilities for a complete captured vocabulary row. This is a
+forward-pass prediction, rather than an autoregressively generated response.
+Missing tokenizer data and incomplete logit rows are reported explicitly.
+Hashed-word smoke-test inputs cannot recover their original prompt text.
 
 Use the trace picker to revisit a captured run. Drag the graph to pan, scroll
 to zoom, or search for a block or tensor and press Enter to jump to a match.
@@ -271,6 +289,42 @@ service is available.
 
 ## Tracing extensions
 
+NNEditor includes two additional tracing plugins, loaded only in the approved
+worker. Install their optional runtimes in the same Python environment:
+
+```bash
+python -m pip install "nneditor[tracer-ssm]"
+python -m pip install "nneditor[tracer-diffusion]"
+```
+
+**Mamba / Mamba2 SSM** supports local Hugging Face Mamba and Mamba2 safetensors
+checkpoints. Open the checkpoint folder, prepare token IDs, and select the
+plugin in **Trace**. It captures embeddings, complete SSM blocks, final
+normalization, and logits, with fresh recurrent state for each run.
+
+**Stable Diffusion UNet** supports Diffusers `UNet2DConditionModel` and
+`UNet2DModel` component folders, including Stable Diffusion 1.x, 2.x, and SDXL
+base/refiner conditioning. Open the pipeline's **unet** folder containing
+`config.json` and safetensors weights. The graph exposes noisy latents,
+timesteps, conditioning embeddings, down/up blocks, the bottleneck, and actual
+skip tensors. SDXL adds pooled-text embeddings and time IDs. Supply `.npy`
+inputs or use deterministic random tensors for a smoke test. A trace runs one
+denoising forward pass and captures the latent/noise prediction; text encoders,
+scheduler iterations, and VAE image decoding belong to the surrounding pipeline.
+
+Both plugins use CPU PyTorch execution and refuse missing or incompatible
+weights. Their numerical tests compare captured model outputs with native model
+forwards. Unsupported UNet configurations remain available for weight inspection.
+The trace panel names any missing runtime extra before running.
+
+Create an editable copy of either plugin as a starting point:
+
+```bash
+nneditor --create-tracer ./my-mamba-tracer --tracer-template ssm
+nneditor --create-tracer ./my-diffusion-tracer --tracer-template diffusion
+nneditor --install-tracer ./my-mamba-tracer
+```
+
 Tracing implementations can be added without editing NNEditor's core. An
 extension is a folder containing `nneditor-tracer.json`, a Python entry point,
 and optional helper modules. The Trace panel offers built-in and installed
@@ -309,7 +363,12 @@ A manifest identifies its API, implementation, and supported artifacts:
 ```
 
 `architectures`, `element_types`, and `operators` are optional allowlists.
-Architectures match GGUF's architecture name or Hugging Face's `model_type`.
+Architectures match GGUF's architecture name, Hugging Face's `model_type`, or
+Diffusers' `_class_name`. Optional `python_modules` lists top-level module names
+to check before execution; bundled plugins use `install_extra` for their runtime
+installation hint. Set `streaming_weights: true` only when a tracer loads
+bounded portions of the weights at a time. Other plugins receive larger
+whole-model RAM defaults.
 `devices` defaults to CPU; a runtime may declare GPU or NPU support. Installed
 tracers can also target other imported artifact kinds with declared graph
 inputs, including ONNX. Custom tracers currently execute source artifacts;
@@ -338,6 +397,11 @@ requested values are visibly marked as dropped. A plugin may return
 `TraceOutcome` with notes and diagnostics, or return `None`. It owns the model's
 execution semantics and should validate configurations before reading weights.
 Install runtime dependencies in the same Python environment as NNEditor.
+
+Example open-weight checkpoints include
+[Mamba 130M](https://huggingface.co/state-spaces/mamba-130m-hf),
+[Mamba2 130M](https://huggingface.co/AntonV/mamba2-130m-hf), and the UNet component
+of [Stable Diffusion XL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0).
 
 For development, set `NNEDITOR_TRACE_PLUGIN_PATH` to the plugin folder or a
 directory containing plugin folders. Multiple directories use the platform's

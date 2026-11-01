@@ -47,6 +47,10 @@ dependencies = [
     # used only after import for Phase 4 schema validation, checking, shape
     # inference, and export.
     "onnx>=1.22,<2",
+    "tokenizers>=0.21,<1",
+    "scipy>=1.13,<2",
+    "scikit-learn>=1.5,<2",
+    "matplotlib>=3.9,<4",
 ]
 
 # ONNX Runtime ships one distribution per accelerator family, and every one of
@@ -60,6 +64,8 @@ runtime-gpu = ["onnxruntime-gpu>=1.22,<2"]
 runtime-directml = ["onnxruntime-directml>=1.22,<2"]
 runtime-qnn = ["onnxruntime-qnn>=1.22,<2"]
 runtime-openvino = ["onnxruntime-openvino>=1.22,<2"]
+tracer-ssm = ["torch>=2.6,<3", "transformers>=5,<6", "safetensors>=0.4,<1"]
+tracer-diffusion = ["torch>=2.6,<3", "diffusers>=0.35,<1", "safetensors>=0.4,<1", "accelerate>=1,<2"]
 
 [project.scripts]
 nneditor = "nneditor.ui.app:cli"
@@ -76,6 +82,10 @@ path = "src/nneditor/__init__.py"
 
 [dependency-groups]
 dev = [
+    # Exercise the packaged optional tracing plugins in every CI environment.
+    "accelerate>=1,<2",
+    "diffusers>=0.35,<1",
+    "transformers>=5,<6",
     "jax>=0.4.35",
     "mypy>=1.18,<2",
     # The CPU runtime, so the ONNX Runtime tracing paths stay tested even

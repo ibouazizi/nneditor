@@ -60,6 +60,11 @@ def test_discovery_is_declarative_and_supports_development_folders(
         {"architectures": "wrong"},
         {"element_types": [1]},
         {"operators": [""]},
+        {"python_modules": ["parent.child"]},
+        {"python_modules": ["../unsafe"]},
+        {"python_modules": "torch"},
+        {"install_extra": "unsafe]"},
+        {"streaming_weights": "yes"},
     ],
 )
 def test_malformed_manifests_do_not_disable_other_tracers(
@@ -69,7 +74,12 @@ def test_malformed_manifests_do_not_disable_other_tracers(
     with pytest.raises(TracePluginError):
         load_manifest(root / MANIFEST_NAME)
     registry = default_trace_registry([tmp_path])
-    assert len(registry.plugins) == 2
+    assert {p.id for p in registry.plugins} == {
+        "builtin.onnx",
+        "builtin.numpy-llm",
+        "nneditor.mamba",
+        "nneditor.stable-diffusion",
+    }
     assert len(registry.errors) == 1
 
 
@@ -192,5 +202,10 @@ def test_unreadable_plugin_directory_is_reported(
 
     monkeypatch.setattr(Path, "iterdir", iterdir)
     registry = default_trace_registry([tmp_path])
-    assert len(registry.plugins) == 2
+    assert {p.id for p in registry.plugins} == {
+        "builtin.onnx",
+        "builtin.numpy-llm",
+        "nneditor.mamba",
+        "nneditor.stable-diffusion",
+    }
     assert "cannot read tracer directory" in registry.errors[0]
