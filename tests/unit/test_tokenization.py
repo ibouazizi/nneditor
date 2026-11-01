@@ -56,6 +56,7 @@ class TestSelfContainedCodebooks:
             "word-hash",
             "gpt2-bpe",
             "tokenizer-json",
+            "gguf-embedded",
         }
         for choice in TOKENIZER_CHOICES:
             assert choice.note.strip()

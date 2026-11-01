@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 
 import flet as ft
 
+from nneditor.input_files import publish_input_archive
 from nneditor.input_generation import (
     GeneratedTensor,
     InputGenerationError,
@@ -615,6 +617,7 @@ class TestInputWorkspace:
             color=palette.ink,
             selectable=True,
         )
+        self.output_format = self._dropdown("Output format", "npy", ("npy", "npz"))
         self.control = build_input_workspace(
             palette=palette,
             kind=self.kind,
@@ -626,6 +629,7 @@ class TestInputWorkspace:
             generate_all_and_assign_button=self.generate_all_and_assign_button,
             status=self.status,
             summary=self.summary,
+            output_format=self.output_format,
         )
         self._refresh_assign_button()
 
@@ -973,6 +977,9 @@ class TestInputWorkspace:
             self._refresh_token_choice()
         if prompt.vocabulary_path:
             self.token_vocabulary_path.value = prompt.vocabulary_path
+        self.output_format.value = (
+            "npz" if prompt.tokenizer_choice == "gguf-embedded" else "npy"
+        )
         if prompt.merges_path:
             self.token_merges_path.value = prompt.merges_path
         if prompt.vocab_size is not None:
@@ -998,11 +1005,11 @@ class TestInputWorkspace:
         self.token_note.value = choice.note
         self.token_vocabulary_row.visible = choice.needs_vocabulary
         self.token_merges_row.visible = choice.needs_merges
-        self.token_vocabulary_path.label = (
-            "Vocabulary (tokenizer.json)"
-            if choice.id == "tokenizer-json"
-            else "Vocabulary (vocab.json)"
-        )
+        self.token_vocabulary_path.label = {
+            "gguf-embedded": "Open GGUF model (embedded vocabulary and merges)",
+            "tokenizer-json": "Vocabulary (tokenizer.json)",
+        }.get(choice.id, "Vocabulary (vocab.json)")
+        self.token_vocabulary_row.controls[1].visible = choice.id != "gguf-embedded"
         # A file-backed codebook takes its size from the vocabulary, so the
         # field would be a lie rather than a setting.
         self.token_vocab_size.disabled = choice.needs_files
@@ -1170,7 +1177,9 @@ class TestInputWorkspace:
         planned = tuple(
             (
                 preset,
-                target_directory / self._preset_filename(index, preset.target.name),
+                (
+                    target_directory / self._preset_filename(index, preset.target.name)
+                ).with_suffix("." + (self.output_format.value or "npy")),
             )
             for index, preset in enumerate(self.input_presets.values())
         )
@@ -1199,6 +1208,12 @@ class TestInputWorkspace:
     def _generate_preset(
         preset: InputGeneratorPreset, destination: Path
     ) -> GeneratedTensor:
+        if destination.suffix.lower() == ".npz":
+            with tempfile.TemporaryDirectory(prefix="nneditor-input-") as directory:
+                generated = TestInputWorkspace._generate_preset(
+                    preset, Path(directory) / "input.npy"
+                )
+                return publish_input_archive(generated, destination, preset.target.name)
         if not preset.ready or preset.dtype is None:
             raise InputGenerationError(
                 f"input {preset.target.name!r} has no complete generator preset"
@@ -1282,7 +1297,9 @@ class TestInputWorkspace:
             dialog_title="Save generated test input",
             file_name=self.generated_input_name(),
             file_type=ft.FilePickerFileType.CUSTOM,
-            allowed_extensions=["npy"],
+            allowed_extensions=["npz", "npy"]
+            if self.output_format.value == "npz"
+            else ["npy", "npz"],
         )
         if destination is None:
             return
@@ -1336,6 +1353,11 @@ class TestInputWorkspace:
 
     def generate_current_input(self, destination: Path) -> GeneratedTensor:
         """Create the tensor described by the currently visible form."""
+        if destination.suffix.lower() == ".npz":
+            with tempfile.TemporaryDirectory(prefix="nneditor-input-") as directory:
+                generated = self.generate_current_input(Path(directory) / "input.npy")
+                name = self.target_input.value or "input"
+                return publish_input_archive(generated, destination, name)
         kind = self.kind.value or "automatic"
         if kind == "automatic":
             return self._generate_preset(
@@ -1607,6 +1629,13 @@ class TestInputWorkspace:
         )
 
     def generated_input_name(self) -> str:
+        return str(
+            Path(self._generated_npy_name()).with_suffix(
+                "." + (self.output_format.value or "npy")
+            )
+        )
+
+    def _generated_npy_name(self) -> str:
         kind = self.kind.value or "automatic"
         if kind == "automatic" and self.target_input.value is not None:
             return f"{self._safe_target_stem(self.target_input.value)}.npy"
@@ -1662,6 +1691,7 @@ def build_input_workspace(
     generate_all_and_assign_button: ft.FilledButton,
     status: ft.Text,
     summary: ft.Text,
+    output_format: ft.Dropdown | None = None,
 ) -> ft.Container:
     """Build the standalone generator workspace from stateful controls."""
     configuration = ft.Container(
@@ -1690,7 +1720,7 @@ def build_input_workspace(
                                     color=palette.ink,
                                 ),
                                 ft.Text(
-                                    "Create bounded, pickle-free .npy tensors "
+                                    "Create bounded, pickle-free .npy or .npz tensors "
                                     "for tracing and model inputs.",
                                     size=11,
                                     color=palette.muted,
@@ -1709,6 +1739,7 @@ def build_input_workspace(
                 *sections,
                 ft.Divider(height=20, color=palette.border),
                 target_input,
+                *([output_format] if output_format is not None else []),
                 ft.Row(
                     controls=[generate_button, generate_and_assign_button],
                     wrap=True,

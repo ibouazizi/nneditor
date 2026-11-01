@@ -33,6 +33,7 @@ from nneditor.tracing.llm_runtime import (
 )
 from nneditor.tracing.runner import recommended_trace_limits
 from tests.fixtures.gguf_models import write_traceable_llama_gguf
+from tests.fixtures.gguf_tokenizers import write_tokenized_gguf
 from tests.fixtures.huggingface_models import (
     write_llama_snapshot,
     write_traceable_llama_snapshot,
@@ -132,12 +133,12 @@ def _approved_request(
 
 
 def test_isolated_gguf_trace_captures_activations(tmp_path: Path) -> None:
-    path = write_traceable_llama_gguf(tmp_path / "model.gguf")
+    path = write_tokenized_gguf(tmp_path / "model.gguf")
     os.environ.pop("NNEDITOR_TRACE_WORKER", None)
     with ApplicationService() as service:
         session = service.open_model(path)
         generated = generate_prompt_token_tensor(
-            tmp_path / "tokens.npy", document=session.document
+            tmp_path / "tokens.npy", document=session.document, text="Hello world!"
         )
         binding = session.trace_tensor_input("tokens", generated.path)
         specification = session.default_trace_inputs(bindings={"tokens": binding})

@@ -147,6 +147,14 @@ TOKENIZER_CHOICES: Final[tuple[TokenizerChoice, ...]] = (
         False,
         "Byte-level BPE read from a single tokenizer.json.",
     ),
+    TokenizerChoice(
+        "gguf-embedded",
+        "GGUF embedded vocabulary (open model)",
+        True,
+        False,
+        "Uses this GGUF's vocabulary, merge ranks, and declared tokenizer rules. "
+        "No external vocabulary or hashed token IDs.",
+    ),
 )
 
 
@@ -425,6 +433,12 @@ def load_codebook(
         raise TokenizationError(f"{choice.label} needs a vocabulary file")
     if choice.needs_merges and merges_path is None:
         raise TokenizationError(f"{choice.label} needs a merges file")
+
+    if choice.id == "gguf-embedded":
+        from nneditor.gguf_tokenization import GgufCodebook
+
+        assert vocabulary_path is not None
+        return GgufCodebook(vocabulary_path)
 
     if choice.id == "byte":
         return ByteCodebook()

@@ -127,13 +127,18 @@ def _hf_tokenizer_path(document: Document) -> Path | None:
 
 
 def codebook_for_document(document: Document) -> Codebook:
-    """Bind the snapshot tokenizer when it is a usable BPE, else hashed words.
+    """Bind an embedded GGUF tokenizer or a supported snapshot tokenizer.
 
     Hugging Face ``tokenizer.json`` files that are byte-level BPE with a
-    complete vocabulary are used as-is. Tiny or incomplete vocabularies, GGUF
-    SentencePiece tables, and missing tokenizer files fall back to
+    complete vocabulary are used as-is. Tiny or incomplete snapshot
+    vocabularies and missing tokenizer files fall back to
     :class:`WordHashCodebook` sized to the model's vocabulary.
+    GGUF encoding errors are explicit and never select a synthetic fallback.
     """
+    if document.artifact_kind is ArtifactKind.GGUF_MODEL:
+        from nneditor.gguf_tokenization import GgufCodebook
+
+        return GgufCodebook(document)
     tokenizer_json = _hf_tokenizer_path(document)
     if tokenizer_json is not None:
         try:
@@ -155,7 +160,15 @@ def _special_ids(document: Document) -> tuple[int | None, int | None, int]:
         bos = _as_int(metadata.get("tokenizer.ggml.bos_token_id"))
         eos = _as_int(metadata.get("tokenizer.ggml.eos_token_id"))
         pad = _as_int(metadata.get("tokenizer.ggml.padding_token_id")) or 0
-        return bos, eos, pad
+        add_bos = metadata.get(
+            "tokenizer.ggml.add_bos_token",
+            metadata.get("tokenizer.ggml.model") == "llama",
+        )
+        return (
+            bos if add_bos else None,
+            eos if metadata.get("tokenizer.ggml.add_eos_token", False) else None,
+            pad,
+        )
     if document.artifact_kind is ArtifactKind.HUGGINGFACE_MODEL:
         config = _extension_map(document, "x-huggingface.config")
         bos = _as_int(config.get("bos_token_id"))
@@ -167,8 +180,23 @@ def _special_ids(document: Document) -> tuple[int | None, int | None, int]:
 
 def prompt_settings_for_document(document: Document) -> PromptSettings:
     """Tokenizer drop-down defaults for a GGUF file or Hugging Face snapshot."""
-    codebook = codebook_for_document(document)
     bos, eos, pad = _special_ids(document)
+    if document.artifact_kind is ArtifactKind.GGUF_MODEL:
+        metadata = _extension_map(document, "x-gguf.metadata")
+        pre = metadata.get("tokenizer.ggml.pre", metadata.get("tokenizer.ggml.model"))
+        return PromptSettings(
+            text=DEFAULT_PROMPT,
+            tokenizer_choice="gguf-embedded",
+            vocab_size=_document_vocab_size(document),
+            bos_id=bos,
+            eos_id=eos,
+            pad_id=pad,
+            vocabulary_path=str(document.source.path),
+            note=f"Embedded GGUF tokenizer: {Path(document.source.path).name}; "
+            f"{pre} rules. Vocabulary and merges are read from the open model. "
+            "Special-token insertion follows the GGUF flags.",
+        )
+    codebook = codebook_for_document(document)
     tokenizer_json = _hf_tokenizer_path(document)
     if getattr(codebook, "name", "") == "tokenizer-json" and tokenizer_json is not None:
         return PromptSettings(

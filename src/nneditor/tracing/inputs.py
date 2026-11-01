@@ -13,6 +13,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from nneditor.cancellation import CancellationToken
+from nneditor.input_files import read_input_array
 from nneditor.ir.core import Document, Value
 from nneditor.tracing.contracts import (
     InputBinding,
@@ -94,11 +95,9 @@ def tensor_file_binding_for_input(
     except KeyError:
         raise ValueError(f"{input_name!r} is not a model input") from None
     target = Path(path).expanduser().resolve()
-    if target.suffix.lower() != ".npy":
-        raise ValueError("trace tensor inputs must be safe .npy arrays")
     if not target.is_file():
         raise ValueError(f"input tensor file {target} is not a readable file")
-    array = np.load(target, allow_pickle=False, mmap_mode="r")
+    array = read_input_array(target, input_name)
     element_type = array.dtype.name
     if value.element_type != element_type:
         raise ValueError(
@@ -298,11 +297,9 @@ def _binding_array(
                 f"input tensor file {path.name} changed after the specification "
                 "was saved"
             )
-        if path.suffix.lower() != ".npy":
-            raise ValueError("trace tensor files currently use safe .npy arrays")
         # Map first so an invalid dtype/shape can be rejected without loading
         # a user-supplied payload into the editor process.
-        array = np.load(path, allow_pickle=False, mmap_mode="r")
+        array = read_input_array(path, binding.name)
         return np.asarray(array)
     values = np.asarray(binding.constant, dtype=dtype)
     count = int(np.prod(binding.shape, dtype=np.int64))

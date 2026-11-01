@@ -1,0 +1,35 @@
+1
+00:00:00,000 --> 00:00:11,660
+1  Open the real Ternary Bonsai 2 27B PQ2_0 GGUF
+
+2
+00:00:11,660 --> 00:00:22,396
+2  Generate model-bound token IDs and save a named NPZ input
+
+3
+00:00:22,396 --> 00:00:34,316
+3  Approve and run the CPU trace — inference wait shown at 8x
+
+4
+00:00:34,316 --> 00:00:41,429
+4  Inspect the traced model through its clickable tensor ports
+
+5
+00:00:41,429 --> 00:00:49,198
+5  Decode output with the GGUF vocabulary and inspect top probabilities
+
+6
+00:00:49,198 --> 00:00:55,246
+6  Check statistics for the captured logits
+
+7
+00:00:55,246 --> 00:01:02,297
+7  Explore the output distribution in Visualization
+
+8
+00:01:02,297 --> 00:01:33,226
+8  Run Python: compute probabilities and entropy, then plot the top tokens
+
+9
+00:01:33,226 --> 00:01:41,314
+Python result: probability distribution and entropy from the captured tensor

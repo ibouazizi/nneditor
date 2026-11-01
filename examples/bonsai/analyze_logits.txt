@@ -1,0 +1,13 @@
+logits = np.asarray(tensor)[0, -1].astype(np.float64)
+probs = scipy.special.softmax(logits)
+top = np.argsort(probs)[-10:][::-1]
+print("Vocabulary entries:", logits.size)
+print("Top token IDs:", top.tolist())
+print("Probability sum:", float(probs.sum()))
+plt.figure(figsize=(8, 3))
+plt.bar(top.astype(str), probs[top])
+plt.xlabel("Token ID")
+plt.ylabel("Next-token probability")
+plt.title("Bonsai: top 10 next-token probabilities")
+plt.tight_layout()
+float(scipy.stats.entropy(probs))

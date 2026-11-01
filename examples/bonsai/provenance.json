@@ -1,0 +1,102 @@
+{
+  "model": "Ternary-Bonsai-2-27B-PQ2_0.gguf",
+  "architecture": "qwen35",
+  "decoder_blocks": 64,
+  "embedded_vocabulary_entries": 248320,
+  "embedded_bpe_merges": 247587,
+  "prompt": "Hello world!",
+  "input_archive": "examples/bonsai/hello-world.npz",
+  "archive_key": "tokens",
+  "token_ids": [
+    9419,
+    1814,
+    0
+  ],
+  "input_dtype": "int64",
+  "input_shape": [
+    1,
+    3
+  ],
+  "runtime": "numpy-llm",
+  "execution_device": "cpu",
+  "activations": 132,
+  "capture_states": {
+    "complete": 132
+  },
+  "logits_shape": [
+    1,
+    3,
+    248320
+  ],
+  "logits_dtype": "float32",
+  "top_token_ids": [
+    271,
+    198,
+    353,
+    248046,
+    1061,
+    1358,
+    2500,
+    10838,
+    220,
+    3437
+  ],
+  "top_probabilities": [
+    0.24838797761225323,
+    0.18942153491409278,
+    0.08417080827060315,
+    0.05047405224621964,
+    0.04184174550562334,
+    0.029195457625711588,
+    0.026721520299958033,
+    0.014947274834774317,
+    0.011995683187637579,
+    0.009539234534312114
+  ],
+  "probability_sum": 0.9999999999999998,
+  "entropy_nats": 3.875404304697744,
+  "recorded_inference_wait_seconds": 95.14936117597972,
+  "video_inference_speed_multiplier": 8,
+  "video_duration_seconds": 101.31418383703931,
+  "native_file_dialogs": "omitted; recorder supplies selected local file paths",
+  "capture": "real NNEditor desktop flow rendered in a local browser capture harness; no model execution, captures or script outputs are mocked",
+  "browser_errors": [],
+  "chapters": [
+    {
+      "name": "open",
+      "start_seconds": 1.767415809998056
+    },
+    {
+      "name": "input",
+      "start_seconds": 11.659812290017726
+    },
+    {
+      "name": "trace",
+      "start_seconds": 22.396206161996815
+    },
+    {
+      "name": "ports",
+      "start_seconds": 34.31619667401901
+    },
+    {
+      "name": "decode",
+      "start_seconds": 41.42927336701905
+    },
+    {
+      "name": "statistics",
+      "start_seconds": 49.198434212015854
+    },
+    {
+      "name": "visualization",
+      "start_seconds": 55.245643096019194
+    },
+    {
+      "name": "python",
+      "start_seconds": 62.29656435703873
+    },
+    {
+      "name": "python-result",
+      "start_seconds": 93.22606293403442
+    }
+  ]
+}

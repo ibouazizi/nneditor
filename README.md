@@ -18,6 +18,107 @@ desktop activation tracing in one application.
 
 ## NNEditor in action
 
+### Ternary Bonsai 2 27B: from GGUF to captured logits
+
+The embedded-tokenizer and NPZ workflow shown here is available in the current
+source checkout; install it with `python -m pip install -e .`.
+
+This example opens the real `Ternary-Bonsai-2-27B-PQ2_0.gguf` checkpoint. Its GGUF
+metadata describes a Qwen3.5 hybrid decoder with **64 blocks**, **248,320
+vocabulary entries**, and about **6.7 GiB of weights**. NNEditor reads the
+container, tokenizer, and tensor catalog lazily, then exposes the attention,
+recurrent, and feed-forward structure for inspection.
+
+[![Bonsai 27B loaded in NNEditor — watch the walkthrough](assets/screenshots/bonsai-model-graph.jpg)](assets/videos/bonsai-walkthrough.mp4)
+
+**[Watch or download the Bonsai walkthrough (MP4)](assets/videos/bonsai-walkthrough.mp4)**
+· [Captions](assets/videos/bonsai-walkthrough.srt)
+· [Recorded results](examples/bonsai/provenance.json)
+
+The recording shows opening the GGUF, generating and assigning its prompt input,
+approving a trace, opening a captured output port, decoding token candidates,
+checking statistics and visualizations, and running a Python analysis. Native
+file dialogs are omitted, and the CPU inference wait is shown at **8× speed**.
+The model execution, captures, decoded vocabulary pieces, and Python plots are
+computed from this checkpoint in the recorded session.
+
+**Prepare the model's own token IDs.** Open **Generate test input**, enter
+`Hello world!`, and leave **GGUF embedded vocabulary (open model)** selected.
+NNEditor reads `tokenizer.ggml.tokens`, `tokenizer.ggml.merges`, and the declared
+`qwen35` pre-tokenizer rules from this file. For this checkpoint, the prompt
+encodes to `[9419, 1814, 0]`. Its `add_bos_token` flag is false, so no BOS token is
+inserted. **Output format → npz** saves a named `tokens` array; **Generate, save &
+assign** validates it against the model input and assigns it to the next trace.
+
+[The recorded NPZ input](examples/bonsai/hello-world.npz) can be inspected with:
+
+```python
+import numpy as np
+
+with np.load("examples/bonsai/hello-world.npz", allow_pickle=False) as inputs:
+    print(inputs["tokens"])  # [[9419, 1814, 0]], int64, shape (1, 3)
+```
+
+These IDs belong to this GGUF vocabulary. When opening a different checkpoint,
+generate its input from that checkpoint's embedded tokenizer.
+
+**Trace and inspect the block ports.** In **Trace**, review the input, selected
+tracer, capture scope, and limits, then choose **Approve & run trace**. The
+**Traced model** pane preserves the model's block structure and connections.
+This recorded run captured all **132 activations in full**.
+Click a small input or output ellipse to inspect its captured tensor, or use
+**Find a block or tensor** to jump to **Logits**.
+
+![Bonsai traced model with clickable tensor ports](assets/screenshots/bonsai-traced-model.jpg)
+
+**Decode and analyze the output.** The final language-model head produces
+float32 logits with shape `(1, 3, 248320)` for this prompt. In **View**, choose
+**Inspect next-token predictions** to see the top candidates and probabilities
+for a captured position. The overlay identifies the source GGUF and vocabulary
+size. Its `gpt2` algorithm label describes byte decoding; the token strings and
+IDs come from Bonsai's embedded vocabulary. The top candidate in this run is
+`ĊĊ`, representing two newline characters, with about **24.84%** probability.
+
+![Bonsai logits decoded using the embedded GGUF vocabulary](assets/screenshots/bonsai-output-decoding.jpg)
+
+**Statistics** reports the captured tensor's counts and numerical distribution;
+**Visualization** provides plots such as a histogram. These controls operate on
+the captured forward pass. The next-token candidates are predictions at one
+position, rather than a generated conversation or an autoregressive completion.
+
+**Use Python for a custom analysis.** The **Python** tab supplies the captured
+`tensor`, `metadata`, NumPy, SciPy, scikit-learn, `math`, and Matplotlib. The
+[script used in the recording](examples/bonsai/analyze_logits.txt) selects the
+last prompt position, computes a softmax, prints the top IDs, plots their
+probabilities, and returns the entropy in nats (**3.8754** for this captured
+position):
+
+```python
+logits = np.asarray(tensor)[0, -1].astype(np.float64)
+probs = scipy.special.softmax(logits)
+top = np.argsort(probs)[-10:][::-1]
+print("Top token IDs:", top.tolist())
+plt.bar(top.astype(str), probs[top])
+plt.xlabel("Token ID")
+plt.ylabel("Next-token probability")
+plt.tight_layout()
+float(scipy.stats.entropy(probs))
+```
+
+![Python analysis of the real Bonsai captured logits](assets/screenshots/bonsai-python-analysis.jpg)
+
+Use **Run script** or Ctrl+Enter to execute a fresh process. Printed output, the
+last expression's result, and Matplotlib figures appear below the editor.
+**Stop**, timeout, and RAM controls bound a run. Processing uses a private copy,
+so in-place array operations preserve the original captured tensor.
+
+This recording uses the **CPU NumPy GGUF tracer**. GPU support depends on the
+selected tracer: installing CuPy or CUDA-enabled PyTorch does not change this
+tracer's execution device. ONNX accelerator backends and plugins declaring GPU
+support provide their own device execution.
+
+### ONNX example: DETR ResNet-50
+
 These screenshots come from a real desktop session with the 2,364-operator
 `detr-resnet-50.onnx` model. The trace used the included fox image tensor and an
 automatically generated all-valid pixel mask. It reached the approved 256 MiB
@@ -48,14 +149,15 @@ capture bound, so NNEditor reported an honest partial result while retaining
   artifact.
 - Save only when needed through a dirty-aware top-bar action, or close the
   current model without quitting the application.
-- Generate safe `.npy` test inputs from images, masks, CSV data, synthetic
+- Generate safe `.npy` or named `.npz` test inputs from images, masks, CSV data, synthetic
   time series, text token ids, or generic tensor patterns. Model inputs are
   detected and preconfigured automatically, and the complete generated set can
   be assigned in one action.
 - Tokenize prompt text into language-model input ids through a selectable
   codebook: byte level, Unicode code points, or hashed words with no external
   files, plus GPT-2/RoBERTa byte-level BPE loaded from a HuggingFace
-  `vocab.json` and `merges.txt` or a single `tokenizer.json`. Every codebook
+  `vocab.json` and `merges.txt` or a single `tokenizer.json`, plus model-bound
+  encoding from embedded GGUF vocabularies and merge tables. Every codebook
   states how faithful its ids are to the model's own tokenizer.
 - Preview quantization and pruning before committing them.
 - Export validated ONNX revisions or clearly labelled weights-only artifacts.
@@ -175,7 +277,8 @@ snapshots.
    use **Generate & assign all detected inputs** to create and validate the
    complete input set in one directory. You can also click the
    tensor-picker button inside an input node and choose an existing safe NumPy
-   `.npy` tensor.
+   `.npy` tensor or `.npz` archive. NPZ arrays match inputs by name; a
+   single-array archive can also be assigned directly.
    Image dimensions are shown and applied as height then width, matching tensor
    shape conventions. Fixed Qwen3-VL `pixel_values` inputs automatically use
    the model-compatible flattened-patch profile.
@@ -183,9 +286,14 @@ snapshots.
    all-valid mask; other inputs use deterministic random data.
    GGUF files and Hugging Face snapshots open the **Text tokens** source with a
    catalog of sample prompts. Sequence length left blank keeps the prompt's
-   natural token length. A Hugging Face `tokenizer.json` is used when it is a
-   complete byte-level BPE; otherwise words are hashed into the model's
-   vocabulary so shapes and ranges are valid.
+   natural token length. GGUF models default to their embedded vocabulary,
+   BPE merge table, declared pre-tokenizer, and special-token insertion flags;
+   **npz** output stores an array named for the selected model input. Supported
+   embedded byte-BPE rules include GPT-2, Qwen2, Qwen3.5/Bonsai, and Llama 3.
+   Missing or unsupported GGUF tokenizer data produces an explicit error;
+   synthetic codebooks remain an explicit smoke-test choice. A Hugging Face
+   `tokenizer.json` is used when it is a complete byte-level BPE; otherwise its
+   prompt preparation offers a clearly labelled hashed-word smoke test.
 2. Open **Trace activations**, review the execution backend, execution device,
    input specification, and wall-clock, memory, capture, and chunk limits.
    For ONNX, **Automatic** tries installed GPU and NPU execution providers

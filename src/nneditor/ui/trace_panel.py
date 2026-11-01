@@ -839,7 +839,8 @@ class TracePanel:
         automatic_mask = binding is None and uses_automatic_mask(input_name)
         chosen = binding is not None or automatic_mask
         source = (
-            f".npy file · {Path(binding.tensor_file).name}"
+            f"{Path(binding.tensor_file).suffix.lower()} file · "
+            f"{Path(binding.tensor_file).name}"
             if binding is not None and binding.tensor_file is not None
             else "All-valid mask · generated automatically"
             if automatic_mask
@@ -863,7 +864,7 @@ class TracePanel:
                         content=(
                             "Replace tensor"
                             if binding is not None
-                            else "Choose .npy tensor"
+                            else "Choose .npy / .npz tensor"
                         ),
                         icon=ft.Icons.UPLOAD_FILE_ROUNDED,
                         on_click=self.choose_tensor_handler(value_id),
@@ -1015,7 +1016,7 @@ class TracePanel:
                 allow_multiple=False,
                 with_data=False,
                 file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=["npy"],
+                allowed_extensions=["npy", "npz"],
             )
             if not files:
                 return

@@ -246,7 +246,7 @@ def test_graph_first_tensor_picker_and_click_to_inspect_every_value(
             picker: ft.FilePicker,
             **kwargs: object,
         ) -> list[SimpleNamespace]:
-            assert kwargs["allowed_extensions"] == ["npy"]
+            assert kwargs["allowed_extensions"] == ["npy", "npz"]
             return [SimpleNamespace(path=str(tensor_path))]
 
         monkeypatch.setattr(ft.FilePicker, "pick_files", pick_tensor)
@@ -494,7 +494,7 @@ def test_generator_tab_saves_and_assigns_to_selected_graph_input(
         picker: ft.FilePicker,
         **kwargs: object,
     ) -> str:
-        assert kwargs["allowed_extensions"] == ["npy"]
+        assert kwargs["allowed_extensions"] == ["npy", "npz"]
         return str(destination)
 
     monkeypatch.setattr(ft.FilePicker, "save_file", save_file)
