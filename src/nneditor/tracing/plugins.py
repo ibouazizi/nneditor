@@ -26,6 +26,7 @@ from nneditor.tracing.plugin_manifest import (
 from nneditor.tracing.sdk import TracePluginError
 
 __all__ = [
+    "BUNDLED_TRACE_FAMILIES",
     "TracePlugin",
     "TracePluginError",
     "TraceRegistry",
@@ -38,6 +39,20 @@ __all__ = [
 
 def trace_plugin_directory() -> Path:
     return default_state_directory() / "tracers"
+
+
+BUNDLED_TRACE_FAMILIES = (
+    "ssm",
+    "diffusion",
+    "vision",
+    "dit",
+    "video",
+    "audio",
+    "seq2seq",
+    "rwkv",
+    "bitnet",
+    "gguf-media",
+)
 
 
 def _builtins() -> tuple[TracePlugin, ...]:
@@ -162,7 +177,7 @@ def default_trace_registry(roots: Iterable[Path] | None = None) -> TraceRegistry
     plugins: list[TracePlugin] = []
     errors: list[str] = []
     manifests: set[Path] = set()
-    for family in ("ssm", "diffusion"):
+    for family in BUNDLED_TRACE_FAMILIES:
         bundled = (
             resources.files("nneditor.tracing") / "templates" / family / MANIFEST_NAME
         )
@@ -231,8 +246,11 @@ def install_trace_plugin(source: Path, *, directory: Path | None = None) -> Trac
 
 def create_trace_plugin(destination: Path, *, template: str = "llm") -> TracePlugin:
     """Create an editable working example without replacing an existing folder."""
-    if template not in {"llm", "ssm", "diffusion"}:
-        raise TracePluginError("Choose an llm, ssm, or diffusion tracer template.")
+    if template not in {"llm", *BUNDLED_TRACE_FAMILIES}:
+        raise TracePluginError(
+            "Choose an llm, ssm, diffusion, vision, dit, video, audio, "
+            "seq2seq, rwkv, bitnet, or gguf-media tracer template."
+        )
     source = resources.files("nneditor.tracing") / "templates" / template
     destination.mkdir(parents=True, exist_ok=False)
     try:

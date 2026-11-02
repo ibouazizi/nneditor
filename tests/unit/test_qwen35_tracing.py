@@ -257,7 +257,7 @@ def _changed_metadata(document: Document, changes: dict[str, JsonValue]) -> Docu
         ("qwen35.rope.dimension_count", 18),
         ("qwen35.attention.value_length", 32),
         ("qwen35.rope.scaling.type", "linear"),
-        ("prism.hadamard.version", 2),
+        ("prism.hadamard.version", 3),
         ("prism.hadamard.transform", "unknown"),
         ("prism.hadamard.axis", "output"),
         ("prism.hadamard.block_size", 3),
@@ -451,3 +451,57 @@ def test_tied_output_and_unsupported_prism_tying(tmp_path: Path) -> None:
     path, _, _ = write_qwen35(tmp_path / "prism-tied.gguf", packing=142, tied=True)
     reason = open_gguf(path).capability(Capability.TRACING).reason
     assert "explicit output projection" in reason
+
+
+@pytest.mark.parametrize("packing", [142, 143])
+def test_prism_version_two_tied_head_matches_torch(
+    tmp_path: Path, packing: int
+) -> None:
+    path, weights, signs = write_qwen35(
+        tmp_path / "v2.gguf",
+        packing=packing,
+        tied=True,
+        hadamard_version=2,
+    )
+    document = open_gguf(path)
+    assert (
+        document.capability(Capability.TRACING).availability is Availability.AVAILABLE
+    )
+    tokens = np.array([[1, 4, 2, 6], [3, 2, 7, 0]], dtype=np.int64)
+    expected = _reference(weights, tokens, signs, prism=True, grouped=True)
+    with TensorStore(document) as store:
+        actual, _, _ = trace_document(document, {"tokens": tokens}, store)
+    for value_id, value in actual.items():
+        name = document.main_graph.value(value_id).name
+        if name == "tokens":
+            continue
+        np.testing.assert_allclose(value, expected[str(name)], rtol=4e-4, atol=2e-5)
+
+
+def test_hadamard_version_two_contract(tmp_path: Path) -> None:
+    path, _, _ = write_qwen35(tmp_path / "v1.gguf", packing=142)
+
+    def reason(changes: dict[str, JsonValue]) -> str | None:
+        return trace_unavailable_reason(_changed_metadata(open_gguf(path), changes))
+
+    untied = reason({"prism.hadamard.version": 2})
+    assert untied is not None and "tied_output=true" in untied
+    forbidden = reason({"prism.hadamard.tied_output": True})
+    assert forbidden is not None and "version 1 forbids it" in forbidden
+    separate_head = reason(
+        {
+            "prism.hadamard.version": 2,
+            "prism.hadamard.tied_output": True,
+        }
+    )
+    assert separate_head is not None and "output.weight to be absent" in separate_head
+    tied_path, _, _ = write_qwen35(
+        tmp_path / "v2.gguf", packing=142, tied=True, hadamard_version=2
+    )
+    missing_latent = trace_unavailable_reason(
+        _changed_metadata(
+            open_gguf(tied_path),
+            {"prism.hadamard.inverse_weight_names": ["blk.0.attn_qkv.weight"]},
+        )
+    )
+    assert missing_latent is not None and "latent token embedding" in missing_latent

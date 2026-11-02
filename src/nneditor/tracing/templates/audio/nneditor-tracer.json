@@ -1,0 +1,14 @@
+{
+  "api_version": 1,
+  "id": "nneditor.audio",
+  "name": "Whisper speech",
+  "version": "1.0.0",
+  "entry_point": "tracer.py:trace",
+  "artifact_kinds": ["huggingface_model"],
+  "architectures": ["whisper", "WhisperForConditionalGeneration"],
+  "element_types": ["float32", "float16", "bfloat16"],
+  "devices": ["cpu"],
+  "python_modules": ["torch", "transformers", "safetensors"],
+  "install_extra": "tracer-modalities",
+  "description": "Trace a local Whisper checkpoint. Install nneditor[tracer-modalities]. Captures encoder blocks, decoder blocks, and logits for one pass."
+}

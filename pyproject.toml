@@ -66,6 +66,7 @@ runtime-qnn = ["onnxruntime-qnn>=1.22,<2"]
 runtime-openvino = ["onnxruntime-openvino>=1.22,<2"]
 tracer-ssm = ["torch>=2.6,<3", "transformers>=5,<6", "safetensors>=0.4,<1"]
 tracer-diffusion = ["torch>=2.6,<3", "diffusers>=0.35,<1", "safetensors>=0.4,<1", "accelerate>=1,<2"]
+tracer-modalities = ["torch>=2.6,<3", "transformers>=5,<6", "diffusers>=0.35,<1", "safetensors>=0.4,<1", "accelerate>=1,<2"]
 
 [project.scripts]
 nneditor = "nneditor.ui.app:cli"

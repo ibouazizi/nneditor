@@ -1,0 +1,14 @@
+{
+  "api_version": 1,
+  "id": "nneditor.dit",
+  "name": "SD3 and Flux",
+  "version": "1.0.0",
+  "entry_point": "tracer.py:trace",
+  "artifact_kinds": ["huggingface_model"],
+  "architectures": ["SD3Transformer2DModel", "FluxTransformer2DModel"],
+  "element_types": ["float32", "float16", "bfloat16"],
+  "devices": ["cpu"],
+  "python_modules": ["torch", "diffusers", "safetensors", "accelerate"],
+  "install_extra": "tracer-modalities",
+  "description": "Trace a local SD3 or Flux transformer folder. Install nneditor[tracer-modalities]. One denoising pass, captured at each transformer block."
+}

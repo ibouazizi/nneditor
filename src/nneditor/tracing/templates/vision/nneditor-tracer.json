@@ -1,0 +1,14 @@
+{
+  "api_version": 1,
+  "id": "nneditor.vision",
+  "name": "Vision-language",
+  "version": "1.0.0",
+  "entry_point": "tracer.py:trace",
+  "artifact_kinds": ["huggingface_model"],
+  "architectures": ["llava", "LlavaForConditionalGeneration", "qwen2_vl", "Qwen2VLForConditionalGeneration", "gemma3", "Gemma3ForConditionalGeneration"],
+  "element_types": ["float32", "float16", "bfloat16"],
+  "devices": ["cpu"],
+  "python_modules": ["torch", "transformers", "safetensors"],
+  "install_extra": "tracer-modalities",
+  "description": "Trace a local LLaVA, Qwen2-VL, or Gemma 3 snapshot. Install nneditor[tracer-modalities]. Captures the vision tower, projector, decoder blocks, and logits."
+}

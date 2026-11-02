@@ -110,6 +110,9 @@ def _document_vocab_size(document: Document) -> int | None:
     if document.artifact_kind is ArtifactKind.HUGGINGFACE_MODEL:
         model = _extension_map(document, "x-huggingface.model")
         config = _extension_map(document, "x-huggingface.config")
+        text = config.get("text_config")
+        if isinstance(text, dict):
+            return _as_int(text.get("vocab_size")) or _as_int(model.get("vocab_size"))
         return _as_int(config.get("vocab_size")) or _as_int(model.get("vocab_size"))
     return None
 
@@ -171,6 +174,9 @@ def _special_ids(document: Document) -> tuple[int | None, int | None, int]:
         )
     if document.artifact_kind is ArtifactKind.HUGGINGFACE_MODEL:
         config = _extension_map(document, "x-huggingface.config")
+        text = config.get("text_config")
+        if isinstance(text, dict):
+            config = text
         bos = _as_int(config.get("bos_token_id"))
         eos = _as_int(config.get("eos_token_id"))
         pad = _as_int(config.get("pad_token_id")) or 0

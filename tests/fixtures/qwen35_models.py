@@ -17,6 +17,7 @@ def write_qwen35(
     endian: str = "little",
     grouped: bool = True,
     tied: bool = False,
+    hadamard_version: int = 1,
 ) -> tuple[Path, dict[str, np.ndarray], np.ndarray]:
     rng = np.random.default_rng(54)
     h, ff, nk, nv, dim, vocab = 128, 128, 2, 8, 16, 9
@@ -141,8 +142,12 @@ def write_qwen35(
     ]
     signs = rng.choice([-1, 1], h).astype(np.int32)
     if packing:
+        if hadamard_version not in (1, 2):
+            raise ValueError("fixture Hadamard version must be 1 or 2")
+        if hadamard_version == 2 and not tied:
+            raise ValueError("Hadamard version 2 fixture requires tied=True")
         kv += [
-            ("prism.hadamard.version", 4, 1),
+            ("prism.hadamard.version", 4, hadamard_version),
             ("prism.hadamard.block_size", 4, 128),
             ("prism.hadamard.transform", 8, "normalized-sylvester-walsh-hadamard"),
             ("prism.hadamard.axis", 8, "input-last-dimension"),
@@ -153,6 +158,8 @@ def write_qwen35(
             ("prism.hadamard.sign_values", 9, (5, signs.tolist())),
             ("prism.hadamard.gdn_v_grouped", 7, grouped),
         ]
+        if hadamard_version == 2:
+            kv.append(("prism.hadamard.tied_output", 7, True))
     return (
         write_gguf(
             path, version=3, endian=endian, kv=tuple(kv), tensors=tuple(tensors)

@@ -17,6 +17,7 @@ from nneditor.input_generation import (
     GeneratedTensor,
     InputGenerationError,
     SyntheticDistribution,
+    generate_constant_tensor,
     generate_csv_tensor,
     generate_image_tensor,
     generate_mask_tensor,
@@ -27,6 +28,7 @@ from nneditor.input_generation import (
     parse_shape,
 )
 from nneditor.ir.core import Dim
+from nneditor.modality_inputs import ModalityInputDefault
 from nneditor.prompt_inputs import DEFAULT_PROMPT, SAMPLE_PROMPTS, PromptSettings
 from nneditor.tokenization import (
     TOKENIZER_CHOICES,
@@ -75,6 +77,7 @@ class InputTarget:
     is_mask: bool = False
     prefer_form: str | None = None
     prompt: PromptSettings | None = None
+    modality: ModalityInputDefault | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +107,18 @@ class InputGeneratorPreset:
 
 def preset_for_target(target: InputTarget) -> InputGeneratorPreset:
     """Infer a bounded generator preset without reading model payloads."""
+    if target.modality is not None:
+        default = target.modality
+        return InputGeneratorPreset(
+            target=target,
+            kind=default.kind,
+            shape=default.shape,
+            dtype=target.element_type,
+            distribution="normal",
+            assumptions=(default.note,),
+            unavailable_reason=default.unavailable_reason,
+            prompt=target.prompt,
+        )
     if target.element_type not in _SUPPORTED_DTYPES:
         return InputGeneratorPreset(
             target=target,
@@ -152,6 +167,26 @@ def preset_for_target(target: InputTarget) -> InputGeneratorPreset:
         kind = "mask"
         distribution = "ones"
         assumptions = ("symbolic or unknown extents default to 1",) if symbolic else ()
+    elif name.replace("_", "-") in {
+        "image-grid",
+        "image-grid-thw",
+        "token-types",
+        "mm-token-type-ids",
+    }:
+        return InputGeneratorPreset(
+            target=target,
+            kind="tensor",
+            shape=shape,
+            dtype=target.element_type,
+            distribution="zeros",
+            unavailable_reason=(
+                "this metadata must match the image patches and token sequence"
+            ),
+        )
+    elif name.replace("_", "-") == "input-features":
+        kind = "audio-features"
+        distribution = "normal"
+        assumptions = ("synthetic features, not a processed recording",)
     elif len(shape) == 2 and target.element_type in _TOKEN_DTYPES:
         kind = "text-tokens"
         distribution = "zeros"
@@ -172,7 +207,7 @@ def preset_for_target(target: InputTarget) -> InputGeneratorPreset:
     if kind == "text-tokens":
         if target.prompt is not None and target.prompt.sequence_length is not None:
             sequence_length = target.prompt.sequence_length
-        elif not symbolic:
+        elif isinstance(target.shape[1], int):
             sequence_length = shape[1]
     return InputGeneratorPreset(
         target=target,
@@ -946,7 +981,12 @@ class TestInputWorkspace:
             if preset.assumptions
             else ""
         )
-        if preset.kind == "mask":
+        if (
+            preset.target.modality is not None
+            and preset.target.modality.values is not None
+        ):
+            values = "model-specific diagnostic constants"
+        elif preset.kind == "mask":
             values = "all-valid values"
         elif preset.kind == "text-tokens":
             values = "prompt token ids"
@@ -1217,6 +1257,15 @@ class TestInputWorkspace:
         if not preset.ready or preset.dtype is None:
             raise InputGenerationError(
                 f"input {preset.target.name!r} has no complete generator preset"
+            )
+        default = preset.target.modality
+        if default is not None and default.values is not None:
+            return generate_constant_tensor(
+                destination,
+                shape=default.shape,
+                values=default.values,
+                dtype=preset.dtype,
+                source=default.note,
             )
         if preset.kind == "text-tokens":
             return TestInputWorkspace._generate_token_preset(preset, destination)
@@ -1557,12 +1606,12 @@ class TestInputWorkspace:
                 self.image_color.value = "rgb" if shape[3] == 3 else "grayscale"
                 self.image_height.value = str(shape[1])
                 self.image_width.value = str(shape[2])
-            elif len(shape) == 3 and shape[0] in {1, 3}:
+            elif preset.kind == "image" and len(shape) == 3 and shape[0] in {1, 3}:
                 self.image_layout.value = "CHW"
                 self.image_color.value = "rgb" if shape[0] == 3 else "grayscale"
                 self.image_height.value = str(shape[1])
                 self.image_width.value = str(shape[2])
-            elif len(shape) == 3 and shape[2] in {1, 3}:
+            elif preset.kind == "image" and len(shape) == 3 and shape[2] in {1, 3}:
                 self.image_layout.value = "HWC"
                 self.image_color.value = "rgb" if shape[2] == 3 else "grayscale"
                 self.image_height.value = str(shape[0])

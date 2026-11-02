@@ -31,10 +31,18 @@ from typing import Any, Final, Protocol, runtime_checkable
 import flet as ft
 import flet.canvas as cv
 
+from nneditor.adapters.gguf import tensor_source_name
 from nneditor.adapters.gguf.preview import preview_kv_array
 from nneditor.adapters.huggingface import preview_tokenizer_vocab
 from nneditor.analysis.hierarchy import Group, Hierarchy
-from nneditor.analysis.llm_layers import layer_label, layer_owner, layer_tensor_ids
+from nneditor.analysis.llm_layers import (
+    block_title,
+    containing_block,
+    layer_label,
+    layer_owner,
+    layer_stem,
+    layer_tensor_ids,
+)
 from nneditor.analysis.lod import DetailLevel, detail_for_scale
 from nneditor.application.editing import SidecarPersistenceError
 from nneditor.application.hierarchy import OrganizationMode
@@ -53,6 +61,7 @@ from nneditor.desktop import (
 from nneditor.editing.validation import EditRequest, EditTransaction
 from nneditor.input_generation import GeneratedTensor
 from nneditor.ir.capabilities import ArtifactKind
+from nneditor.modality_inputs import modality_input_defaults
 from nneditor.prompt_inputs import prompt_settings_for_document
 from nneditor.rendering import create_flet_renderer
 from nneditor.rendering.contract import InteractiveGraphRenderer, RendererFactory
@@ -548,6 +557,22 @@ class Shell:
             visible=False,
             left=16,
             top=16,
+        )
+        self.place_label = ft.Text(
+            "",
+            size=12,
+            weight=ft.FontWeight.W_600,
+            color=self.palette.ink,
+        )
+        self.place_chip = ft.Container(
+            content=self.place_label,
+            padding=ft.Padding.symmetric(horizontal=10, vertical=6),
+            bgcolor=self.palette.panel,
+            border=ft.Border.all(1, self.palette.border),
+            border_radius=10,
+            top=12,
+            right=12,
+            visible=False,
         )
         self._hovered_id: str | None = None
         self.edit_panel = EditPanel(
@@ -1154,6 +1179,7 @@ class Shell:
             renderer_control=self.renderer_control,
             graph_actions=self.trace.graph_actions,
             empty_state=self.empty_state,
+            place_chip=self.place_chip,
             hover_card=self.hover_card,
             operations_drawer=self.operations_drawer,
             loading_overlay=self.loading_overlay,
@@ -1515,15 +1541,23 @@ class Shell:
             return
         graph = session.document.main_graph
         llm_kind = bool(graph.nodes and graph.nodes[0].domain == "nneditor.llm")
-        settings = prompt_settings_for_document(session.document) if llm_kind else None
+        defaults = modality_input_defaults(session.document)
+        token_names = {"tokens", "source-tokens", "decoder-tokens"}
+        has_tokens = any(graph.value(key).name in token_names for key in graph.inputs)
+        settings = (
+            prompt_settings_for_document(session.document) if has_tokens else None
+        )
         targets = tuple(
             input_workspace.InputTarget(
                 name=value.name or value.id,
                 element_type=value.element_type,
                 shape=value.shape,
                 is_mask=uses_automatic_mask(value.name or value.id),
-                prefer_form="text-tokens" if llm_kind else None,
-                prompt=settings,
+                prefer_form="text-tokens"
+                if llm_kind and value.name in token_names
+                else None,
+                prompt=settings if value.name in token_names else None,
+                modality=defaults.get(value.name),
             )
             for value_id in graph.inputs
             if value_id not in graph.initializers
@@ -1782,6 +1816,7 @@ class Shell:
         self.open_selection_button.visible = False
         self.back_to_parent_button.visible = False
         self.hover_card.visible = False
+        self.place_chip.visible = False
         self.reset_view_button.disabled = True
         self.title_text.value = APP_TITLE
         self.model_subtitle.value = "Neural network explorer"
@@ -2021,7 +2056,7 @@ class Shell:
             ft.TextButton(
                 content=f"{hit.label} "
                 f"[{document.graphs[hit.graph_id].name or hit.graph_id}]",
-                on_click=self._jump_handler(hit.graph_id, hit.node_id),
+                on_click=self._jump_handler(hit.graph_id, hit.node_id, hit.layer_stem),
             )
             for hit in hits[:50]
         ]
@@ -2029,7 +2064,7 @@ class Shell:
         self.page.update()
 
     def _jump_handler(
-        self, graph_id: str, node_id: str
+        self, graph_id: str, node_id: str, layer: str | None = None
     ) -> Callable[[ft.Event[ft.TextButton]], None]:
         def jump(event: ft.Event[ft.TextButton]) -> None:
             # A result captured from a previously opened model must never
@@ -2042,7 +2077,7 @@ class Shell:
                 return
             if graph_id != self.current_graph:
                 self._show_graph(graph_id)
-            self.focus_node(node_id)
+            self.focus_node(node_id, layer_stem=layer)
 
         return jump
 
@@ -2051,19 +2086,73 @@ class Shell:
         if not selected:
             return
         value = selected[0]
+        previous = self.current_detail
         if value == "auto":
             self.auto_detail = True
             self.current_detail = detail_for_scale(self.view["scale"])
         else:
             self.auto_detail = False
             self.current_detail = DetailLevel(value)
+        if (
+            self.current_detail is DetailLevel.LAYER
+            and self.current_root_group is None
+            and self.session is not None
+            and self.session.finest_detail() is DetailLevel.LAYER
+        ):
+            block_id = self._selected_block_group()
+            if block_id is None:
+                self.current_detail = previous
+                self.auto_detail = False
+                self._sync_detail_controls()
+                self._set_status("Select a block, then choose Layers to see inside it.")
+                self.page.update()
+                return
+            self.show_group(block_id)
+            self._sync_place_label()
+            self._set_status(f"Showing the layers in {self.place_label.value}")
+            self.page.update()
+            return
         self._replace_current_representation()
 
     def _sync_detail_controls(self) -> None:
         """Reflect the detail state in the segment; Auto stays selected."""
+        self._apply_detail_segments()
         self.detail_segment.selected = [
             "auto" if self.auto_detail else self.current_detail.value
         ]
+
+    def _apply_detail_segments(self) -> None:
+        """Hide Operators when this model has no finer circuit than Layers."""
+        if not hasattr(self, "_all_detail_segments"):
+            self._all_detail_segments = list(self.detail_segment.segments)
+        finest = (
+            self.session.finest_detail()
+            if self.session is not None
+            else DetailLevel.OPERATOR
+        )
+        if self.current_detail is DetailLevel.OPERATOR and finest is DetailLevel.LAYER:
+            self.current_detail = DetailLevel.LAYER
+        self.detail_segment.segments = [
+            segment
+            for segment in self._all_detail_segments
+            if finest is DetailLevel.OPERATOR
+            or segment.value != DetailLevel.OPERATOR.value
+        ]
+
+    def _selected_block_group(self) -> str | None:
+        if (
+            self.session is None
+            or self.current_graph is None
+            or len(self.renderer.selection) != 1
+        ):
+            return None
+        (selected,) = self.renderer.selection
+        hierarchy = self.session.graph_hierarchy(self.current_graph)
+        if hierarchy.has_group(selected):
+            label = hierarchy.group(selected).label
+            if label.startswith("block-") and label[6:].isdigit():
+                return selected
+        return containing_block(hierarchy, selected)
 
     def _on_open_selected(self, event: ft.Event[ft.Button]) -> None:
         self._drill_into_selection()
@@ -2082,12 +2171,21 @@ class Shell:
         ):
             return
         hierarchy = self.session.graph_hierarchy(self.current_graph)
+        finest = self.session.finest_detail()
         next_level = {
             DetailLevel.ARCHITECTURE: DetailLevel.BLOCK,
             DetailLevel.BLOCK: DetailLevel.LAYER,
-            DetailLevel.LAYER: DetailLevel.OPERATOR,
-            DetailLevel.OPERATOR: DetailLevel.OPERATOR,
+            DetailLevel.LAYER: finest,
+            DetailLevel.OPERATOR: finest,
         }[self.current_detail]
+        root = selected if hierarchy.has_group(selected) else self.current_root_group
+        prospective = self.session.scene(
+            self.current_graph,
+            detail_level=next_level,
+            root_group=root,
+        )
+        if not self._opens_interior(selected, prospective):
+            return
         self.current_detail = next_level
         self.auto_detail = False
         self._sync_detail_controls()
@@ -2096,8 +2194,39 @@ class Shell:
             self._refresh_inspector(frozenset({selected}))
         else:
             self._replace_current_representation()
-        self._set_status(f"Opened {next_level.value} view")
+        self._sync_place_label()
+        place = self.place_label.value or next_level.value
+        if next_level is DetailLevel.LAYER:
+            self._set_status(f"Showing the layers in {place}")
+        else:
+            self._set_status(f"Opened {place}")
         self.page.update()
+
+    def _opens_interior(self, selected: str, prospective: GraphSlice) -> bool:
+        """Whether drilling ``selected`` would reveal anything new."""
+        if "::layer:" in selected:
+            return False
+        current = self.current_slice
+        clicked = (
+            current.members_by_glyph.get(selected, frozenset({selected}))
+            if current is not None
+            else frozenset({selected})
+        )
+        if len(clicked) <= 1:
+            owned = [
+                glyph_id
+                for glyph_id, members in prospective.members_by_glyph.items()
+                if members == clicked or glyph_id.startswith(f"{selected}::layer:")
+            ]
+            return len(owned) > 1
+        return (
+            sum(
+                1
+                for members in prospective.members_by_glyph.values()
+                if members and members <= clicked
+            )
+            > 1
+        )
 
     def _on_back_to_parent(self, event: ft.Event[ft.TextButton] | None = None) -> None:
         if (
@@ -2108,6 +2237,19 @@ class Shell:
             return
         hierarchy = self.session.graph_hierarchy(self.current_graph)
         group = hierarchy.group(self.current_root_group)
+        if (
+            self.current_detail is DetailLevel.LAYER
+            and group.label.startswith("block-")
+            and group.label[6:].isdigit()
+        ):
+            self.current_detail = DetailLevel.BLOCK
+            self.auto_detail = False
+            self.show_group(group.id)
+            self._sync_detail_controls()
+            self._sync_place_label()
+            self._set_status(f"Back to {block_title(group.label)}")
+            self.page.update()
+            return
         if group.parent_id is None:
             self._show_graph(self.current_graph)
         else:
@@ -2288,7 +2430,21 @@ class Shell:
             return
         modes = list(OrganizationMode)
         mode = modes[(modes.index(self.session.hierarchy.mode) + 1) % len(modes)]
+        previous = self.session.hierarchy.mode
         self.session.hierarchy.set_mode(mode)
+        hierarchy = self.session.graph_hierarchy(self.current_graph)
+        if (
+            self.session.finest_detail() is DetailLevel.LAYER
+            and not hierarchy.groups
+            and previous is not mode
+        ):
+            self.session.hierarchy.set_mode(previous)
+            self._set_status(
+                f"{mode.value.title()} grouping is not available for this model. "
+                "The picture is unchanged."
+            )
+            self.page.update()
+            return
         # A drilled-in root reconciled under the previous mode may not exist
         # in this one; repair before the scene rebuild would raise on it.
         self._repair_missing_root_group()
@@ -2381,6 +2537,7 @@ class Shell:
         self.current_detail = DetailLevel.ARCHITECTURE
         self.auto_detail = False
         self._sync_detail_controls()
+        self._sync_place_label()
         # The organization mode is per-artifact sidecar state restored by the
         # hierarchy controller; the toolbar button must reflect it, not reset.
         self._sync_organize_button()
@@ -2491,6 +2648,33 @@ class Shell:
         self._refresh_hierarchy()
         self._refresh_breadcrumbs()
         self._rebuild_minimap()
+        self._sync_place_label()
+
+    def _sync_place_label(self) -> None:
+        """Name the open block and detail level on the canvas."""
+        if self.session is None or self.current_graph is None:
+            self.place_label.value = ""
+            self.place_chip.visible = False
+            return
+        detail = {
+            DetailLevel.ARCHITECTURE: "Architecture",
+            DetailLevel.BLOCK: "Blocks",
+            DetailLevel.LAYER: "Layers",
+            DetailLevel.OPERATOR: "Operators",
+        }[self.current_detail]
+        title = detail
+        if self.current_root_group is not None:
+            hierarchy = self.session.graph_hierarchy(self.current_graph)
+            if hierarchy.has_group(self.current_root_group):
+                title = (
+                    f"{block_title(hierarchy.group(self.current_root_group).label)}"
+                    f" · {detail}"
+                )
+        self.place_label.value = title
+        self.place_label.color = self.palette.ink
+        self.place_chip.bgcolor = self.palette.panel
+        self.place_chip.border = ft.Border.all(1, self.palette.border)
+        self.place_chip.visible = True
 
     def show_group(self, group_id: str) -> None:
         """Navigate into a group without losing the operator selection."""
@@ -2508,6 +2692,7 @@ class Shell:
         self._sync_hierarchy_selection()
         self._refresh_breadcrumbs()
         self._rebuild_minimap()
+        self._sync_place_label()
 
     def _replace_scene_fitted(self, layout: GraphSlice) -> None:
         """Fit a new architecture or block context with comfortable padding."""
@@ -2604,8 +2789,11 @@ class Shell:
         self._refresh_breadcrumbs()
         self._rebuild_minimap()
         self._sync_detail_controls()
-        self.model_subtitle.value = f"{self.current_detail.value.title()} view"
-        self._set_status(f"{self.current_detail.value.title()} detail")
+        self._sync_place_label()
+        self.model_subtitle.value = (
+            self.place_label.value or f"{self.current_detail.value.title()} view"
+        )
+        self._set_status(self.model_subtitle.value)
         self.page.update()
 
     def _restore_logical_selection(self) -> None:
@@ -2625,9 +2813,33 @@ class Shell:
         if visible:
             self.renderer.set_selection(visible)
 
-    def focus_node(self, node_id: str) -> None:
+    def focus_node(self, node_id: str, *, layer_stem: str | None = None) -> None:
         """Center a node found via search, at a readable zoom."""
         if self.session is None or self.current_graph is None:
+            return
+        hierarchy = self.session.graph_hierarchy(self.current_graph)
+        block_id = containing_block(hierarchy, node_id)
+        if block_id is not None and (
+            layer_stem is not None or self.session.finest_detail() is DetailLevel.LAYER
+        ):
+            self.auto_detail = False
+            self.current_detail = (
+                DetailLevel.LAYER if layer_stem is not None else DetailLevel.BLOCK
+            )
+            self.current_root_group = block_id
+            target = (
+                f"{node_id}::layer:{layer_stem}" if layer_stem is not None else node_id
+            )
+            self._sync_detail_controls()
+            self._replace_current_representation()
+            layout = self.current_slice
+            if layout is None or not layout.scene.has_node(target):
+                target = node_id
+            if layout is None or not layout.scene.has_node(target):
+                self._set_status("That layer is not part of the current block")
+                self.page.update()
+                return
+            self._focus_glyph(target, layout.scene.node(target).label)
             return
         needs_rebuild = False
         if self.current_detail is not DetailLevel.OPERATOR:
@@ -2657,16 +2869,20 @@ class Shell:
         if needs_rebuild:
             self._sync_detail_controls()
             self._replace_current_representation()
+        self._focus_glyph(node_id, layout.scene.node(node_id).label)
+
+    def _focus_glyph(self, glyph_id: str, label: str) -> None:
         width, height = self.surface_size
         viewport = self.renderer.viewport_focused_on(
-            node_id, width=width, height=height, scale=max(self.view["scale"], 1.0)
+            glyph_id, width=width, height=height, scale=max(self.view["scale"], 1.0)
         )
         self.view = {"scale": viewport.scale, "x": viewport.x, "y": viewport.y}
         self.renderer.set_viewport(viewport)
-        self.renderer.set_selection(frozenset({node_id}))
-        self.logical_selection = frozenset({node_id})
-        self._refresh_inspector(frozenset({node_id}))
-        self._set_status(f"Focused {layout.scene.node(node_id).label}")
+        self.renderer.set_selection(frozenset({glyph_id}))
+        owner = glyph_id.split("::layer:", 1)[0]
+        self.logical_selection = frozenset({owner})
+        self._refresh_inspector(frozenset({glyph_id}))
+        self._set_status(f"Focused {label}")
         self.page.update()
 
     def _restore_view(self, session: ModelSession) -> None:
@@ -2822,6 +3038,11 @@ class Shell:
         rows: list[ft.Control] = []
         self.back_to_parent_button.visible = self.current_root_group is not None
         self.open_selection_button.visible = False
+        self.open_selection_button.content = (
+            "Show layers"
+            if self.current_detail is DetailLevel.BLOCK and self.current_root_group
+            else "Open block"
+        )
         if len(ids) == 1 and self.current_graph is not None:
             self.inspector.spacing = 14
             (node_id,) = ids
@@ -2935,6 +3156,13 @@ class Shell:
                     )
                     rows.extend(self.activations.activation_rows(node_id))
                 else:
+                    if (
+                        self.current_detail is DetailLevel.BLOCK
+                        and self.current_root_group is not None
+                        and self.session.finest_detail() is DetailLevel.LAYER
+                    ):
+                        self.open_selection_button.visible = True
+                        self.open_selection_button.content = "Show layers"
                     show_tensors = True
             if show_tensors:
                 rows.extend(self.activations.tensor_rows(node_id))
@@ -3625,7 +3853,7 @@ class Shell:
         self.activations.tensor_card_expanded[tensor_id] = True
         owner = tensor_owner_node_id(document, tensor_id)
         if owner is not None:
-            self.focus_node(owner)
+            self.focus_node(owner, layer_stem=layer_stem(tensor_source_name(tensor_id)))
             return
         self.renderer.set_selection(frozenset())
         self.logical_selection = frozenset()
@@ -4160,9 +4388,11 @@ def cli(argv: Sequence[str] | None = None) -> None:
         metavar="FOLDER",
         help="create an editable tracer extension",
     )
+    from nneditor.tracing.plugins import BUNDLED_TRACE_FAMILIES
+
     parser.add_argument(
         "--tracer-template",
-        choices=("llm", "ssm", "diffusion"),
+        choices=("llm", *BUNDLED_TRACE_FAMILIES),
         default="llm",
         help="template to use with --create-tracer",
     )

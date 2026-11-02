@@ -528,6 +528,23 @@ def generate_synthetic_tensor(
     return _publish_array(array, destination, source=f"{distribution} tensor")
 
 
+def generate_constant_tensor(
+    destination: Path | str,
+    *,
+    shape: tuple[int, ...],
+    values: tuple[int, ...],
+    dtype: str = "int64",
+    source: str = "model input constants",
+) -> GeneratedTensor:
+    """Publish bounded, explicitly specified model metadata or special tokens."""
+    target_dtype = _dtype(dtype)
+    _bounded_allocation(shape, target_dtype)
+    if len(values) != math.prod(shape):
+        raise InputGenerationError("constant count does not match the input shape")
+    array = np.asarray(values, dtype=target_dtype).reshape(shape)
+    return _publish_array(array, destination, source=source)
+
+
 def _dtype(
     name: str,
     *,

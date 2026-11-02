@@ -26,6 +26,14 @@ __all__ = [
 ]
 
 _BLOCK_NAME: Final = re.compile(r"^blk\.(\d+)\.(.+)$")
+_PREFIXED_BLOCKS: Final = (
+    (re.compile(r"^v\.blk\.(\d+)\.(.+)$"), "VisionBlock", "vision"),
+    (re.compile(r"^a\.blk\.(\d+)\.(.+)$"), "EncoderBlock", "audio-encoder"),
+    (re.compile(r"^encoder\.blocks\.(\d+)\.(.+)$"), "EncoderBlock", "audio-encoder"),
+    (re.compile(r"^encoder\.blk\.(\d+)\.(.+)$"), "EncoderBlock", "audio-encoder"),
+    (re.compile(r"^decoder\.blocks\.(\d+)\.(.+)$"), "DecoderBlock", "audio-decoder"),
+    (re.compile(r"^decoder\.blk\.(\d+)\.(.+)$"), "DecoderBlock", "audio-decoder"),
+)
 _EMBED_PREFIXES: Final = ("token_embd", "position_embd", "token_types")
 _EMPTY_KINDS: Final[dict[str, list[str]]] = {
     "attn": [],
@@ -147,6 +155,29 @@ def _classify_block_suffix(suffix: str) -> str:
     if suffix.startswith("attn_"):
         return "attn"
     return "extra"
+
+
+def _prefixed_layers(
+    tensors: dict[str, GgufTensorIndex],
+    pattern: re.Pattern[str],
+    op_type: str,
+    prefix: str,
+) -> list[LayerSpec]:
+    grouped: dict[int, list[str]] = {}
+    for name in tensors:
+        match = pattern.match(name)
+        if match is not None:
+            grouped.setdefault(int(match.group(1)), []).append(name)
+    return [
+        LayerSpec(
+            name=f"{prefix}-{block:03d}",
+            op_type=op_type,
+            source_name=f"{prefix}/block-{block:03d}",
+            weights=_bindings(sorted(names)),
+            block=block,
+        )
+        for block, names in sorted(grouped.items())
+    ]
 
 
 def _partition_blocks(
@@ -271,7 +302,12 @@ def plan_architecture(index: GgufIndex) -> ArchitecturePlan:
     global_specs = _global_layers(tensors, tied=tied)
     embed = [spec for spec in global_specs if spec.op_type == "Embedding"]
     tail = [spec for spec in global_specs if spec.op_type != "Embedding"]
-    layers = (*embed, *block_specs, *tail)
+    towers = [
+        layer
+        for pattern, op_type, prefix in _PREFIXED_BLOCKS
+        for layer in _prefixed_layers(tensors, pattern, op_type, prefix)
+    ]
+    layers = (*embed, *towers, *block_specs, *tail)
     if not layers:
         layers = _fallback_layers(tensors)
     return ArchitecturePlan(

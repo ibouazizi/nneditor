@@ -149,10 +149,17 @@ def _is_synthetic_llm(document: Document) -> bool:
     )
 
 
+def _finest_detail(document: Document) -> DetailLevel:
+    """The deepest representation this artifact can actually show."""
+    if _is_synthetic_llm(document):
+        return DetailLevel.LAYER
+    return DetailLevel.OPERATOR
+
+
 def _capped_detail(document: Document, detail_level: DetailLevel) -> DetailLevel:
     """A synthesized LLM graph's finest useful view is LAYER."""
-    if _is_synthetic_llm(document) and detail_level is DetailLevel.OPERATOR:
-        return DetailLevel.LAYER
+    if detail_level is DetailLevel.OPERATOR:
+        return _finest_detail(document)
     return detail_level
 
 
@@ -483,6 +490,11 @@ class ModelSession:
         # rather than failing the open.
         with contextlib.suppress(RuntimeError):
             self._prewarm_job = self._jobs.submit(f"prewarm layouts {self.title}", work)
+
+    def finest_detail(self) -> DetailLevel:
+        """The deepest representation the open artifact can actually show."""
+        self._ensure_open()
+        return _finest_detail(self.document)
 
     def search(self, text: str) -> tuple[str, ...]:
         self._ensure_open()

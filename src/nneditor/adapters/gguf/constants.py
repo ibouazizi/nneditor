@@ -183,7 +183,7 @@ GGML_QUANT_SIZES: Final[MappingProxyType[int, tuple[int, int]]] = MappingProxyTy
         6: (32, 22),  # Q5_0
         7: (32, 24),  # Q5_1
         8: (32, 34),  # Q8_0
-        9: (32, 40),  # Q8_1
+        9: (32, 36),  # Q8_1: two fp16 values plus 32 int8 quants
         10: (256, 2 + 2 + QK_K // 16 + QK_K // 4),  # Q2_K
         11: (256, 2 + QK_K // 4 + QK_K // 8 + 12),  # Q3_K
         12: (256, 2 + 2 + QK_K // 2 + 12),  # Q4_K
@@ -215,7 +215,7 @@ GGML_QUANT_SIZES: Final[MappingProxyType[int, tuple[int, int]]] = MappingProxyTy
 )
 
 # Canonical IR names for public ggml types. Packed quants keep a ggml-style
-# spelling so the inspector can name them; they have no decoder.
+# spelling so the inspector can name them.
 GGML_IR_DTYPES: Final[MappingProxyType[int, str]] = MappingProxyType(
     {
         0: "float32",

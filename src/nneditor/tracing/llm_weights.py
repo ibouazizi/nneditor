@@ -50,13 +50,27 @@ def _array_count(value: JsonValue) -> int:
     raise LlmTraceError("Prism Hadamard metadata requires an array")
 
 
+def _tied_output(meta: dict[str, JsonValue]) -> bool:
+    """Version 2 is version 1 plus a tied latent output head."""
+    tied = meta.get("prism.hadamard.tied_output", False)
+    if not isinstance(tied, bool):
+        raise LlmTraceError("Unsupported Prism Hadamard tied output")
+    if tied != (meta.get("prism.hadamard.version") == 2):
+        raise LlmTraceError(
+            "Prism Hadamard version 2 requires tied_output=true; version 1 forbids it"
+        )
+    return tied
+
+
 def validate_prism(document: Document) -> None:
     """Validate declared transform semantics without reading any payload."""
     meta = _extension_map(document, "x-gguf.metadata")
     if not any(key.startswith("prism.hadamard.") for key in meta):
         return
+    if meta.get("prism.hadamard.version") not in (1, 2):
+        raise LlmTraceError("Unsupported or missing Prism Hadamard version")
+    _tied_output(meta)
     expected: dict[str, JsonValue] = {
-        "version": 1,
         "transform": "normalized-sylvester-walsh-hadamard",
         "axis": "input-last-dimension",
     }
@@ -99,12 +113,18 @@ class GgufWeights:
         self.folded: set[str] = set()
         self.inverses: set[str] = set()
         self.signs: dict[int, FloatArray] = {}
+        self.tied_output = False
         validate_prism(document)
         if "prism.hadamard.version" not in self.meta:
             return
+        self.tied_output = _tied_output(self.meta)
         self.block = int(str(self.meta["prism.hadamard.block_size"]))
         self.folded = self._names("weight_names")
         self.inverses = self._names("inverse_weight_names", optional=True)
+        if self.tied_output and self.inverses != {"token_embd.weight"}:
+            raise LlmTraceError(
+                "Prism Hadamard tied output requires a latent token embedding"
+            )
         if any(
             name == "token_embd.weight" or ".ssm_conv1d." in name
             for name in self.folded
@@ -194,9 +214,14 @@ class GgufWeights:
                 x *= self.signs[x.shape[-1]]
         return x
 
+    def _forward_folded(self, name: str) -> bool:
+        # The metadata list keeps the embedding inverse-only. Version 2 also
+        # registers that table on the output matmul, which folds the activation.
+        return name in self.folded or (self.tied_output and name == "token_embd.weight")
+
     def linear(self, name: str, x: FloatArray) -> FloatArray:
         tensor = self.store.metadata(self.ids[name])
-        if name in self.folded:
+        if self._forward_folded(name):
             if name.endswith(".ssm_out.weight") and self.meta.get(
                 "prism.hadamard.gdn_v_grouped"
             ):

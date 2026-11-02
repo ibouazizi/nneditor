@@ -350,6 +350,9 @@ def bind_inputs(
                 f"specified {binding.shape}"
             )
         feeds[name] = np.ascontiguousarray(array)
+    from nneditor.tracing.modality_validation import validate_modality_inputs
+
+    validate_modality_inputs(document, feeds)
     return feeds
 
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from nneditor.analysis.hierarchy import Hierarchy
+from nneditor.analysis.llm_layers import block_title, layer_label, node_layers
 from nneditor.analysis.lod import SemanticScene
 from nneditor.ir.core import Document
 from nneditor.rendering.scene import Bounds, Scene, Viewport
@@ -27,6 +28,7 @@ class SearchHit:
     node_id: str
     label: str
     op_type: str
+    layer_stem: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,14 +99,38 @@ class NavigationModel:
         if not needle:
             return ()
         hits: list[SearchHit] = []
+        seen: set[tuple[str, str, str | None]] = set()
+
+        def add(hit: SearchHit) -> None:
+            key = (hit.graph_id, hit.node_id, hit.layer_stem)
+            if key in seen:
+                return
+            seen.add(key)
+            hits.append(hit)
+
         for graph in document.graphs.values():
             for node in graph.nodes:
                 label = node.source_name or node.op_type
                 haystacks = (node.id, label, node.op_type, node.qualified_op_type)
                 if any(needle in item.lower() for item in haystacks):
-                    hits.append(
-                        SearchHit(graph.id, node.id, label, node.qualified_op_type)
-                    )
+                    add(SearchHit(graph.id, node.id, label, node.qualified_op_type))
+                for stem, layer_name in node_layers(node):
+                    block = ""
+                    for part in (node.source_name or "").split("/"):
+                        if part.startswith("block-"):
+                            block = block_title(part)
+                    display = f"{block} · {layer_name}" if block else layer_name
+                    layer_haystacks = (stem, layer_name, display, layer_label(stem))
+                    if any(needle in item.lower() for item in layer_haystacks):
+                        add(
+                            SearchHit(
+                                graph.id,
+                                node.id,
+                                display,
+                                node.qualified_op_type,
+                                stem,
+                            )
+                        )
         return tuple(hits)
 
     def breadcrumbs(

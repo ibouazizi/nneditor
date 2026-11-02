@@ -1264,6 +1264,14 @@ tracer-diffusion = [
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
 ]
+tracer-modalities = [
+    { name = "accelerate" },
+    { name = "diffusers" },
+    { name = "safetensors" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
+    { name = "transformers" },
+]
 tracer-ssm = [
     { name = "safetensors" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
@@ -1290,7 +1298,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'tracer-diffusion'", specifier = ">=1,<2" },
+    { name = "accelerate", marker = "extra == 'tracer-modalities'", specifier = ">=1,<2" },
     { name = "diffusers", marker = "extra == 'tracer-diffusion'", specifier = ">=0.35,<1" },
+    { name = "diffusers", marker = "extra == 'tracer-modalities'", specifier = ">=0.35,<1" },
     { name = "flet", extras = ["all"], specifier = "==1.0.5" },
     { name = "matplotlib", specifier = ">=3.9,<4" },
     { name = "numpy", specifier = ">=1.26,<3" },
@@ -1302,15 +1312,18 @@ requires-dist = [
     { name = "onnxruntime-qnn", marker = "extra == 'runtime-qnn'", specifier = ">=1.22,<2" },
     { name = "pillow", specifier = ">=10,<13" },
     { name = "safetensors", marker = "extra == 'tracer-diffusion'", specifier = ">=0.4,<1" },
+    { name = "safetensors", marker = "extra == 'tracer-modalities'", specifier = ">=0.4,<1" },
     { name = "safetensors", marker = "extra == 'tracer-ssm'", specifier = ">=0.4,<1" },
     { name = "scikit-learn", specifier = ">=1.5,<2" },
     { name = "scipy", specifier = ">=1.13,<2" },
     { name = "tokenizers", specifier = ">=0.21,<1" },
     { name = "torch", marker = "extra == 'tracer-diffusion'", specifier = ">=2.6,<3", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "extra == 'tracer-modalities'", specifier = ">=2.6,<3", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "extra == 'tracer-ssm'", specifier = ">=2.6,<3", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "transformers", marker = "extra == 'tracer-modalities'", specifier = ">=5,<6" },
     { name = "transformers", marker = "extra == 'tracer-ssm'", specifier = ">=5,<6" },
 ]
-provides-extras = ["runtime", "runtime-directml", "runtime-gpu", "runtime-openvino", "runtime-qnn", "tracer-diffusion", "tracer-ssm"]
+provides-extras = ["runtime", "runtime-directml", "runtime-gpu", "runtime-openvino", "runtime-qnn", "tracer-diffusion", "tracer-modalities", "tracer-ssm"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -24,7 +24,7 @@ import flet as ft
 from nneditor.application.jobs import Job
 from nneditor.application.session import ModelSession
 from nneditor.application.slices import GraphSlice
-from nneditor.ir.capabilities import Availability, Capability
+from nneditor.ir.capabilities import Availability
 from nneditor.rendering.contract import InteractiveGraphRenderer
 from nneditor.tracing.comparison import TraceComparison
 from nneditor.tracing.contracts import (
@@ -936,10 +936,9 @@ class TracePanel:
         ):
             self.graph_actions.controls = controls
             return
-        status = session.capability(Capability.TRACING)
-        if status.availability is not Availability.AVAILABLE:
-            self.graph_actions.controls = controls
-            return
+        # Choosing the test tensor is separate from whether this checkpoint
+        # can be executed. A Bonsai file the tracer cannot run yet still has
+        # a prompt input, and the button has to be there to assign it.
         surface_width, surface_height = self._surface_size()
         graph = session.document.main_graph
         for value_id, glyph_id in presentation.input_glyphs.items():

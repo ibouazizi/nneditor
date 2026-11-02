@@ -92,7 +92,21 @@ def test_unsupported_unet_remains_inspectable_and_reports_tracing_reason(
     assert registry.reason(plugin, document) == error
 
 
-@pytest.mark.parametrize("family", ["ssm", "diffusion"])
+@pytest.mark.parametrize(
+    "family",
+    [
+        "ssm",
+        "diffusion",
+        "vision",
+        "dit",
+        "video",
+        "audio",
+        "seq2seq",
+        "rwkv",
+        "bitnet",
+        "gguf-media",
+    ],
+)
 def test_packaged_plugins_have_editable_starters_and_explicit_dependencies(
     tmp_path: Path, family: str
 ) -> None:

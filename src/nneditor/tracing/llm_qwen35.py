@@ -14,7 +14,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from nneditor.adapters.gguf.dequant import supports_dequantization
-from nneditor.ir.core import AttrKind, Document, Storage
+from nneditor.ir.core import AttrKind, Document, JsonValue, Storage
 from nneditor.storage.store import TensorStore
 from nneditor.tracing.llm_ops import apply_rope, rms_norm, rope_cos_sin, silu, softmax
 from nneditor.tracing.llm_runtime import (
@@ -71,6 +71,31 @@ class Qwen35Config:
         )
 
 
+def _require_prism_head(meta: dict[str, JsonValue], names: set[str]) -> None:
+    """Version 1 needs its own head; version 2 ties the latent embedding."""
+    version = meta.get("prism.hadamard.version")
+    if version == 1 and "output.weight" not in names:
+        raise LlmTraceError("Prism v1 requires an explicit output projection")
+    if version != 2:
+        return
+    if "output.weight" in names:
+        raise LlmTraceError(
+            "Prism Hadamard tied output requires output.weight to be absent"
+        )
+    inverses = meta.get("prism.hadamard.inverse_weight_names")
+    if inverses == ["token_embd.weight"]:
+        return
+    retained = (
+        isinstance(inverses, dict)
+        and inverses.get("type") == "array"
+        and inverses.get("count") == 1
+    )
+    if not retained:
+        raise LlmTraceError(
+            "Prism Hadamard tied output requires a latent token embedding"
+        )
+
+
 def validate_qwen35(document: Document, params: LlmHyperparams) -> Qwen35Config:
     """Check the complete dense text decoder by names and shapes, without IO."""
     validate_prism(document)
@@ -106,8 +131,7 @@ def validate_qwen35(document: Document, params: LlmHyperparams) -> Qwen35Config:
         "output_norm.weight": (params.n_embd,),
     }
     tensors = {_tensor_name(t.id): t for t in document.tensors.values()}
-    if "prism.hadamard.version" in meta and "output.weight" not in tensors:
-        raise LlmTraceError("Prism v1 requires an explicit output projection")
+    _require_prism_head(meta, set(tensors))
     if "output.weight" in tensors:
         expected["output.weight"] = (params.vocab_size, params.n_embd)
     h, ff, d = params.n_embd, params.n_ff or 0, cfg.head_dim

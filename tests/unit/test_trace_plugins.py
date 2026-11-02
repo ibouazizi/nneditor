@@ -79,6 +79,14 @@ def test_malformed_manifests_do_not_disable_other_tracers(
         "builtin.numpy-llm",
         "nneditor.mamba",
         "nneditor.stable-diffusion",
+        "nneditor.vision",
+        "nneditor.dit",
+        "nneditor.video",
+        "nneditor.audio",
+        "nneditor.seq2seq",
+        "nneditor.rwkv",
+        "nneditor.bitnet",
+        "nneditor.gguf-media",
     }
     assert len(registry.errors) == 1
 
@@ -209,5 +217,13 @@ def test_unreadable_plugin_directory_is_reported(
         "builtin.numpy-llm",
         "nneditor.mamba",
         "nneditor.stable-diffusion",
+        "nneditor.vision",
+        "nneditor.dit",
+        "nneditor.video",
+        "nneditor.audio",
+        "nneditor.seq2seq",
+        "nneditor.rwkv",
+        "nneditor.bitnet",
+        "nneditor.gguf-media",
     }
     assert "cannot read tracer directory" in registry.errors[0]

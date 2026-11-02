@@ -58,6 +58,40 @@ def test_q4_k_applies_superblock_scale_and_min() -> None:
     np.testing.assert_allclose(decoded, expected)
 
 
+def test_q4_1_adds_the_block_minimum() -> None:
+    scale = np.float16(0.5)
+    minimum = np.float16(1.0)
+    payload = (
+        np.asarray([scale], dtype="<f2").tobytes()
+        + np.asarray([minimum], dtype="<f2").tobytes()
+        + bytes(16)
+    )
+    decoded = dequantize("q4_1", (32,), payload)
+    np.testing.assert_allclose(decoded, np.full(32, 1.0, dtype=np.float32))
+
+
+def test_q8_1_scales_int8_and_ignores_the_sum() -> None:
+    scale = np.float16(0.25)
+    total = np.float16(3.0)
+    qs = np.arange(32, dtype=np.int8)
+    payload = (
+        np.asarray([scale], dtype="<f2").tobytes()
+        + np.asarray([total], dtype="<f2").tobytes()
+        + qs.tobytes()
+    )
+    decoded = dequantize("q8_1", (32,), payload)
+    np.testing.assert_allclose(decoded, qs.astype(np.float32) * 0.25)
+
+
+def test_q8_k_scales_the_superblock() -> None:
+    scale = np.float32(0.5)
+    qs = np.full(256, 4, dtype=np.int8)
+    sums = np.zeros(16, dtype="<i2")
+    payload = scale.tobytes() + qs.tobytes() + sums.tobytes()
+    decoded = dequantize("q8_k", (256,), payload)
+    np.testing.assert_allclose(decoded, np.full(256, 2.0, dtype=np.float32))
+
+
 def test_unknown_packed_type_is_refused() -> None:
     with pytest.raises(GgufDequantError, match="not decoded"):
         dequantize("gguf.type_143", (4,), bytes(16))

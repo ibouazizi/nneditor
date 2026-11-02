@@ -125,7 +125,10 @@ class TracePlugin:
             return (
                 f"{self.name} supports architectures: {', '.join(self.architectures)}"
             )
-        graph_error = dict(document.extensions).get("x-huggingface.trace-graph-error")
+        extensions = dict(document.extensions)
+        graph_error = extensions.get(
+            "x-huggingface.trace-graph-error"
+        ) or extensions.get("x-gguf.trace-graph-error")
         if isinstance(graph_error, str):
             return graph_error
         if self.element_types:

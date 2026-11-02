@@ -15,11 +15,21 @@ from __future__ import annotations
 
 from itertools import pairwise
 
+from nneditor.analysis.hierarchy import Hierarchy
 from nneditor.analysis.lod import DetailLevel, SemanticScene, _relayout
 from nneditor.ir.core import Graph, Node
 from nneditor.rendering.scene import EdgeGlyph, NodeGlyph, Scene
 
-__all__ = ["expand_llm_layers", "layer_label", "layer_owner", "layer_tensor_ids"]
+__all__ = [
+    "block_title",
+    "containing_block",
+    "expand_llm_layers",
+    "layer_label",
+    "layer_owner",
+    "layer_stem",
+    "layer_tensor_ids",
+    "node_layers",
+]
 
 _LAYER_MARKER = "::layer:"
 
@@ -103,6 +113,26 @@ _LABELS: dict[str, str] = {
 _EXPAND_OPS = frozenset({"Attention", "SSM", "FFN", "Parameters"})
 
 
+def block_title(label: str) -> str:
+    """``block-019`` becomes ``Block 19``. Other labels stay as they are."""
+    if label.startswith("block-") and label[6:].isdigit():
+        return f"Block {int(label[6:])}"
+    return label
+
+
+def containing_block(hierarchy: Hierarchy, node_id: str) -> str | None:
+    """The ``block-NNN`` group id that contains ``node_id``, if any."""
+    for group in hierarchy.groups_for_node(node_id):
+        if group.label.startswith("block-") and group.label[6:].isdigit():
+            return group.id
+    return None
+
+
+def node_layers(node: Node) -> tuple[tuple[str, str], ...]:
+    """``(stem, display label)`` for each weight layer on one block node."""
+    return tuple((stem, layer_label(stem)) for stem, _names in _grouped(node))
+
+
 def layer_label(stem: str) -> str:
     """The name drawn on one layer glyph."""
     known = _LABELS.get(stem)
@@ -127,7 +157,7 @@ def layer_tensor_ids(node: Node, stem: str) -> tuple[str, ...]:
     """Tensor ids on ``node`` that belong to one layer stem."""
     found: list[str] = []
     for attribute in node.attributes:
-        if _stem(attribute.name) != stem:
+        if layer_stem(attribute.name) != stem:
             continue
         for tensor_id in attribute.referenced_tensor_ids():
             if tensor_id not in found:
@@ -230,12 +260,13 @@ def _grouped(node: Node) -> tuple[tuple[str, tuple[str, ...]], ...]:
     for attribute in node.attributes:
         if not attribute.referenced_tensor_ids():
             continue
-        buckets.setdefault(_stem(attribute.name), []).append(attribute.name)
+        buckets.setdefault(layer_stem(attribute.name), []).append(attribute.name)
     ordered = sorted(buckets, key=lambda stem: (_RANK.get(stem, len(_RANK)), stem))
     return tuple((stem, tuple(buckets[stem])) for stem in ordered)
 
 
-def _stem(name: str) -> str:
+def layer_stem(name: str) -> str:
+    """The layer key inside a weight name, ignoring block index and ``.weight``."""
     parts = name.split(".")
     if len(parts) >= 3 and parts[0] == "blk" and parts[1].isdigit():
         parts = parts[2:]
@@ -247,7 +278,7 @@ def _stem(name: str) -> str:
 def _block_prefix(node: Node) -> str:
     for part in (node.source_name or "").split("/"):
         if part.startswith("block-"):
-            return f"{part.removeprefix('block-')} · "
+            return f"{block_title(part)} · "
     return ""
 
 

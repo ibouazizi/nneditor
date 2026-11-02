@@ -159,6 +159,55 @@ def _decode_q8_0(payload: bytes, n_elems: int, endian: str) -> Float32Array:
     return out
 
 
+def _decode_q4_1(payload: bytes, n_elems: int, endian: str) -> Float32Array:
+    n_blocks, type_size = _block_count(n_elems, 32, 3, "q4_1")
+    _need(payload, n_blocks * type_size, "q4_1")
+    out = np.empty(n_elems, dtype=np.float32)
+    for index in range(n_blocks):
+        base = index * type_size
+        scale = _fp16_at(payload, base, endian)
+        minimum = _fp16_at(payload, base + 2, endian)
+        qs = np.frombuffer(payload, dtype=np.uint8, count=16, offset=base + 4)
+        start = index * 32
+        out[start : start + 16] = (qs & 0x0F).astype(np.float32) * scale + minimum
+        out[start + 16 : start + 32] = (qs >> 4).astype(np.float32) * scale + minimum
+    return out
+
+
+def _decode_q8_1(payload: bytes, n_elems: int, endian: str) -> Float32Array:
+    n_blocks, type_size = _block_count(n_elems, 32, 9, "q8_1")
+    _need(payload, n_blocks * type_size, "q8_1")
+    out = np.empty(n_elems, dtype=np.float32)
+    for index in range(n_blocks):
+        base = index * type_size
+        scale = _fp16_at(payload, base, endian)
+        qs = np.frombuffer(payload, dtype=np.int8, count=32, offset=base + 4)
+        start = index * 32
+        out[start : start + 32] = qs.astype(np.float32) * scale
+    return out
+
+
+def _f32_at(payload: bytes, offset: int, endian: str) -> float:
+    prefix = "<" if endian == "little" else ">"
+    value = np.frombuffer(
+        payload, dtype=np.dtype(prefix + "f4"), count=1, offset=offset
+    )
+    return float(value[0])
+
+
+def _decode_q8_k(payload: bytes, n_elems: int, endian: str) -> Float32Array:
+    n_blocks, type_size = _block_count(n_elems, QK_K, 15, "q8_k")
+    _need(payload, n_blocks * type_size, "q8_k")
+    out = np.empty(n_elems, dtype=np.float32)
+    for index in range(n_blocks):
+        base = index * type_size
+        scale = _f32_at(payload, base, endian)
+        qs = np.frombuffer(payload, dtype=np.int8, count=QK_K, offset=base + 4)
+        start = index * QK_K
+        out[start : start + QK_K] = qs.astype(np.float32) * np.float32(scale)
+    return out
+
+
 def _decode_q4_0(payload: bytes, n_elems: int, endian: str) -> Float32Array:
     n_blocks, type_size = _block_count(n_elems, 32, 2, "q4_0")
     _need(payload, n_blocks * type_size, "q4_0")
@@ -328,7 +377,10 @@ _DECODERS: dict[str, _Decoder] = {
     "int64": _decode_i64,
     "uint8": _decode_u8,
     "q8_0": _decode_q8_0,
+    "q8_1": _decode_q8_1,
+    "q8_k": _decode_q8_k,
     "q4_0": _decode_q4_0,
+    "q4_1": _decode_q4_1,
     "q4_k": _decode_q4_k,
     "q5_k": _decode_q5_k,
     "q6_k": _decode_q6_k,

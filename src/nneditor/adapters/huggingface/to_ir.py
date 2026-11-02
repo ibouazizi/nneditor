@@ -17,6 +17,11 @@ from nneditor.adapters.huggingface.architecture import (
     plan_architecture,
 )
 from nneditor.adapters.huggingface.diffusion import DIFFUSION_CLASSES, diffusion_graph
+from nneditor.adapters.huggingface.modalities import (
+    BLOCK_OPS,
+    modality_graph,
+    modality_kind,
+)
 from nneditor.adapters.huggingface.snapshot import (
     HfIndex,
     HfTensorIndex,
@@ -286,6 +291,7 @@ def index_to_document(index: HfIndex) -> Document:
     model_class = index.config.get("_class_name")
     diffusion = isinstance(model_class, str) and model_class in DIFFUSION_CLASSES
     graph_error: str | None = None
+    kind = None if diffusion else modality_kind(index.config)
     if diffusion:
         try:
             graph = diffusion_graph(index)
@@ -300,8 +306,29 @@ def index_to_document(index: HfIndex) -> Document:
                 for node in graph.nodes
             ),
         )
+    elif kind is not None:
+        try:
+            built = modality_graph(index)
+        except HuggingFaceError as error:
+            graph_error = str(error)
+            built = None
+        if built is None:
+            graph = _build_graph(index, plan)
+        else:
+            graph = built
+            plan = replace(
+                plan,
+                name=kind,
+                block_count=sum(node.op_type in BLOCK_OPS for node in graph.nodes),
+            )
     else:
         graph = _build_graph(index, plan)
+    if diffusion:
+        synthesis = "synthesize-diffusion-architecture"
+    elif kind is not None and graph_error is None:
+        synthesis = "synthesize-modality-architecture"
+    else:
+        synthesis = "synthesize-llm-architecture"
     tool_version = f"nneditor {__version__}"
     document = Document(
         source=ArtifactRef(
@@ -322,9 +349,7 @@ def index_to_document(index: HfIndex) -> Document:
                 source_artifact=index.content_hash,
             ),
             ProvenanceEntry(
-                operation="synthesize-diffusion-architecture"
-                if diffusion
-                else "synthesize-llm-architecture",
+                operation=synthesis,
                 tool_version=tool_version,
                 target=ROOT_GRAPH_ID,
                 parameters=(

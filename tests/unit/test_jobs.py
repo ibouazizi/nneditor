@@ -31,7 +31,12 @@ def test_release_result_drops_the_payload() -> None:
     handle = weakref.ref(payload)
     manager = JobManager(max_workers=1)
     try:
-        job = manager.submit("keep", lambda token, kept=payload: kept)
+
+        def keep(_token: CancellationToken, kept: Payload = payload) -> Payload:
+            return kept
+
+        job = manager.submit("keep", keep)
+        del keep
         assert job.result(timeout=5) is payload
         del payload
         assert handle() is not None

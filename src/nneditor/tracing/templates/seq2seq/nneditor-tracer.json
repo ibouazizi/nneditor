@@ -1,0 +1,14 @@
+{
+  "api_version": 1,
+  "id": "nneditor.seq2seq",
+  "name": "T5 sequence to sequence",
+  "version": "1.0.0",
+  "entry_point": "tracer.py:trace",
+  "artifact_kinds": ["huggingface_model"],
+  "architectures": ["t5", "T5ForConditionalGeneration"],
+  "element_types": ["float32", "float16", "bfloat16"],
+  "devices": ["cpu"],
+  "python_modules": ["torch", "transformers", "safetensors"],
+  "install_extra": "tracer-modalities",
+  "description": "Trace a local T5 checkpoint. Install nneditor[tracer-modalities]. Captures encoder blocks, decoder blocks, and logits for one pass."
+}

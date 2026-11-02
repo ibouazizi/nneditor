@@ -10,7 +10,7 @@
   code.
 </p>
 
-NNEditor 2.0 is a capability-aware neural-network workspace for ONNX, PyTorch,
+NNEditor 2.1 is a capability-aware neural-network workspace for ONNX, PyTorch,
 safetensors, GGUF, Hugging Face snapshots, and textual StableHLO artifacts. It
 combines semantic graph
 navigation, lazy tensor access, reversible editing, validated export, and
@@ -230,8 +230,8 @@ StableHLO does not imply that NNEditor can write the dialect back. Unavailable
 actions explain the format-specific reason directly in the interface.
 
 Ternary Bonsai 2 files using the `qwen35` hybrid decoder, Prism `PQ2_0` or
-`PTQ1_0` packed weights, and version 1 Hadamard transforms support desktop
-tracing. The decoder implements gated full attention, partial text MRoPE,
+`PTQ1_0` packed weights, and Hadamard transforms (including a version 2 tied
+output head) support desktop tracing. The decoder implements gated full attention, partial text MRoPE,
 causal convolution, and GatedDeltaNet recurrence. Weights stream in bounded
 chunks, including the vocabulary projection; recurrent states reset for each
 prompt. Select **Prepare prompt input**, generate or assign token IDs, then
@@ -243,7 +243,7 @@ IDs from the model's tokenizer for a faithful text prompt.
 NNEditor requires Python 3.12, 3.13, or 3.14.
 
 ```bash
-python -m pip install nneditor==2.0.0
+python -m pip install nneditor==2.1.0
 ```
 
 Start the desktop application with either command:
@@ -428,8 +428,7 @@ GGUF Qwen3.5 dense text traces also support Prism's g128 ternary packings,
 explicit Hadamard signs, inverse embedding transforms, and grouped recurrent
 output projections. Matrix products use decoded float32 weights and activations;
 results can differ from optimized runtimes that additionally quantize activations.
-Multimodal inputs, MoE decoders, and Prism version 2 tied output transforms are
-not implemented.
+Multimodal inputs and MoE decoders are not implemented.
 The approved memory ceiling limits host RAM; device memory remains
 under the accelerator provider and driver. A failed or cancelled run publishes
 no trace.
@@ -452,7 +451,7 @@ add a runtime for an existing imported graph. A new artifact format or graph
 structure also needs an appropriate model reader; a tracing plugin does not
 register readers or create graph topology.
 
-**NNEditor 2.0.0 uses tracing API version 1.** Keep `api_version: 1` in plugin
+**NNEditor 2.1.0 uses tracing API version 1.** Keep `api_version: 1` in plugin
 manifests. The application version, SDK API version, and each plugin's own
 `version` are separate.
 
@@ -464,12 +463,39 @@ manifests. The application version, SDK API version, and each plugin's own
 | NumPy LLM decoder, built in | Supported GGUF and Hugging Face Llama, GPT-2, Qwen, and Bonsai decoder configurations on CPU | Included in `nneditor` |
 | Mamba / Mamba2 SSM, bundled plugin | Local Hugging Face Mamba and Mamba2 safetensors checkpoints on CPU | `nneditor[tracer-ssm]` |
 | Stable Diffusion UNet, bundled plugin | Diffusers `UNet2DConditionModel` and `UNet2DModel` components on CPU | `nneditor[tracer-diffusion]` |
+| LLaVA, Qwen2-VL, and Gemma 3, bundled plugin | Local vision-language snapshots on CPU | `nneditor[tracer-modalities]` |
+| BitNet, bundled plugin | Local BitNet snapshots and float32 BitNet GGUF files on CPU | `nneditor[tracer-modalities]` |
+| GGUF vision and Whisper, bundled plugin | CLIP vision and Whisper GGUF files, including Q4 and Q8 weights, on CPU | `nneditor[tracer-modalities]` |
+| SD3 and Flux, bundled plugin | Local SD3 and Flux transformer folders on CPU | `nneditor[tracer-modalities]` |
+| CogVideoX and Wan, bundled plugin | Local video transformer folders on CPU | `nneditor[tracer-modalities]` |
+| Whisper, bundled plugin | Local Whisper checkpoints on CPU | `nneditor[tracer-modalities]` |
+| T5, bundled plugin | Local T5 checkpoints on CPU | `nneditor[tracer-modalities]` |
+| RWKV, bundled plugin | Local RWKV checkpoints on CPU | `nneditor[tracer-modalities]` |
+
+Whisper and vision-language tracing runs one CPU forward pass. **Automatic from
+input** prepares coordinated synthetic inputs for diagnostics: Whisper mel
+features at the configured frame count and a decoder start token, or image
+tensors with matching image placeholders and grid metadata. These inputs do not
+represent a recording, photograph, or user prompt. For real media, prepare named
+`.npy` or `.npz` tensors with the checkpoint's processor and assign the complete
+input set using the graph's input names. Generic image resizing does not replace
+model-specific preprocessing.
+GGUF Whisper requires decoder-start or BOS metadata for an automatic prefix.
+If it is absent, assign the decoder tokens explicitly.
+
+Captured stages distinguish Whisper convolutions, positional embeddings,
+encoder and decoder blocks, and final logits. Vision-language graphs expose
+feature selection and image/text merging. GGUF CLIP exposes each vision block,
+the pooled output, and a separate sequence output. These tracers load the model
+in float32 on CPU. They do not perform autoregressive transcription or caption
+generation.
 
 Install optional runtimes in the same Python environment as NNEditor:
 
 ```bash
-python -m pip install "nneditor[tracer-ssm]==2.0.0"
-python -m pip install "nneditor[tracer-diffusion]==2.0.0"
+python -m pip install "nneditor[tracer-ssm]==2.1.0"
+python -m pip install "nneditor[tracer-diffusion]==2.1.0"
+python -m pip install "nneditor[tracer-modalities]==2.1.0"
 ```
 
 **Mamba / Mamba2 SSM:** open the checkpoint folder and prepare integer token IDs.

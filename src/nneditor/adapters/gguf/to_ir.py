@@ -8,6 +8,7 @@ re-reads the file.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from nneditor import __version__
@@ -18,6 +19,7 @@ from nneditor.adapters.gguf.architecture import (
 )
 from nneditor.adapters.gguf.index import GgufIndex, GgufTensorIndex
 from nneditor.adapters.gguf.indexer import GgufIndexError, index_gguf
+from nneditor.adapters.gguf.media import media_graph
 from nneditor.cancellation import CancellationToken, OperationCancelled
 from nneditor.ir.capabilities import (
     ArtifactKind,
@@ -45,7 +47,24 @@ from nneditor.ir.identity import ROOT_GRAPH_ID, node_id, value_id
 
 __all__ = ["index_to_document", "open_gguf"]
 
-_CHAIN_OPS = frozenset({"Embedding", "Attention", "FFN", "SSM", "RMSNorm", "Linear"})
+_CHAIN_OPS = frozenset(
+    {
+        "Embedding",
+        "Attention",
+        "FFN",
+        "SSM",
+        "RMSNorm",
+        "Linear",
+        "VisionBlock",
+        "EncoderBlock",
+        "DecoderBlock",
+    }
+)
+_DOMAINS = {
+    "VisionBlock": "nneditor.vision",
+    "EncoderBlock": "nneditor.audio",
+    "DecoderBlock": "nneditor.audio",
+}
 
 
 def _ir_dims(file_dims: tuple[int, ...]) -> tuple[int, ...]:
@@ -204,7 +223,7 @@ def _append_layer(
             id=nid,
             id_stability=stability,
             op_type=spec.op_type,
-            domain="nneditor.llm",
+            domain=_DOMAINS.get(spec.op_type, "nneditor.llm"),
             inputs=inputs,
             outputs=(out_id,),
             attributes=_weight_attributes(spec, name_to_id),
@@ -222,15 +241,35 @@ def _build_graph(index: GgufIndex, plan: ArchitecturePlan) -> Graph:
     previous: str | None = None
     inputs: tuple[str, ...] = ()
     if chained:
+        kinds = {spec.op_type for spec in plan.layers}
+        first = next(spec.op_type for spec in plan.layers if spec.op_type in _CHAIN_OPS)
+        if first == "VisionBlock":
+            feed_name, feed_type = "pixel-values", "float32"
+            feed_shape: tuple[int | str, ...] = ("batch", "channels", "height", "width")
+        elif first == "EncoderBlock":
+            feed_name, feed_type = "input-features", "float32"
+            feed_shape = ("batch", "mel", "frames")
+        else:
+            feed_name, feed_type = "tokens", "int64"
+            feed_shape = ("batch", "seq")
         tokens = Value(
-            id=value_id(ROOT_GRAPH_ID, "tokens"),
-            name="tokens",
-            element_type="int64",
-            shape=("batch", "seq"),
+            id=value_id(ROOT_GRAPH_ID, feed_name),
+            name=feed_name,
+            element_type=feed_type,
+            shape=feed_shape,
         )
         values[tokens.id] = tokens
         previous = tokens.id
         inputs = (tokens.id,)
+        if "EncoderBlock" in kinds and "DecoderBlock" in kinds:
+            decoder_tokens = Value(
+                id=value_id(ROOT_GRAPH_ID, "decoder-tokens"),
+                name="decoder-tokens",
+                element_type="int64",
+                shape=("batch", "target"),
+            )
+            values[decoder_tokens.id] = decoder_tokens
+            inputs = (*inputs, decoder_tokens.id)
     for ordinal, spec in enumerate(plan.layers):
         previous = _append_layer(
             spec, ordinal, previous, plan, values, nodes, name_to_id
@@ -254,7 +293,23 @@ def index_to_document(index: GgufIndex) -> Document:
     plan = plan_architecture(index)
     tensors = [_tensor_ref(tensor) for tensor in index.tensors]
     statuses, notes = _narrow_capabilities(tensors)
-    graph = _build_graph(index, plan)
+    graph_error = None
+    synthesis = "synthesize-llm-architecture"
+    try:
+        media = media_graph(index)
+        graph = media or _build_graph(index, plan)
+        if media is not None:
+            synthesis = "synthesize-modality-architecture"
+            plan = replace(
+                plan,
+                block_count=sum(
+                    node.op_type in {"VisionBlock", "EncoderBlock", "DecoderBlock"}
+                    for node in graph.nodes
+                ),
+            )
+    except ValueError as error:
+        graph_error = str(error)
+        graph = _build_graph(index, plan)
     tool_version = f"nneditor {__version__}"
     document = Document(
         source=ArtifactRef(
@@ -279,7 +334,7 @@ def index_to_document(index: GgufIndex) -> Document:
                 source_artifact=index.content_hash,
             ),
             ProvenanceEntry(
-                operation="synthesize-llm-architecture",
+                operation=synthesis,
                 tool_version=tool_version,
                 target=ROOT_GRAPH_ID,
                 parameters=(
@@ -295,6 +350,7 @@ def index_to_document(index: GgufIndex) -> Document:
             ("x-gguf.model", _model_extension(index, plan)),
             ("x-gguf.metadata", _json_kv(index)),
             ("x-gguf.kv", _kv_records(index)),
+            *([("x-gguf.trace-graph-error", graph_error)] if graph_error else []),
         ],
     )
     return with_trace_support(document)

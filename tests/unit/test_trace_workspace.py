@@ -139,9 +139,10 @@ def test_blocks_own_boundary_tensors_and_drill_down_without_weights(
         assert shell.current_root_group is None and not pane.back.visible
         pane.detail.value = "operator"
         pane._on_detail(_event())
-        assert shell.current_detail is DetailLevel.OPERATOR
+        # A weights-only model has no operator circuit to drill into.
+        assert shell.current_detail is session.finest_detail() is DetailLevel.LAYER
         assert shell.current_slice is not None
-        assert len(shell.current_slice.scene.nodes) == len(graph.nodes)
+        assert any("::layer:" in node.id for node in shell.current_slice.scene.nodes)
         pane.search.value = "no-such-block"
         pane._find(_event())
         assert "No matching" in (pane.hint.value or "")
